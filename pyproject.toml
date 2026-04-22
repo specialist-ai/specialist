@@ -16,6 +16,9 @@ dependencies = [
   "allantools>=2024.6",
   "pyyaml>=6.0",
   "robot-descriptions",
+  # Wheel-bundled static ffmpeg so multi-clip audio clap-sync works on every
+  # platform via `uv sync` (no system ffmpeg / sudo, e.g. the headless server).
+  "imageio-ffmpeg>=0.5",
 ]
 
 [project.optional-dependencies]
@@ -66,5 +69,6 @@ module = [
   "cv2", "cv2.*",
   "pupil_apriltags", "pupil_apriltags.*",
   "allantools", "allantools.*",
+  "imageio_ffmpeg", "imageio_ffmpeg.*",
 ]
 ignore_missing_imports = true
