@@ -1,0 +1,181 @@
+"""IMU preintegration helpers wrapping GTSAM's
+``PreintegratedCombinedMeasurements``: typed ``ImuSamples`` container,
+``PreintegrationCombinedParams`` builder, and a decoder for the X3 factory
+bias from ``gyro_calib.numbers``. ``gravity_world`` follows the GTSAM
+convention (acceleration of gravity, e.g. ``(0, 0, -9.81)`` for z-up)."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import gtsam
+import numpy as np
+import numpy.typing as npt
+
+Float64Array = npt.NDArray[np.float64]
+
+__all__ = [
+  "ImuSamples",
+  "factory_imu_bias",
+  "find_stationary_windows",
+  "from_deg_per_s",
+  "integrate_samples",
+  "make_preintegration_params",
+  "preintegrate_between_keyframes",
+  "slice_samples_at_keyframes",
+]
+
+
+@dataclass(frozen=True)
+class ImuSamples:
+  """Aligned IMU triple in SI units: timestamps (s), gyro (rad/s), accel (m/s²).
+
+  Row i of ``gyro`` and ``accel`` shares timestamp ``t[i]``.
+  """
+
+  t: Float64Array
+  gyro: Float64Array
+  accel: Float64Array
+
+  def __len__(self) -> int:
+    return int(self.t.shape[0])
+
+
+def from_deg_per_s(
+  t: Float64Array,
+  gyro_deg: Float64Array,
+  accel: Float64Array,
+) -> ImuSamples:
+  """Build an ``ImuSamples`` from raw parse_insv output (gyro is in deg/s)."""
+  return ImuSamples(
+    t=np.asarray(t, dtype=np.float64),
+    gyro=np.deg2rad(np.asarray(gyro_deg, dtype=np.float64)),
+    accel=np.asarray(accel, dtype=np.float64),
+  )
+
+
+def find_stationary_windows(
+  samples: ImuSamples,
+  bias: gtsam.imuBias.ConstantBias,
+  window_size: int = 50,
+  gyro_threshold: float = 0.1,
+  accel_var_threshold: float = 0.05,
+  stride: int | None = None,
+) -> list[tuple[int, int]]:
+  """Find ``(start, end)`` index ranges where the IMU appears stationary:
+  bias-corrected gyro magnitude below ``gyro_threshold`` and accel
+  sample variance below ``accel_var_threshold``. The accel-magnitude
+  check is intentionally skipped — IMU scale errors (X3 reads ~9.4 not
+  9.81) would otherwise reject every real stationary window. The caller
+  rescales accel using the detected windows. ``stride`` defaults to
+  ``window_size`` (non-overlapping)."""
+  n = len(samples)
+  if n < window_size:
+    return []
+  step = window_size if stride is None else max(1, stride)
+  accel_corr = samples.accel - bias.accelerometer()
+  gyro_corr = samples.gyro - bias.gyroscope()
+  windows: list[tuple[int, int]] = []
+  for start in range(0, n - window_size + 1, step):
+    end = start + window_size
+    if np.max(np.linalg.norm(gyro_corr[start:end], axis=1)) > gyro_threshold:
+      continue
+    if float(accel_corr[start:end].var(axis=0).max()) > accel_var_threshold:
+      continue
+    windows.append((start, end))
+  return windows
+
+
+def make_preintegration_params(
+  gyro_noise_sigma: float,
+  accel_noise_sigma: float,
+  gyro_walk: float,
+  accel_walk: float,
+  gravity_world: tuple[float, float, float] = (0.0, 0.0, -9.81),
+  initial_bias_sigma: float = 1e-3,
+) -> gtsam.PreintegrationCombinedParams:
+  """Populate a ``PreintegrationCombinedParams`` with per-axis isotropic
+  noise + bias-walk covariances."""
+  params = gtsam.PreintegrationCombinedParams(
+    np.asarray(gravity_world, dtype=np.float64)
+  )
+  params.setAccelerometerCovariance(np.eye(3) * accel_noise_sigma**2)
+  params.setGyroscopeCovariance(np.eye(3) * gyro_noise_sigma**2)
+  params.setIntegrationCovariance(np.eye(3) * 1e-10)
+  params.setBiasAccCovariance(np.eye(3) * accel_walk**2)
+  params.setBiasOmegaCovariance(np.eye(3) * gyro_walk**2)
+  params.setBiasAccOmegaInit(np.eye(6) * initial_bias_sigma**2)
+  return params
+
+
+def factory_imu_bias(
+  gyro_calib_numbers: Float64Array,
+) -> gtsam.imuBias.ConstantBias:
+  """Factory IMU bias from ``gyro_calib.numbers``: ``[gx, gy, gz, ax, ay,
+  az]`` (3 gyro rad/s + 3 accel m/s²). Use this when the capture doesn't
+  start stationary and a window-mean seed would absorb real motion."""
+  arr = np.asarray(gyro_calib_numbers, dtype=np.float64).reshape(6)
+  return gtsam.imuBias.ConstantBias(arr[3:6], arr[:3])
+
+
+def slice_samples_at_keyframes(
+  samples: ImuSamples,
+  keyframe_times: Float64Array,
+) -> list[ImuSamples]:
+  """Partition ``samples`` into ``len(keyframe_times) - 1`` windows.
+
+  Window ``i`` holds samples whose timestamp lies in ``(t_i, t_{i+1}]``.
+  Empty windows (no samples in the bracket) come back as zero-length
+  ``ImuSamples`` so the caller's per-window loop stays index-aligned.
+  """
+  t_kf = np.asarray(keyframe_times, dtype=np.float64)
+  out: list[ImuSamples] = []
+  for i in range(len(t_kf) - 1):
+    mask = (samples.t > t_kf[i]) & (samples.t <= t_kf[i + 1])
+    out.append(
+      ImuSamples(
+        t=samples.t[mask],
+        gyro=samples.gyro[mask],
+        accel=samples.accel[mask],
+      )
+    )
+  return out
+
+
+def preintegrate_between_keyframes(
+  params: gtsam.PreintegrationCombinedParams,
+  samples: ImuSamples,
+  keyframe_times: Float64Array,
+  bias: gtsam.imuBias.ConstantBias,
+) -> list[gtsam.PreintegratedCombinedMeasurements]:
+  """One ``PreintegratedCombinedMeasurements`` per consecutive keyframe pair."""
+  per_window = slice_samples_at_keyframes(samples, keyframe_times)
+  return [integrate_samples(params, w, bias) for w in per_window]
+
+
+def integrate_samples(
+  params: gtsam.PreintegrationCombinedParams,
+  samples: ImuSamples,
+  bias: gtsam.imuBias.ConstantBias,
+) -> gtsam.PreintegratedCombinedMeasurements:
+  """Integrate every consecutive-pair Δt from ``samples`` into one PIM.
+
+  The GTSAM convention uses the earlier sample's measurement over the
+  ``t[i+1] - t[i]`` interval (zero-order hold). Non-monotone timestamps
+  contribute zero — defensive against clock wrap-around.
+  """
+  pim = gtsam.PreintegratedCombinedMeasurements(params, bias)
+  n = len(samples)
+  if n < 2:
+    return pim
+  dts = np.diff(samples.t)
+  for i in range(n - 1):
+    dt = float(dts[i])
+    if dt <= 0.0:
+      continue
+    pim.integrateMeasurement(
+      samples.accel[i].astype(np.float64),
+      samples.gyro[i].astype(np.float64),
+      dt,
+    )
+  return pim
