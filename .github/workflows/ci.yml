@@ -41,9 +41,11 @@ jobs:
           python-version: "3.12"
           enable-cache: true
       - name: Install dependencies
-        run: uv sync --extra dev
+        # robot-descriptions is a private SSH git dep (URDF assets) used only
+        # lazily in scripts/track.py; CI has no SSH creds and doesn't need it.
+        run: uv sync --extra dev --no-install-package robot-descriptions
       - name: Run mypy
-        run: uv run mypy src/specialist
+        run: uv run --no-sync mypy src/specialist
 
   tests:
     runs-on: ubuntu-latest
@@ -56,6 +58,8 @@ jobs:
           python-version: "3.12"
           enable-cache: true
       - name: Install dependencies
-        run: uv sync --extra dev
+        # robot-descriptions is a private SSH git dep (URDF assets) used only
+        # lazily in scripts/track.py; CI has no SSH creds and doesn't need it.
+        run: uv sync --extra dev --no-install-package robot-descriptions
       - name: Run tests
-        run: uv run pytest || [ $? -eq 5 ]
+        run: uv run --no-sync pytest || [ $? -eq 5 ]

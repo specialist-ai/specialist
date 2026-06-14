@@ -23,20 +23,20 @@ import gtsam
 import numpy as np
 import numpy.typing as npt
 from gtsam.symbol_shorthand import X
+
+from specialist.loader.mei_model import MeiParams, mei_project, mei_unproject
 from specialist.vi_ba.build import (
   LensSetup,
   build_graph,
   front_landmark_key,
 )
+from specialist.vi_ba.features import Frame, chain_tracks
 from specialist.vi_ba.init import (
   body_poses_from_camera_poses,
   interpolate_camera_poses,
   triangulate_track_dlt,
   two_view_essential,
 )
-
-from specialist.loader.mei_model import MeiParams, mei_project, mei_unproject
-from specialist.vi_ba.features import Frame, chain_tracks
 from specialist.vi_ba.optimize import optimize_graph
 
 Float64Array = npt.NDArray[np.float64]
