@@ -64,6 +64,9 @@ class Args:
   urdf_path: Path | None = None
   log_frames_in_rrd: bool = False
   open_viewer: bool = True
+  # Optional (N, 3) .npy of ground-truth positions already in the anchor
+  # world; drawn as a static overlay at /world/ground_truth. Debug only.
+  ground_truth_npy: Path | None = None
   # One id per tracker; cross-tracker disambiguation needs distinct ids.
   base_tag_ids: tuple[int, ...] = ()
   # Per-tracker finger tag ids (or 0 to disable for that tracker). Used to
@@ -918,6 +921,14 @@ def main(args: Args) -> None:
       )
     )
 
+  gt_poses = None
+  gt_times = None
+  if args.ground_truth_npy is not None:
+    _gt = np.load(args.ground_truth_npy)
+    gt_poses = [
+      gtsam.Pose3(gtsam.Rot3(p[:3, :3]), gtsam.Point3(*p[:3, 3])) for p in _gt["poses"]
+    ]
+    gt_times = _gt["times"]
   log_multi_ba_run(
     rrd_path=rrd_path,
     trackers=viz_trackers,
@@ -927,6 +938,8 @@ def main(args: Args) -> None:
     mask_pad_px=args.frontend.mask_tag_pad_px,
     urdf_path=urdf_path,
     open_viewer=args.open_viewer,
+    ground_truth_gripper_poses=gt_poses,
+    ground_truth_times=gt_times,
   )
 
   bbox_diag = tuple(

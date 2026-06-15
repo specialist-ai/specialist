@@ -34,6 +34,7 @@ from specialist.vi_ba.eval_metrics import (
   per_keyframe_reproj_rmse,
   per_pair_keypoint_distances,
   quality_landmark_counts_per_kf,
+  trajectory_position_drift,
 )
 
 Float64Array = npt.NDArray[np.float64]
@@ -85,6 +86,20 @@ def _tag_detections_from_dict(per_kf: Any) -> list[list[TagDetection]]:
   ]
 
 
+def _keypoint_world_from_raw(raw: Any) -> dict[str, list[Float64Array]]:
+  """Reconstruct each tracker's per-kf fingertip world trajectory from a
+  raw ``track.py`` JSON (used to load a reference/pseudo-GT run)."""
+  names = list(raw["tracker_names"])
+  offset = np.asarray(raw["gripper_keypoint_offset"], dtype=np.float64)
+  out: dict[str, list[Float64Array]] = {}
+  for name in names:
+    poses = [_pose_from_dict(p) for p in raw["body_poses_by_tracker"][name]]
+    btg_dict = raw["body_T_base_tag_by_tracker"][name]
+    btg = _pose_from_dict(btg_dict) if btg_dict is not None else None
+    out[name] = keypoint_world_position_per_kf(poses, btg, offset)
+  return out
+
+
 def _anchor_obs_kf_to_sides(
   anchor_obs_list: Any,
 ) -> dict[int, dict[str, Float64Array]]:
@@ -98,7 +113,11 @@ def _anchor_obs_kf_to_sides(
   return out
 
 
-def main(track_json: Path) -> None:
+def main(
+  track_json: Path,
+  reference_json: Path | None = None,
+  blackout: tuple[float, float] | None = None,
+) -> None:
   raw = json.loads(track_json.read_text())
   tracker_names: list[str] = list(raw["tracker_names"])
   ref_anchor = _pose_from_dict(raw["ref_anchor_pose_world"])
@@ -236,7 +255,7 @@ def main(track_json: Path) -> None:
   # Inter-tracker keypoint distance.
   keypoint_world_by_tracker: dict[str, list[Float64Array]] = {}
   for name in tracker_names:
-    btg_dict = raw["body_T_gripper_tag_by_tracker"][name]
+    btg_dict = raw["body_T_base_tag_by_tracker"][name]
     btg = _pose_from_dict(btg_dict) if btg_dict is not None else None
     keypoint_world_by_tracker[name] = keypoint_world_position_per_kf(
       body_poses_by_tracker[name], btg, keypoint_offset
@@ -255,6 +274,38 @@ def main(track_json: Path) -> None:
         f"p95={s['p95'] * 1000:.1f}mm "
         f"max={s['max'] * 1000:.1f}mm  (n={int(s['n'])})"
       )
+
+  # Fingertip drift vs a reference run (the full-anchor pseudo-GT). Both live
+  # in the same anchor world, so the per-kf L2 is the candidate's VI drift.
+  if reference_json is not None:
+    ref_kp = _keypoint_world_from_raw(json.loads(reference_json.read_text()))
+    drift_by_tracker: dict[str, dict[str, object]] = {}
+    print("\n=== fingertip drift vs reference (pseudo-GT) ===")
+    for name in tracker_names:
+      if name not in ref_kp:
+        continue
+      kf_times = np.asarray(raw["kf_times_by_tracker"][name], dtype=np.float64)
+      d = trajectory_position_drift(
+        keypoint_world_by_tracker[name], ref_kp[name], kf_times, window=blackout
+      )
+      drift_by_tracker[name] = d
+      ov = d["overall"]
+      assert isinstance(ov, dict)
+      msg = (
+        f"  [{name}] overall median={ov['median'] * 1000:.1f}mm "
+        f"max={ov['max'] * 1000:.1f}mm (n={int(ov['n'])})"
+      )
+      win = d.get("window")
+      if isinstance(win, dict):
+        bounds = d["window_bounds"]
+        assert isinstance(bounds, list)
+        msg += (
+          f" | blackout {bounds[0]:.0f}-{bounds[1]:.0f}s "
+          f"median={win['median'] * 1000:.1f}mm max={win['max'] * 1000:.1f}mm "
+          f"(n={int(win['n'])})"
+        )
+      print(msg)
+    metrics["fingertip_drift_vs_reference"] = drift_by_tracker
 
   out_path = track_json.with_suffix(".eval.json")
   out_path.write_text(json.dumps(metrics, indent=2, default=str))

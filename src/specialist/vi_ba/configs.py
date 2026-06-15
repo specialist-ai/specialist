@@ -20,6 +20,22 @@ class FrontendCfg:
   min_parallax_deg: float = 0.5
   mask_rear_rects: tuple[tuple[int, int, int, int], ...] = ((485, 950, 1435, 1920),)
   init_min_shared_tracks: int = 60
+  # DIS dense flow (default) vs gyro-seeded pyramidal KLT. KLT consumes the
+  # IMU rotation predictor (DIS ignores it); flip to False to stress-test the
+  # gyro-aided frontend through rotation.
+  use_dis_flow: bool = True
+  # When the anchor blacks out, the default pipeline drops every landmark not
+  # co-visible with an anchor keyframe, so vision contributes nothing through
+  # the gap (pure IMU dead-reckon). Set True to keep gap landmarks
+  # (triangulated from anchor-covisible views) and let the joint BA refine
+  # poses and structure together through the blackout.
+  keep_gap_landmarks: bool = False
+  # Restrict keep_gap to the front (world-facing) lens. The rear lens mostly
+  # images the gripper/hand, so its gap landmarks are unreliable.
+  keep_gap_front_only: bool = False
+  # Parallax gate (deg) on the anchor-covisible view subset used to triangulate
+  # gap landmarks; 0 disables. Sweepable to drop short-baseline gap landmarks.
+  gap_min_parallax_deg: float = 0.5
 
 
 @dataclass
@@ -48,6 +64,12 @@ class AnchorCfg:
   sigma_radius_scale: float = 0.1
   # Huber threshold; caps single-frame PnP outliers. None disables.
   huber_k: float | None = 1.5
+  # Ablation bench: drop every anchor observation whose keyframe time falls
+  # in [blackout_start, blackout_end] (seconds, clip clock). Both None = no
+  # blackout. Lets the full-anchor run serve as pseudo-GT while a candidate
+  # run flies blind through the window on VI alone.
+  blackout_start: float | None = None
+  blackout_end: float | None = None
 
 
 @dataclass

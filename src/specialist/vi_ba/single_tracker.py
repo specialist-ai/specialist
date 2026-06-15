@@ -346,6 +346,21 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
       ).items():
         anchor_obs_per_kf.setdefault(kf, {})[side] = pose
 
+  if args.anchor.blackout_start is not None and args.anchor.blackout_end is not None:
+    blackout = {
+      kf
+      for kf in anchor_obs_per_kf
+      if args.anchor.blackout_start <= kf_times[kf] <= args.anchor.blackout_end
+    }
+    for kf in blackout:
+      del anchor_obs_per_kf[kf]
+    if blackout:
+      print(
+        f"  [{name}] anchor blackout "
+        f"{args.anchor.blackout_start:.1f}-{args.anchor.blackout_end:.1f}s: "
+        f"dropped {len(blackout)} anchor kfs"
+      )
+
   front_masks = _build_non_anchor_tag_masks(
     front_frames, front_tags_per_kf, args.anchor.tag_id, args.frontend.mask_tag_pad_px
   )
@@ -359,6 +374,7 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
     n_features=args.frontend.orb_n_features,
     ransac_threshold_px=args.frontend.ransac_threshold_px,
     max_half_angle_deg=args.frontend.max_half_angle_deg,
+    use_dis_flow=args.frontend.use_dis_flow,
   )
   imu_to_body_pre = np.asarray(args.imu.imu_to_body, dtype=np.float64)
   gyro_body_pre = (
@@ -618,19 +634,50 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
   }
   if use_anchor:
     anchor_kfs = set(anchor_obs_per_kf.keys())
-    front_kept = {
-      t: front_kept[t] for t in front_kept if anchor_kfs & front_kept[t].keys()
-    }
-    rear_kept = {t: rear_kept[t] for t in rear_kept if anchor_kfs & rear_kept[t].keys()}
+    gap_par = args.frontend.gap_min_parallax_deg
+
+    def _gated(
+      kept: dict[int, dict[int, Float64Array]],
+    ) -> dict[int, dict[int, Float64Array]]:
+      """Default behavior: keep only tracks co-visible with an anchor kf."""
+      return {t: kept[t] for t in kept if anchor_kfs & kept[t].keys()}
+
+    def _gap_subset(
+      kept: dict[int, dict[int, Float64Array]], params: MeiParams
+    ) -> dict[int, dict[int, Float64Array]]:
+      """keep_gap: keep full tracks but triangulate from anchor-covisible views
+      only (the blackout poses are IMU dead-reckon and would corrupt the DLT),
+      then parallax-gate to drop short-baseline gap landmarks. The full track
+      (incl. blackout obs) stays in front_kept/rear_kept for the reprojection
+      factors, so vision constrains the unanchored poses."""
+      sub = {
+        t: {k: v for k, v in obs.items() if k in anchor_kfs} for t, obs in kept.items()
+      }
+      if gap_par > 0.0:
+        sub, _ = filter_tracks_by_parallax(sub, params, gap_par)
+      return sub
+
+    if args.frontend.keep_gap_landmarks:
+      front_for_tri = _gap_subset(front_kept, front_lens.params)
+      if args.frontend.keep_gap_front_only:
+        rear_kept = _gated(rear_kept)
+        rear_for_tri = rear_kept
+      else:
+        rear_for_tri = _gap_subset(rear_kept, rear_lens.params)
+    else:
+      front_kept = _gated(front_kept)
+      rear_kept = _gated(rear_kept)
+      front_for_tri = front_kept
+      rear_for_tri = rear_kept
     front_points = triangulate_lens(
-      {t: front_kept[t] for t in front_kept if t in front_unscaled},
+      {t: front_for_tri[t] for t in front_for_tri if t in front_unscaled},
       body_poses,
       front_lens.extrinsic,
       front_lens.params,
       args.frontend.min_track_length,
     )
     rear_points = triangulate_lens(
-      {t: rear_kept[t] for t in rear_kept if t in rear_unscaled},
+      {t: rear_for_tri[t] for t in rear_for_tri if t in rear_unscaled},
       body_poses,
       rear_lens.extrinsic,
       rear_lens.params,

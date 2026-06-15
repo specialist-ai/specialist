@@ -353,6 +353,50 @@ def keypoint_world_position_per_kf(
   return out
 
 
+def trajectory_position_drift(
+  candidate_keypoint_world: list[Float64Array],
+  reference_keypoint_world: list[Float64Array],
+  kf_times: Float64Array,
+  window: tuple[float, float] | None = None,
+) -> dict[str, object]:
+  """Per-kf L2 distance between a candidate and a reference fingertip
+  world trajectory. Both must live in the same anchor world — guaranteed
+  when the candidate's anchor blackout leaves the first anchor sighting
+  intact, so no alignment is applied (the surviving sparse anchors pin
+  the frame). Returns the per-kf series, overall stats, and — if
+  ``window`` (a ``(start_s, end_s)`` time range) is given — stats
+  restricted to keyframes inside it (the blacked-out segment)."""
+  n = min(len(candidate_keypoint_world), len(reference_keypoint_world))
+  per_kf = [
+    float(np.linalg.norm(candidate_keypoint_world[k] - reference_keypoint_world[k]))
+    for k in range(n)
+  ]
+
+  def _stats(idxs: list[int]) -> dict[str, float]:
+    vals = [per_kf[k] for k in idxs]
+    if not vals:
+      return {
+        "n": 0,
+        "max": float("nan"),
+        "median": float("nan"),
+        "mean": float("nan"),
+      }
+    return {
+      "n": float(len(vals)),
+      "max": float(np.max(vals)),
+      "median": float(np.median(vals)),
+      "mean": float(np.mean(vals)),
+    }
+
+  out: dict[str, object] = {"per_kf": per_kf, "overall": _stats(list(range(n)))}
+  if window is not None:
+    lo, hi = window
+    win_idx = [k for k in range(n) if lo <= float(kf_times[k]) <= hi]
+    out["window"] = _stats(win_idx)
+    out["window_bounds"] = [float(lo), float(hi)]
+  return out
+
+
 def per_pair_keypoint_distances(
   keypoint_world_by_tracker: dict[str, list[Float64Array]],
   tracker_order: list[str],
