@@ -882,11 +882,14 @@ def log_multi_ba_run(
   mask_pad_px: int = 0,
   urdf_path: Path | None = None,
   open_viewer: bool = True,
+  ground_truth_gripper_poses: list[gtsam.Pose3] | None = None,
+  ground_truth_times: Float64Array | None = None,
 ) -> None:
   """Multi-tracker entry point. Each tracker's entities live under
   ``/<name>/...``, image overlays under ``/image/<name>/<lens>``, scalars
   under ``/metrics/<name>/...``. The anchor tag is logged once at
-  ``/world/anchor_tag``."""
+  ``/world/anchor_tag``. ``ground_truth_positions`` (N,3, already in the
+  shared world frame) is drawn statically at ``/world/ground_truth``."""
   rr.init("specialist.vi_ba", spawn=False)
   for i, t in enumerate(trackers):
     if not t.name:
@@ -915,6 +918,57 @@ def log_multi_ba_run(
   rr.log("world", rr.ViewCoordinates.RIGHT_HAND_Z_UP, static=True)
   rr.log("world", rr.Transform3D(child_frame="world"), static=True)
   _log_anchor("world", anchor_pose_world, anchor_tag_size)
+  if ground_truth_gripper_poses:
+    gp = ground_truth_gripper_poses
+    off = np.asarray(
+      trackers[0].trajectory_offset_in_gripper or (0.0, 0.0, 0.0), dtype=np.float64
+    )
+    root = np.asarray([np.asarray(p.translation()) for p in gp], dtype=np.float64)
+    ftip = np.asarray(
+      [np.asarray(p.translation()) + p.rotation().matrix() @ off for p in gp],
+      dtype=np.float64,
+    )
+    rr.log(
+      "world/ground_truth/fingertip",
+      rr.LineStrips3D([ftip], colors=(0, 255, 90), radii=0.003),
+      static=True,
+    )
+    if urdf_path is not None:
+      gt_tree = rr.urdf.UrdfTree.from_file_path(
+        str(urdf_path), entity_path_prefix="ground_truth", frame_prefix="gt_"
+      )
+      gt_tree.log_urdf_to_recording()
+      links = [gt_tree.root_link(), *map(gt_tree.get_joint_child, gt_tree.joints())]
+      for link in links:
+        for p in gt_tree.get_collision_geometry_paths(link):
+          rr.log(p, rr.Clear(recursive=True), static=True)
+        for p in gt_tree.get_visual_geometry_paths(link):
+          rr.log(
+            p, rr.Mesh3D.from_fields(albedo_factor=[0.1, 0.95, 0.4, 0.4]), static=True
+          )
+      gt_root_frame = f"gt_{gt_tree.root_link().name}"
+      rr.log(
+        "ground_truth/gripper",
+        rr.Transform3D(parent_frame="world", child_frame=gt_root_frame),
+        static=True,
+      )
+      gtimes = (
+        rr.TimeColumn(
+          _TIMELINE, duration=np.asarray(ground_truth_times, dtype=np.float64)
+        )
+        if ground_truth_times is not None
+        else rr.TimeColumn(_TIMELINE, sequence=np.arange(len(gp), dtype=np.int64))
+      )
+      rr.send_columns(
+        "ground_truth/gripper",
+        indexes=[gtimes],
+        columns=rr.Transform3D.columns(
+          translation=root,
+          quaternion=np.stack([_pose_quaternion_xyzw(p) for p in gp], axis=0),
+          parent_frame=["world"] * len(gp),
+          child_frame=[gt_root_frame] * len(gp),
+        ),
+      )
   for t in trackers:
     _log_tracker(
       t,
