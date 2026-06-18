@@ -200,6 +200,13 @@ def run_lens_frontend(
     )
     filtered.append(m[inliers])
   tracks = chain_tracks(orb_frames, filtered)
+  n_kp = sum(int(len(f.keypoints)) for f in orb_frames)
+  n_match = sum(int(m.shape[0]) for m in matches_between)
+  n_in = sum(int(f.shape[0]) for f in filtered)
+  print(
+    f"  [frontend funnel] keypoints={n_kp} matched={n_match} "
+    f"ransac_inliers={n_in} chained_tracks={len(tracks)}"
+  )
   return orb_frames, tracks
 
 

@@ -23,9 +23,18 @@ def optimize_graph(
   max_iterations: int = 50,
 ) -> OptimizeResult:
   """Run Levenberg-Marquardt and return values + run stats."""
+  initial_error = float(graph.error(initial_values))
+  if max_iterations <= 0:
+    # Return the initialization untouched — used to evaluate an init in
+    # isolation, with no bundle-adjustment refinement.
+    return OptimizeResult(
+      values=initial_values,
+      iterations=0,
+      initial_error=initial_error,
+      final_error=initial_error,
+    )
   params = gtsam.LevenbergMarquardtParams()
   params.setMaxIterations(max_iterations)
-  initial_error = float(graph.error(initial_values))
   optimizer = gtsam.LevenbergMarquardtOptimizer(graph, initial_values, params)
   result = optimizer.optimize()
   return OptimizeResult(

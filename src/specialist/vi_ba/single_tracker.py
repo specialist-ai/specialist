@@ -10,6 +10,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import cv2
 import gtsam
 import numpy as np
 import numpy.typing as npt
@@ -30,6 +31,7 @@ from specialist.vi_ba.configs import (
   ImuCfg,
 )
 from specialist.vi_ba.extrinsics import parse_insv_extrinsics
+from specialist.vi_ba.features import detect_orb, match_pair
 from specialist.vi_ba.imu import (
   ImuSamples,
   factory_imu_bias,
@@ -41,6 +43,7 @@ from specialist.vi_ba.init import (
   Alignment,
   apply_alignment_to_poses,
   body_poses_from_camera_poses,
+  incremental_sfm,
   interpolate_camera_poses,
   pick_init_pair,
   two_view_essential,
@@ -314,6 +317,212 @@ def _make_imu_klt_predictor(
   return predictor
 
 
+def _bearings_by_track(
+  tracks: dict[int, dict[int, Float64Array]], params: MeiParams
+) -> dict[int, dict[int, Float64Array]]:
+  """``{tid: {kf: unit bearing}}`` for the visual-odometry front-end."""
+  out: dict[int, dict[int, Float64Array]] = {}
+  for tid, obs in tracks.items():
+    kfs = sorted(obs)
+    b = mei_unproject(np.asarray([obs[k] for k in kfs], dtype=np.float64), params)
+    nrm = np.linalg.norm(b, axis=1, keepdims=True)
+    b = b / np.where(nrm == 0.0, 1.0, nrm)
+    out[tid] = {k: b[i] for i, k in enumerate(kfs)}
+  return out
+
+
+def _subsample_obs(
+  track: dict[int, Float64Array], max_obs: int
+) -> dict[int, Float64Array]:
+  """Keep at most ``max_obs`` observations (endpoints + evenly-spaced middle),
+  preserving the track's baseline. Trims reprojection-factor count for the BA."""
+  kfs = sorted(track)
+  if max_obs <= 0 or len(kfs) <= max_obs:
+    return track
+  idx = np.unique(np.linspace(0, len(kfs) - 1, max_obs).round().astype(int))
+  return {kfs[i]: track[kfs[i]] for i in idx}
+
+
+def _cap_landmarks(
+  points: dict[int, Float64Array],
+  tracks: dict[int, dict[int, Float64Array]],
+  cap: int,
+) -> dict[int, Float64Array]:
+  """Keep at most ``cap`` landmarks, preferring the longest tracks (most
+  observations → best-constrained). No-op when already under the cap."""
+  if cap <= 0 or len(points) <= cap:
+    return points
+  keep = set(sorted(points, key=lambda t: -len(tracks.get(t, {})))[:cap])
+  return {t: p for t, p in points.items() if t in keep}
+
+
+def _loop_closure_tracks(
+  frames: list[np.ndarray],
+  masks: list[np.ndarray],
+  body_poses: list[gtsam.Pose3],
+  lens: LensSetup,
+  n_features: int,
+  base_track_id: int,
+  max_center_dist: float,
+  min_kf_gap: int,
+  n_neighbors: int = 4,
+  ratio: float = 0.7,
+  ransac_px: float = 3.0,
+  min_views: int = 3,
+  min_inliers: int = 20,
+) -> dict[int, dict[int, Float64Array]]:
+  """Recover tracks broken by fast lifts via ORB loop closure.
+
+  Fast repositioning breaks the chained optical-flow tracks, so a physical point
+  seen before and after a lift becomes two disconnected tracks and nothing ties
+  the revisited poses together — the visual odometry drifts across the lift. Here
+  ORB features are re-matched between spatially-close, non-adjacent keyframes
+  (revisits of the writing workspace), geometrically verified, and union-found
+  into multi-view tracks spanning the lifts. Triangulated against the (drifted)
+  poses these become wide-baseline landmarks whose reprojection inconsistency
+  drives the bundle to pull the revisits back together, cancelling the drift."""
+  orb = [detect_orb(f, n_features, 20, m) for f, m in zip(frames, masks, strict=True)]
+  centers = np.asarray(
+    [
+      np.asarray(p.compose(lens.extrinsic).translation(), dtype=np.float64)
+      for p in body_poses
+    ]
+  )
+  n = len(frames)
+  parent: dict[tuple[int, int], tuple[int, int]] = {}
+
+  def find(x: tuple[int, int]) -> tuple[int, int]:
+    parent.setdefault(x, x)
+    root = x
+    while parent[root] != root:
+      root = parent[root]
+    while parent[x] != root:
+      parent[x], x = root, parent[x]
+    return root
+
+  for i in range(n):
+    if len(orb[i].keypoints) == 0:
+      continue
+    dist = np.linalg.norm(centers - centers[i], axis=1)
+    cand = [
+      int(j)
+      for j in np.argsort(dist)
+      if j > i and (j - i) > min_kf_gap and dist[j] <= max_center_dist
+    ][:n_neighbors]
+    for j in cand:
+      m = match_pair(orb[i], orb[j], ratio)
+      if len(m) < min_inliers:
+        continue
+      pa = orb[i].keypoints[m[:, 0]]
+      pb = orb[j].keypoints[m[:, 1]]
+      # Revisits are near-identical small-baseline views, so the essential matrix
+      # is degenerate and lets false matches through (which wreck the bundle).
+      # A homography is the right model for the small inter-view change and
+      # rejects the inconsistent matches.
+      _, mask = cv2.findHomography(pa, pb, cv2.RANSAC, ransac_px)
+      if mask is None:
+        continue
+      inl = mask.ravel().astype(bool)
+      if int(inl.sum()) < min_inliers:
+        continue
+      for k in np.where(inl)[0]:
+        ra = find((i, int(m[k, 0])))
+        rb = find((j, int(m[k, 1])))
+        if ra != rb:
+          parent[ra] = rb
+
+  comps: dict[tuple[int, int], dict[int, int]] = {}
+  for node in list(parent):
+    comps.setdefault(find(node), {})[node[0]] = node[1]
+  tracks: dict[int, dict[int, Float64Array]] = {}
+  tid = base_track_id + 1
+  for by_kf in comps.values():
+    if len(by_kf) < min_views:
+      continue
+    # Store pixel coordinates (like the optical-flow tracks): downstream
+    # triangulation and reprojection unproject through the MEI model themselves.
+    tracks[tid] = {
+      kf: np.asarray(orb[kf].keypoints[kp], dtype=np.float64)
+      for kf, kp in by_kf.items()
+    }
+    tid += 1
+  return tracks
+
+
+def _reject_vo_pose_outliers(
+  cam_poses: dict[int, gtsam.Pose3], reject_factor: float = 8.0
+) -> tuple[dict[int, gtsam.Pose3], list[int]]:
+  """Drop incremental-SfM keyframes whose camera center is a local spike.
+
+  Pure monocular SfM has no global consistency, so a degenerate PnP (few
+  co-visible landmarks during fast rotation) can teleport a single keyframe far
+  off the smooth path. Such a spike corrupts the visual displacements that the
+  IMU scale alignment consumes, collapsing the recovered scale. Each interior
+  registered keyframe is compared against the linear interpolation of its
+  immediate registered neighbors; a residual exceeding ``reject_factor`` times
+  the median per-keyframe step marks a spike. Spikes are removed iteratively
+  (worst first) so ``_fill_camera_poses`` interpolates cleanly across them.
+
+  ``reject_factor`` is deliberately loose (8×): a genuine real-motion burst can
+  reach ~7× the slow-motion median step, and rejecting those over-interpolates
+  the rotation and wrecks the recovered orientation. Only the far-larger PnP
+  teleports should be cut."""
+  kept = dict(cam_poses)
+  removed: list[int] = []
+  for _ in range(len(cam_poses)):
+    ks = sorted(kept)
+    if len(ks) < 5:
+      break
+    c = {k: np.asarray(kept[k].translation(), dtype=np.float64) for k in ks}
+    steps = [
+      float(np.linalg.norm(c[ks[i + 1]] - c[ks[i]])) / (ks[i + 1] - ks[i])
+      for i in range(len(ks) - 1)
+    ]
+    median_step = float(np.median(steps))
+    if median_step < 1e-12:
+      break
+    worst_k: int | None = None
+    worst_r = 0.0
+    for i in range(1, len(ks) - 1):
+      kp, k, kn = ks[i - 1], ks[i], ks[i + 1]
+      f = (k - kp) / (kn - kp)
+      pred = (1.0 - f) * c[kp] + f * c[kn]
+      r = float(np.linalg.norm(c[k] - pred))
+      if r > worst_r:
+        worst_r, worst_k = r, k
+    if worst_k is not None and worst_r > reject_factor * median_step:
+      del kept[worst_k]
+      removed.append(worst_k)
+    else:
+      break
+  return kept, sorted(removed)
+
+
+def _fill_camera_poses(
+  cam_poses: dict[int, gtsam.Pose3], n_frames: int
+) -> list[gtsam.Pose3]:
+  """Expand SfM-registered camera poses to a full per-keyframe list, filling
+  unregistered keyframes by SLERP+lerp between nearest neighbors (held at the
+  ends). The joint BA refines these from IMU + reprojection."""
+  reg = sorted(cam_poses)
+  out: list[gtsam.Pose3] = []
+  for k in range(n_frames):
+    if k in cam_poses:
+      out.append(cam_poses[k])
+      continue
+    lo = max((r for r in reg if r < k), default=None)
+    hi = min((r for r in reg if r > k), default=None)
+    if lo is None:
+      out.append(cam_poses[hi])  # type: ignore[index]
+    elif hi is None:
+      out.append(cam_poses[lo])
+    else:
+      pa, pb = cam_poses[lo], cam_poses[hi]
+      f = (k - lo) / (hi - lo)
+      out.append(pa.compose(gtsam.Pose3.Expmap(f * gtsam.Pose3.Logmap(pa.between(pb)))))
+  return out
+
+
 def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
   """Run every per-tracker stage. Returns a ``PreparedTracker`` ready for
   joint-graph composition. Body poses are in this tracker's own gravity-
@@ -360,6 +569,15 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
         f"{args.anchor.blackout_start:.1f}-{args.anchor.blackout_end:.1f}s: "
         f"dropped {len(blackout)} anchor kfs"
       )
+
+  if args.anchor.keep_every > 1 and anchor_obs_per_kf:
+    keep = set(sorted(anchor_obs_per_kf.keys())[:: args.anchor.keep_every])
+    dropped = len(anchor_obs_per_kf) - len(keep)
+    anchor_obs_per_kf = {kf: v for kf, v in anchor_obs_per_kf.items() if kf in keep}
+    print(
+      f"  [{name}] anchor keep_every={args.anchor.keep_every}: "
+      f"kept {len(keep)}, dropped {dropped}"
+    )
 
   front_masks = _build_non_anchor_tag_masks(
     front_frames, front_tags_per_kf, args.anchor.tag_id, args.frontend.mask_tag_pad_px
@@ -465,6 +683,35 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
   cam_poses = interpolate_camera_poses(r_cw_last, t_cw_last, n_frames)
   body_poses_unscaled = body_poses_from_camera_poses(cam_poses, init_extrinsic)
 
+  # Visual-odometry front-end: recover the real per-keyframe trajectory shape
+  # from front-lens correspondences (front owns rotation/shape) instead of the
+  # two-keyframe straight line. Falls back to the straight line above if the
+  # incremental SfM cannot register enough keyframes.
+  if args.frontend.use_visual_odometry:
+    sfm_cams, _ = incremental_sfm(
+      _bearings_by_track(front_kept, front_lens.params),
+      n_frames,
+      min_shared=args.frontend.init_min_shared_tracks,
+    )
+    sfm_cams, _vo_outliers = _reject_vo_pose_outliers(sfm_cams)
+    if _vo_outliers:
+      print(
+        f"  [{name}] visual-odometry rejected {len(_vo_outliers)} rotation-spike kfs"
+      )
+    if len(sfm_cams) >= max(8, n_frames // 4):
+      body_poses_unscaled = body_poses_from_camera_poses(
+        _fill_camera_poses(sfm_cams, n_frames), front_lens.extrinsic
+      )
+      print(
+        f"  [{name}] visual-odometry init: registered "
+        f"{len(sfm_cams)}/{n_frames} keyframes"
+      )
+    else:
+      print(
+        f"  [{name}] visual-odometry init: only {len(sfm_cams)}/{n_frames} "
+        f"keyframes registered — using straight-line init"
+      )
+
   imu_to_body = np.asarray(args.imu.imu_to_body, dtype=np.float64)
   raw_gyro = np.deg2rad(np.asarray(data.gyro_deg, dtype=np.float64)) @ imu_to_body.T
   raw_accel = np.asarray(data.accel, dtype=np.float64) @ imu_to_body.T
@@ -539,7 +786,9 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
     gravity_world=pim_gravity,
   )
   pim_init = preintegrate_between_keyframes(params_pim, imu, kf_times, bias0)
-  alignment = visual_inertial_align(body_poses_visual, pim_init)
+  alignment = visual_inertial_align(
+    body_poses_visual, pim_init, fixed_gravity=gravity_world_initial
+  )
   if alignment.scale < 0.0:
     origin = np.asarray(body_poses_visual[0].translation(), dtype=np.float64)
     body_poses_visual = [
@@ -549,7 +798,9 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
       )
       for p in body_poses_visual
     ]
-    alignment = visual_inertial_align(body_poses_visual, pim_init)
+    alignment = visual_inertial_align(
+      body_poses_visual, pim_init, fixed_gravity=gravity_world_initial
+    )
   # Override LSQ-fit gravity with the IMU stationary-window estimate so the
   # world frame stays gravity-aligned (LSQ-fit gravity can drift up to ~30°
   # from the IMU truth, which then tilts the rerun viewer's z-up convention).
@@ -559,6 +810,7 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
       gravity_world=gravity_world_initial,
       velocities=alignment.velocities,
     )
+  print(f"  [{name}] VI scale={alignment.scale:.4f}")
   body_poses, world_rotation = apply_alignment_to_poses(body_poses_visual, alignment)
   world_rot_mat = world_rotation.matrix()
   velocities = [world_rot_mat @ v for v in alignment.velocities]
@@ -582,46 +834,69 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
     anchor_pose_world_local = (
       body_poses[first_kf].compose(first_lens.extrinsic).compose(first_cam_T_tag)
     )
-    for kf, kf_sides in anchor_obs_per_kf.items():
-      lens = front_lens if "front" in kf_sides else rear_lens
-      cam_T_tag = kf_sides.get("front", kf_sides.get("rear"))
-      assert cam_T_tag is not None
-      body_poses[kf] = anchor_pose_world_local.compose(
-        lens.extrinsic.compose(cam_T_tag).inverse()
-      )
-    sorted_kfs = sorted(anchor_obs_per_kf.keys())
-    if len(sorted_kfs) >= 2:
-      jumps = [
-        float(
-          np.linalg.norm(
-            np.asarray(body_poses[sorted_kfs[i]].translation())
-            - np.asarray(body_poses[sorted_kfs[i - 1]].translation())
-          )
+    # Visual-odometry mode keeps the vision trajectory and lets the anchor
+    # enter only as a joint-graph factor; the per-keyframe PnP pose overwrite
+    # and IMU gap dead-reckon below are the anchor-owns-the-trajectory path.
+    if not args.frontend.use_visual_odometry:
+      for kf, kf_sides in anchor_obs_per_kf.items():
+        lens = front_lens if "front" in kf_sides else rear_lens
+        cam_T_tag = kf_sides.get("front", kf_sides.get("rear"))
+        assert cam_T_tag is not None
+        body_poses[kf] = anchor_pose_world_local.compose(
+          lens.extrinsic.compose(cam_T_tag).inverse()
         )
-        for i in range(1, len(sorted_kfs))
-      ]
-      i = int(np.argmax(jumps))
-      print(
-        f"  [{name}] max anchor-init Δp: {jumps[i]:.3f} m at kf {sorted_kfs[i + 1]}"
-      )
-    # IMU forward-propagation from each anchor kf fills the gap kfs with the
-    # IMU-integrated trajectory instead of constant-velocity pose interpolation.
-    first_anchor = sorted_kfs[0]
-    for k in range(first_anchor):
-      body_poses[k] = body_poses[first_anchor]
-      velocities[k] = velocities[first_anchor]
-    for i in range(len(sorted_kfs)):
-      a = sorted_kfs[i]
-      b = sorted_kfs[i + 1] if i + 1 < len(sorted_kfs) else n_frames
-      if b - a <= 1:
-        continue
-      nav = gtsam.NavState(body_poses[a], velocities[a])
-      for k in range(a + 1, b):
-        nav = pim[k - 1].predict(nav, bias0)
-        if k in anchor_obs_per_kf:
+      sorted_kfs = sorted(anchor_obs_per_kf.keys())
+      if len(sorted_kfs) >= 2:
+        jumps = [
+          float(
+            np.linalg.norm(
+              np.asarray(body_poses[sorted_kfs[i]].translation())
+              - np.asarray(body_poses[sorted_kfs[i - 1]].translation())
+            )
+          )
+          for i in range(1, len(sorted_kfs))
+        ]
+        i = int(np.argmax(jumps))
+        print(
+          f"  [{name}] max anchor-init Δp: {jumps[i]:.3f} m at kf {sorted_kfs[i + 1]}"
+        )
+      # IMU forward-propagation from each anchor kf fills the gap kfs with the
+      # IMU-integrated trajectory instead of constant-velocity pose interpolation.
+      first_anchor = sorted_kfs[0]
+      for k in range(first_anchor):
+        body_poses[k] = body_poses[first_anchor]
+        velocities[k] = velocities[first_anchor]
+      for i in range(len(sorted_kfs)):
+        a = sorted_kfs[i]
+        b = sorted_kfs[i + 1] if i + 1 < len(sorted_kfs) else n_frames
+        if b - a <= 1:
           continue
-        body_poses[k] = nav.pose()
-        velocities[k] = np.asarray(nav.velocity(), dtype=np.float64)
+        # Bidirectional only for interior gaps (b is an anchor kf with a known
+        # snapped pose): distribute the forward-prop end drift across the gap.
+        bidir = b < n_frames
+        nav = gtsam.NavState(body_poses[a], velocities[a])
+        fwd_pose: dict[int, gtsam.Pose3] = {}
+        fwd_vel: dict[int, Float64Array] = {}
+        for k in range(a + 1, b + 1 if bidir else b):
+          nav = pim[k - 1].predict(nav, bias0)
+          fwd_pose[k] = nav.pose()
+          fwd_vel[k] = np.asarray(nav.velocity(), dtype=np.float64)
+        dp = (
+          np.asarray(body_poses[b].translation(), dtype=np.float64)
+          - np.asarray(fwd_pose[b].translation(), dtype=np.float64)
+          if bidir
+          else np.zeros(3, dtype=np.float64)
+        )
+        for k in range(a + 1, b):
+          if k in anchor_obs_per_kf:
+            continue
+          p = fwd_pose[k]
+          if bidir:
+            tk = np.asarray(p.translation(), dtype=np.float64) + (k - a) / (b - a) * dp
+            body_poses[k] = gtsam.Pose3(p.rotation(), gtsam.Point3(*tk))
+          else:
+            body_poses[k] = p
+          velocities[k] = fwd_vel[k]
 
   align_mat = alignment.scale * world_rotation.matrix()
   front_unscaled_metric = {
@@ -632,6 +907,18 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
     tid: align_mat @ np.asarray(rear_unscaled[tid], dtype=np.float64)
     for tid in rear_unscaled
   }
+  loop_tracks: dict[int, dict[int, Float64Array]] = {}
+  if args.frontend.use_visual_odometry and args.frontend.loop_closure:
+    loop_tracks = _loop_closure_tracks(
+      front_frames,
+      front_masks,
+      body_poses,
+      front_lens,
+      args.frontend.orb_n_features,
+      max(front_kept, default=0),
+      args.frontend.loop_closure_max_dist,
+      args.frontend.loop_closure_min_kf_gap,
+    )
   if use_anchor:
     anchor_kfs = set(anchor_obs_per_kf.keys())
     gap_par = args.frontend.gap_min_parallax_deg
@@ -657,7 +944,12 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
         sub, _ = filter_tracks_by_parallax(sub, params, gap_par)
       return sub
 
-    if args.frontend.keep_gap_landmarks:
+    if args.frontend.use_visual_odometry:
+      # Vision owns every keyframe pose, so triangulate the full tracks (no
+      # anchor-covisibility gating): the near-field rear structure survives.
+      front_for_tri = front_kept
+      rear_for_tri = rear_kept
+    elif args.frontend.keep_gap_landmarks:
       front_for_tri = _gap_subset(front_kept, front_lens.params)
       if args.frontend.keep_gap_front_only:
         rear_kept = _gated(rear_kept)
@@ -675,6 +967,7 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
       front_lens.extrinsic,
       front_lens.params,
       args.frontend.min_track_length,
+      max_landmark_depth=args.frontend.max_landmark_depth,
     )
     rear_points = triangulate_lens(
       {t: rear_for_tri[t] for t in rear_for_tri if t in rear_unscaled},
@@ -682,13 +975,39 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
       rear_lens.extrinsic,
       rear_lens.params,
       args.frontend.min_track_length,
+      max_landmark_depth=args.frontend.max_landmark_depth,
     )
+    if args.frontend.use_visual_odometry:
+      cap = args.frontend.vo_max_landmarks_per_lens
+      front_points = _cap_landmarks(front_points, front_for_tri, cap)
+      rear_points = _cap_landmarks(rear_points, rear_for_tri, cap)
+      if loop_tracks:
+        # Triangulated + merged after the cap so the drift-cancelling revisit
+        # landmarks are never culled by the per-lens landmark budget.
+        loop_pts = triangulate_lens(
+          loop_tracks,
+          body_poses,
+          front_lens.extrinsic,
+          front_lens.params,
+          args.frontend.min_track_length,
+          max_landmark_depth=args.frontend.max_landmark_depth,
+        )
+        front_points.update(loop_pts)
+        front_kept.update(loop_tracks)
+        print(
+          f"  [{name}] loop closure: +{len(loop_pts)} landmarks "
+          f"from {len(loop_tracks)} revisit tracks"
+        )
   else:
     front_points = front_unscaled_metric
     rear_points = rear_unscaled_metric
 
   front_tracks_tri = {t: front_kept[t] for t in front_points if t in front_kept}
   rear_tracks_tri = {t: rear_kept[t] for t in rear_points if t in rear_kept}
+  if args.frontend.use_visual_odometry:
+    m = args.frontend.vo_max_obs_per_track
+    front_tracks_tri = {t: _subsample_obs(o, m) for t, o in front_tracks_tri.items()}
+    rear_tracks_tri = {t: _subsample_obs(o, m) for t, o in rear_tracks_tri.items()}
 
   v_max = float(max(np.linalg.norm(v) for v in velocities))
   print(f"  [{name}] VIO LSQ |v|max={v_max:.2f} m/s")

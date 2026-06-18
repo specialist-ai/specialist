@@ -6,6 +6,7 @@ available in both modes."""
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -372,7 +373,7 @@ class TrackerVizData:
   # Per-keyframe ``(n, 2, 3)`` line endpoints (lens centre → tag) for every
   # factor firing at that keyframe. ``anchor_obs_lines`` is from this
   # tracker's lens(es) to the world anchor; ``cross_tracker_lines`` is from
-  # this tracker's lens(es) to other trackers' gripper tags it observed.
+  # this tracker's lens(es) to other trackers' base tags it observed.
   anchor_obs_lines: list[Float64Array] | None = None
   cross_tracker_lines: list[Float64Array] | None = None
   # ``None`` lets ``log_multi_ba_run`` assign a per-tracker palette color;
@@ -785,10 +786,14 @@ def log_ba_run(
   )
   rr.init("specialist.vi_ba", spawn=False)
   rr.send_blueprint(blueprint(_floor_z_for(data)), make_active=True, make_default=True)
-  if open_viewer:
+  if open_viewer and not os.environ.get("SPECIALIST_RRD_FILE_ONLY"):
     rr.spawn(connect=False)
     rr.set_sinks(rr.FileSink(str(rrd_path)), rr.GrpcSink())
   else:
+    # Headless/server generation: write the rrd directly (no viewer stream).
+    # Streaming a dense frames scene to a spawned-but-headless viewer thrashes
+    # and can hang; file-only keeps generation fast. Viewer still opens when
+    # the rrd is loaded locally.
     rr.save(str(rrd_path))
   rr.log("world", rr.ViewCoordinates.RIGHT_HAND_Z_UP, static=True)
   rr.log("world", rr.Transform3D(child_frame="world"), static=True)
@@ -910,10 +915,14 @@ def log_multi_ba_run(
     make_active=True,
     make_default=True,
   )
-  if open_viewer:
+  if open_viewer and not os.environ.get("SPECIALIST_RRD_FILE_ONLY"):
     rr.spawn(connect=False)
     rr.set_sinks(rr.FileSink(str(rrd_path)), rr.GrpcSink())
   else:
+    # Headless/server generation: write the rrd directly (no viewer stream).
+    # Streaming a dense frames scene to a spawned-but-headless viewer thrashes
+    # and can hang; file-only keeps generation fast. Viewer still opens when
+    # the rrd is loaded locally.
     rr.save(str(rrd_path))
   rr.log("world", rr.ViewCoordinates.RIGHT_HAND_Z_UP, static=True)
   rr.log("world", rr.Transform3D(child_frame="world"), static=True)

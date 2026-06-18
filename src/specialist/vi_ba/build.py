@@ -6,6 +6,7 @@ the intermediates."""
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
@@ -46,6 +47,13 @@ def rear_landmark_key(track_id: int) -> int:
   return int(L(_REAR_LANDMARK_OFFSET + track_id))
 
 
+def _reproj_noise_scale(n_obs: int, ref_obs: int = 8, max_mult: float = 4.0) -> float:
+  """Adaptive reprojection-σ multiplier from track length: a landmark seen in
+  more keyframes is better-triangulated → tighter; short tracks → looser.
+  Floored at 0.5 so we never wildly over-trust long tracks."""
+  return float(min(max(math.sqrt(ref_obs / max(n_obs, 1)), 0.5), max_mult))
+
+
 def _add_projection_factors(
   graph: gtsam.NonlinearFactorGraph,
   values: gtsam.Values,
@@ -55,19 +63,28 @@ def _add_projection_factors(
   landmark_key_fn: Callable[[int], int],
   pixel_noise: gtsam.noiseModel.Base,
   pose_key_fn: Callable[[int], int] | None = None,
+  adaptive_pixel_sigma: float | None = None,
 ) -> None:
   pose_key = pose_key_fn if pose_key_fn is not None else (lambda i: int(X(i)))
   for tid, xyz in points.items():
     lm_key = landmark_key_fn(tid)
     if not values.exists(lm_key):
       values.insert(lm_key, gtsam.Point3(float(xyz[0]), float(xyz[1]), float(xyz[2])))
+    if adaptive_pixel_sigma is not None:
+      scale = _reproj_noise_scale(len(tracks[tid]))
+      noise = gtsam.noiseModel.Robust.Create(
+        gtsam.noiseModel.mEstimator.Huber.Create(1.345),
+        gtsam.noiseModel.Isotropic.Sigma(2, adaptive_pixel_sigma * scale),
+      )
+    else:
+      noise = pixel_noise
     for fi, pt in tracks[tid].items():
       graph.push_back(
         make_mei_factor(
           pose_key=pose_key(fi),
           landmark_key=lm_key,
           pixel=np.asarray(pt, dtype=np.float64),
-          noise=pixel_noise,
+          noise=noise,
           extrinsic=lens.extrinsic,
           params=lens.params,
         )
@@ -153,6 +170,7 @@ def build_vi_graph(
   bias_key_fn: Callable[[int], int] | None = None,
   front_landmark_key_fn: Callable[[int], int] | None = None,
   rear_landmark_key_fn: Callable[[int], int] | None = None,
+  adaptive_reproj: bool = False,
   graph: gtsam.NonlinearFactorGraph | None = None,
   values: gtsam.Values | None = None,
 ) -> tuple[gtsam.NonlinearFactorGraph, gtsam.Values]:
@@ -226,12 +244,29 @@ def build_vi_graph(
     )
 
   # Per-lens projection factors.
+  adaptive_sigma = pixel_sigma if adaptive_reproj else None
   _add_projection_factors(
-    graph, values, front_tracks, front_points, front, front_lm, pixel_noise, pose_key
+    graph,
+    values,
+    front_tracks,
+    front_points,
+    front,
+    front_lm,
+    pixel_noise,
+    pose_key,
+    adaptive_pixel_sigma=adaptive_sigma,
   )
   if rear is not None and rear_tracks is not None and rear_points is not None:
     _add_projection_factors(
-      graph, values, rear_tracks, rear_points, rear, rear_lm, pixel_noise, pose_key
+      graph,
+      values,
+      rear_tracks,
+      rear_points,
+      rear,
+      rear_lm,
+      pixel_noise,
+      pose_key,
+      adaptive_pixel_sigma=adaptive_sigma,
     )
 
   return graph, values
