@@ -24,6 +24,28 @@ class FrontendCfg:
   max_landmark_depth: float = 5.0
   mask_rear_rects: tuple[tuple[int, int, int, int], ...] = ((728, 1425, 2153, 2880),)
   init_min_shared_tracks: int = 60
+  # Loop closure: re-match ORB features between spatially-close, non-adjacent
+  # keyframes (the fingertip writing revisits the workspace) to recover tracks
+  # the fast lifts break, adding wide-baseline landmarks that tie the revisits
+  # together in the bundle and cancel the drift accumulated across each lift.
+  loop_closure: bool = True
+  loop_closure_max_dist: float = 0.1
+  loop_closure_min_kf_gap: int = 15
+  # Use incremental visual odometry (front-lens SfM) for the trajectory shape
+  # instead of the two-keyframe straight-line interpolation, and let the anchor
+  # enter only as a joint-graph factor (no per-keyframe PnP pose overwrite).
+  # Triangulates both lenses against the vision trajectory so the near-field
+  # rear structure survives to constrain scale.
+  use_visual_odometry: bool = True
+  # Cap on triangulated landmarks per lens in visual-odometry mode (keeps the
+  # longest-track, best-constrained landmarks). The dense far-field front
+  # structure is redundant; capping keeps the joint BA tractable.
+  vo_max_landmarks_per_lens: int = 400
+  # Cap on reprojection observations per track fed to the joint BA in
+  # visual-odometry mode (endpoints + evenly-spaced middle, preserving the
+  # track's baseline). Long VO tracks otherwise add ~15 factors each; capping
+  # the factor count keeps BA runtime near the anchor-snapped baseline.
+  vo_max_obs_per_track: int = 8
 
 
 @dataclass
@@ -43,8 +65,12 @@ class ImuCfg:
 class AnchorCfg:
   tag_id: int
   tag_size: float = 0.1
-  translation_sigma: float = 0.002
-  rotation_sigma: float = 0.005
+  # Per-frame single-tag PnP is only ~cm-accurate at ~1 m (and laterally weak),
+  # so the anchor enters as a soft frame/scale reference, not a hard per-frame
+  # pose; visual odometry owns the trajectory shape. A tight σ here forces the
+  # inflated PnP onto the trajectory (the session_03 2x over-scale).
+  translation_sigma: float = 0.02
+  rotation_sigma: float = 0.05
   prior_translation_sigma: float = 1.0e-4
   prior_rotation_sigma: float = 1.0e-4
   # σ multiplier = (1 + max(0, r − pivot) / scale)² for tag image radius r.
