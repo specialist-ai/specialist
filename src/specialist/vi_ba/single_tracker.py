@@ -7,8 +7,10 @@ compose into a joint factor graph.
 from __future__ import annotations
 
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TypeVar
 
 import cv2
 import gtsam
@@ -62,11 +64,29 @@ from specialist.vi_ba.pipeline import (
 
 Float64Array = npt.NDArray[np.float64]
 
+_A = TypeVar("_A")
+_B = TypeVar("_B")
+
 __all__ = [
   "PreparedTracker",
   "TrackerArgs",
   "prepare_tracker",
+  "run_two_concurrently",
 ]
+
+
+def run_two_concurrently(
+  task_a: Callable[[], _A], task_b: Callable[[], _B]
+) -> tuple[_A, _B]:
+  """Run two independent CPU-bound thunks on separate threads, return ``(a, b)``.
+  OpenCV (DIS flow, ORB, essential/homography RANSAC) and the AprilTag detector
+  release the GIL during their native calls, so the front and rear lens stages
+  run on separate cores. The result is independent of completion order, so it
+  matches sequential execution."""
+  with ThreadPoolExecutor(max_workers=2) as ex:
+    fut_a = ex.submit(task_a)
+    fut_b = ex.submit(task_b)
+    return fut_a.result(), fut_b.result()
 
 
 @dataclass
@@ -588,8 +608,10 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
     raise RuntimeError(f"only {n_frames} keyframes decoded — window too short")
   kf_times = keyframe_timestamps(args.start, data.frame_rate, keyframe_every, n_frames)
 
-  front_tags_per_kf = detect_all_tags(front_frames)
-  rear_tags_per_kf = detect_all_tags(rear_frames)
+  front_tags_per_kf, rear_tags_per_kf = run_two_concurrently(
+    lambda: detect_all_tags(front_frames),
+    lambda: detect_all_tags(rear_frames),
+  )
 
   anchor_obs_per_kf: dict[int, dict[str, gtsam.Pose3]] = {}
   if args.anchor.tag_id >= 0:
@@ -641,33 +663,42 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
     max_half_angle_deg=args.frontend.max_half_angle_deg,
     use_dis_flow=args.frontend.use_dis_flow,
   )
-  imu_to_body_pre = np.asarray(args.imu.imu_to_body, dtype=np.float64)
-  gyro_body_pre = (
-    np.deg2rad(np.asarray(data.gyro_deg, dtype=np.float64)) @ imu_to_body_pre.T
-  )
-  imu_t_pre = np.asarray(data.imu_timestamps, dtype=np.float64)
-  body_rotations_between = _gyro_integrated_rotations(
-    imu_t_pre, gyro_body_pre, kf_times
-  )
-  front_predictor = _make_imu_klt_predictor(
-    front_lens.params, front_lens.extrinsic.rotation().matrix(), body_rotations_between
-  )
-  rear_predictor = _make_imu_klt_predictor(
-    rear_lens.params, rear_lens.extrinsic.rotation().matrix(), body_rotations_between
-  )
-  front_orb, front_tracks = run_lens_frontend(
-    front_frames,
-    front_lens.params,
-    cfg,
-    masks=front_masks,
-    rotation_predictor=front_predictor,
-  )
-  rear_orb, rear_tracks = run_lens_frontend(
-    rear_frames,
-    rear_lens.params,
-    cfg,
-    masks=rear_masks,
-    rotation_predictor=rear_predictor,
+  # The IMU-gyro KLT seed only feeds klt_track; DIS flow ignores it. Skip the
+  # gyro integration entirely on the DIS path (the default).
+  front_predictor = None
+  rear_predictor = None
+  if not args.frontend.use_dis_flow:
+    imu_to_body_pre = np.asarray(args.imu.imu_to_body, dtype=np.float64)
+    gyro_body_pre = (
+      np.deg2rad(np.asarray(data.gyro_deg, dtype=np.float64)) @ imu_to_body_pre.T
+    )
+    imu_t_pre = np.asarray(data.imu_timestamps, dtype=np.float64)
+    body_rotations_between = _gyro_integrated_rotations(
+      imu_t_pre, gyro_body_pre, kf_times
+    )
+    front_predictor = _make_imu_klt_predictor(
+      front_lens.params,
+      front_lens.extrinsic.rotation().matrix(),
+      body_rotations_between,
+    )
+    rear_predictor = _make_imu_klt_predictor(
+      rear_lens.params, rear_lens.extrinsic.rotation().matrix(), body_rotations_between
+    )
+  (front_orb, front_tracks), (rear_orb, rear_tracks) = run_two_concurrently(
+    lambda: run_lens_frontend(
+      front_frames,
+      front_lens.params,
+      cfg,
+      masks=front_masks,
+      rotation_predictor=front_predictor,
+    ),
+    lambda: run_lens_frontend(
+      rear_frames,
+      rear_lens.params,
+      cfg,
+      masks=rear_masks,
+      rotation_predictor=rear_predictor,
+    ),
   )
   front_kept = {
     t: o for t, o in front_tracks.items() if len(o) >= args.frontend.min_track_length

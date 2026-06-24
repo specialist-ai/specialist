@@ -122,13 +122,18 @@ def decode_dual_keyframes(
   front: list[np.ndarray] = []
   rear: list[np.ndarray] = []
   for i in range(total_frames):
+    # Non-keyframes still need decoding (inter-frame references) but not the
+    # YUV->BGR convert/copy, so grab() them and only retrieve() the keyframes.
+    if i % keyframe_every != 0:
+      if not cap.grab():
+        break
+      continue
     ok, frame = cap.read()
     if not ok:
       break
-    if i % keyframe_every == 0:
-      gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-      front.append(gray[:, :half])
-      rear.append(gray[:, half:])
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    front.append(gray[:, :half])
+    rear.append(gray[:, half:])
   cap.release()
   return front, rear
 
