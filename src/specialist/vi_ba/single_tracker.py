@@ -6,8 +6,11 @@ pose seed as the starved fallback) → metric re-triangulation. Returns a
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TypeVar
 
 import cv2
 import gtsam
@@ -64,6 +67,9 @@ from specialist.vi_ba.pipeline import (
 
 Float64Array = npt.NDArray[np.float64]
 
+_A = TypeVar("_A")
+_B = TypeVar("_B")
+
 # ORB loop-closure track recovery (``_loop_closure_tracks``).
 _LOOP_N_NEIGHBORS = 4  # spatially-closest non-adjacent revisit kfs to re-match
 _LOOP_MATCH_RATIO = 0.7  # Lowe ratio-test threshold
@@ -78,7 +84,22 @@ __all__ = [
   "PreparedTracker",
   "TrackerArgs",
   "prepare_tracker",
+  "run_two_concurrently",
 ]
+
+
+def run_two_concurrently(
+  task_a: Callable[[], _A], task_b: Callable[[], _B]
+) -> tuple[_A, _B]:
+  """Run two independent CPU-bound thunks on separate threads, return ``(a, b)``.
+  OpenCV (DIS flow, ORB, essential/homography RANSAC) and the AprilTag detector
+  release the GIL during their native calls, so the front and rear lens stages
+  run on separate cores. The result is independent of completion order, so it
+  matches sequential execution."""
+  with ThreadPoolExecutor(max_workers=2) as ex:
+    fut_a = ex.submit(task_a)
+    fut_b = ex.submit(task_b)
+    return fut_a.result(), fut_b.result()
 
 
 @dataclass
@@ -694,8 +715,10 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
     raise RuntimeError(f"only {n_keyframes} keyframes decoded — window too short")
   keyframe_times = keyframe_timestamps(args.start, fps, keyframe_every, n_keyframes)
 
-  front_tags_per_kf = detect_all_tags(front_gray)
-  rear_tags_per_kf = detect_all_tags(rear_gray)
+  front_tags_per_kf, rear_tags_per_kf = run_two_concurrently(
+    lambda: detect_all_tags(front_gray),
+    lambda: detect_all_tags(rear_gray),
+  )
 
   # Gyro-derived per-keyframe camera rotation increments carry every tag
   # disambiguation prior through fast rotation, where a stale previous-pose
@@ -741,17 +764,21 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
     ransac_threshold=args.frontend.ransac_threshold,
     max_half_angle=args.frontend.max_half_angle,
   )
-  front_feature_frames, front_tracks = run_lens_frontend(
-    front_gray,
-    front_lens.params,
-    cfg,
-    masks=front_masks,
-  )
-  rear_feature_frames, rear_tracks = run_lens_frontend(
-    rear_gray,
-    rear_lens.params,
-    cfg,
-    masks=rear_masks,
+  (front_feature_frames, front_tracks), (rear_feature_frames, rear_tracks) = (
+    run_two_concurrently(
+      lambda: run_lens_frontend(
+        front_gray,
+        front_lens.params,
+        cfg,
+        masks=front_masks,
+      ),
+      lambda: run_lens_frontend(
+        rear_gray,
+        rear_lens.params,
+        cfg,
+        masks=rear_masks,
+      ),
+    )
   )
   front_kept = {
     t: o for t, o in front_tracks.items() if len(o) >= args.frontend.min_track_length
