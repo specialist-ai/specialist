@@ -11,7 +11,16 @@ import numpy.typing as npt
 from gtsam.symbol_shorthand import B, L, V, X
 
 from specialist.loader.mei_model import MeiParams
-from specialist.vi_ba.mei_factor import make_mei_factor
+
+try:
+  # Native C++ MEI reprojection factor.
+  from specialist.vi_ba._mei_factor_cpp import make_mei_factor_cpp
+except ImportError as _exc:  # pragma: no cover - extension is built by uv sync
+  raise ImportError(
+    "The native MEI factor extension (specialist.vi_ba._mei_factor_cpp) is not "
+    "built. It is compiled automatically by `uv sync`; to (re)build it manually "
+    "run `uv run build-mei-factor`."
+  ) from _exc
 
 Float64Array = npt.NDArray[np.float64]
 
@@ -68,15 +77,25 @@ def _add_projection_factors(
     lm_key = landmark_key_fn(tid)
     if not values.exists(lm_key):
       values.insert(lm_key, gtsam.Point3(float(xyz[0]), float(xyz[1]), float(xyz[2])))
+    p = lens.params
     for fi, pt in tracks[tid].items():
       graph.push_back(
-        make_mei_factor(
-          pose_key=pose_key_fn(fi),
-          landmark_key=lm_key,
-          pixel=np.asarray(pt, dtype=np.float64),
-          noise=pixel_noise,
-          extrinsic=lens.extrinsic,
-          params=lens.params,
+        make_mei_factor_cpp(
+          pose_key_fn(fi),
+          lm_key,
+          np.asarray(pt, dtype=np.float64).reshape(2),
+          pixel_noise,
+          lens.extrinsic,
+          p.fx,
+          p.fy,
+          p.cx,
+          p.cy,
+          p.k1,
+          p.k2,
+          p.k3,
+          p.p1,
+          p.p2,
+          p.xi,
         )
       )
 
