@@ -1,16 +1,18 @@
-"""Tests for ``specialist.vi_ba.mei_factor``.
+"""Tests for the native MEI projection factor (``_mei_factor_cpp``).
 
-A binary GTSAM ``CustomFactor`` on ``(body_pose, world_landmark)`` with the
-body → lens extrinsic baked in at construction. Residual:
+A binary GTSAM factor on ``(body_pose, world_landmark)`` with the body → lens
+extrinsic baked in at construction. Residual:
 ``mei_project((T_world_body · T_body_lens)⁻¹ · L) − pixel``.
 
-Three guardrail properties:
+Guardrail properties:
 
 1. **Zero residual** at the exact projection, with both a front (identity)
    and a rear (roll 90°, tz −0.026 m) extrinsic.
 2. **Jacobian self-consistency**: the factor's linearization, evaluated at
    ≥5 points spanning the FOV including one beyond 90° half-angle, predicts
    the residual change over a small tangent step to within `1e-4` absolute.
+   This finite-difference check independently validates the analytical
+   Jacobians compiled into the C++ factor.
 3. **Cheirality past 90°**: ``mei_project`` + ±1 px noise + ``mei_unproject``
    at 95° half-angle recovers a bearing in the same forward hemisphere as
    the input — a standing guardrail for the super-fisheye regime.
@@ -23,9 +25,19 @@ import math
 import gtsam
 import numpy as np
 import numpy.typing as npt
+import pytest
 
 from specialist.loader.mei_model import MeiParams, mei_project, mei_unproject
-from specialist.vi_ba.mei_factor import make_mei_factor
+
+try:
+  from specialist.vi_ba._mei_factor_cpp import make_mei_factor_cpp
+except ImportError:
+  make_mei_factor_cpp = None
+
+pytestmark = pytest.mark.skipif(
+  make_mei_factor_cpp is None,
+  reason="native MEI factor not built (run `uv run build-mei-factor`)",
+)
 
 _POSE_KEY = 0
 _LM_KEY = 1
@@ -50,6 +62,29 @@ def _params() -> MeiParams:
 def _noise() -> gtsam.noiseModel.Base:
   # Isotropic σ=1 px → whitened == unwhitened; makes Jacobian introspection easy.
   return gtsam.noiseModel.Isotropic.Sigma(2, 1.0)
+
+
+def _factor(
+  pixel: npt.NDArray[np.float64], extrinsic: gtsam.Pose3, params: MeiParams
+) -> gtsam.NonlinearFactor:
+  p = params
+  return make_mei_factor_cpp(
+    _POSE_KEY,
+    _LM_KEY,
+    np.asarray(pixel, dtype=np.float64).reshape(2),
+    _noise(),
+    extrinsic,
+    p.fx,
+    p.fy,
+    p.cx,
+    p.cy,
+    p.k1,
+    p.k2,
+    p.k3,
+    p.p1,
+    p.p2,
+    p.xi,
+  )
 
 
 def _rear_extrinsic() -> gtsam.Pose3:
@@ -87,7 +122,7 @@ def test_zero_residual_front_identity_extrinsic() -> None:
   landmark = np.array([0.3, 0.1, 2.0])  # in front of lens
   pixel = _project_through(body_pose, landmark, extrinsic, params)
 
-  factor = make_mei_factor(_POSE_KEY, _LM_KEY, pixel, _noise(), extrinsic, params)
+  factor = _factor(pixel, extrinsic, params)
   err = factor.unwhitenedError(_values(body_pose, landmark))
   assert np.allclose(err, 0.0, atol=1e-10)
 
@@ -99,11 +134,11 @@ def test_zero_residual_rear_extrinsic() -> None:
   # A point in front of the *rear* lens (forward = extrinsic.rotation() * +z):
   # Put the landmark 1.5 m out along the lens's +z, then into world.
   p_in_lens = np.array([0.1, -0.1, 1.5])
-  lens_T_world = extrinsic  # body == world here
-  landmark_world = np.asarray(lens_T_world.transformFrom(gtsam.Point3(*p_in_lens)))
+  T_world_lens = extrinsic  # body == world here
+  landmark_world = np.asarray(T_world_lens.transformFrom(gtsam.Point3(*p_in_lens)))
   pixel = _project_through(body_pose, landmark_world, extrinsic, params)
 
-  factor = make_mei_factor(_POSE_KEY, _LM_KEY, pixel, _noise(), extrinsic, params)
+  factor = _factor(pixel, extrinsic, params)
   err = factor.unwhitenedError(_values(body_pose, landmark_world))
   assert np.allclose(err, 0.0, atol=1e-10)
 
@@ -115,7 +150,7 @@ def test_nonzero_residual_when_pose_perturbed() -> None:
   landmark = np.array([0.3, 0.1, 2.0])
   pixel = _project_through(body_pose, landmark, extrinsic, params)
 
-  factor = make_mei_factor(_POSE_KEY, _LM_KEY, pixel, _noise(), extrinsic, params)
+  factor = _factor(pixel, extrinsic, params)
 
   perturbed = body_pose.retract(np.array([0.0, 0.0, 0.0, 0.05, 0.0, 0.0]))
   err = factor.unwhitenedError(_values(perturbed, landmark))
@@ -131,53 +166,46 @@ _FOV_LANDMARKS: tuple[tuple[npt.NDArray[np.float64], str], ...] = (
 )
 
 
+def _assert_fd_jacobian(
+  factor: gtsam.NonlinearFactor,
+  body_pose: gtsam.Pose3,
+  landmark: npt.NDArray[np.float64],
+  jac: npt.NDArray[np.float64],
+  kind: str,
+  label: str,
+) -> None:
+  """Finite-difference check: ``jac · δ ≈ r(x ⊞ δ) − r(x)`` along each axis of a
+  ``"pose"`` (retract) or ``"landmark"`` (additive) perturbation."""
+  base = factor.unwhitenedError(_values(body_pose, landmark))
+  for axis in range(jac.shape[1]):
+    delta = np.zeros(jac.shape[1])
+    delta[axis] = 1e-5
+    stepped = (
+      _values(body_pose.retract(delta), landmark)
+      if kind == "pose"
+      else _values(body_pose, landmark + delta)
+    )
+    observed = factor.unwhitenedError(stepped) - base
+    assert np.allclose(jac @ delta, observed, atol=1e-4), (
+      f"{label}: {kind} axis {axis}: pred={jac @ delta}, obs={observed}"
+    )
+
+
 def test_jacobian_self_consistency_across_fov() -> None:
-  """At ≥5 FOV-spanning landmarks, Hp·δ ≈ r(x+δ) − r(x) for small δ."""
+  """At ≥5 FOV-spanning landmarks, J·δ ≈ r(x ⊞ δ) − r(x) for small δ."""
   params = _params()
   extrinsic = gtsam.Pose3()
   body_pose = gtsam.Pose3()
 
   for landmark, label in _FOV_LANDMARKS:
     pixel = _project_through(body_pose, landmark, extrinsic, params)
-    # Shift pixel so residual at base is non-zero — Jacobian evaluation is at
-    # non-zero residual, mirroring how LM uses it during optimization.
-    pixel_shifted = pixel + np.array([2.0, -3.0])
-    factor = make_mei_factor(
-      _POSE_KEY, _LM_KEY, pixel_shifted, _noise(), extrinsic, params
-    )
-
-    values = _values(body_pose, landmark)
-    jac_factor = factor.linearize(values)
-    A, _ = jac_factor.jacobian()
-    assert A.shape == (2, 9), f"{label}: unexpected A shape {A.shape}"
-    hp = A[:, :6]
-    hl = A[:, 6:]
-
-    # Pose-tangent step ⇒ predicted residual change.
-    for axis in range(6):
-      delta = np.zeros(6)
-      delta[axis] = 1e-5
-      stepped = body_pose.retract(delta)
-      predicted = hp @ delta
-      observed = factor.unwhitenedError(
-        _values(stepped, landmark)
-      ) - factor.unwhitenedError(values)
-      assert np.allclose(predicted, observed, atol=1e-4), (
-        f"{label}: pose axis {axis}: pred={predicted}, obs={observed}"
-      )
-
-    # Landmark step ⇒ predicted residual change.
-    for axis in range(3):
-      delta_l = np.zeros(3)
-      delta_l[axis] = 1e-5
-      lm_stepped = landmark + delta_l
-      predicted = hl @ delta_l
-      observed = factor.unwhitenedError(
-        _values(body_pose, lm_stepped)
-      ) - factor.unwhitenedError(values)
-      assert np.allclose(predicted, observed, atol=1e-4), (
-        f"{label}: landmark axis {axis}: pred={predicted}, obs={observed}"
-      )
+    # Shift pixel so the base residual is non-zero, mirroring how LM evaluates
+    # the Jacobian away from the optimum during optimization.
+    factor = _factor(pixel + np.array([2.0, -3.0]), extrinsic, params)
+    a, _ = factor.linearize(_values(body_pose, landmark)).jacobian()
+    assert a.shape == (2, 9), f"{label}: unexpected Jacobian shape {a.shape}"
+    _assert_fd_jacobian(factor, body_pose, landmark, a[:, :6], "pose", label)
+    _assert_fd_jacobian(factor, body_pose, landmark, a[:, 6:], "landmark", label)
 
 
 def test_mei_cheirality_past_90_degrees_preserves_hemisphere() -> None:

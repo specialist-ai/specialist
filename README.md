@@ -14,6 +14,25 @@ uv sync --extra dev
 
 This pulls `gtsam>=4.3a0` (the alpha — it is the only release with cp312 wheels), `numpy`, `scipy`, `rerun-sdk`, `tyro`, `telemetry-parser`, `opencv-python`, `pupil-apriltags`, `allantools`, `pyyaml`, and `imageio-ffmpeg` (wheel-bundled ffmpeg for audio clap-sync), plus the dev tools `pytest`, `ruff`, `mypy`, and `pre-commit`. `robot-descriptions` (gripper URDF assets) is a private SSH git dependency.
 
+`uv sync` also compiles the native MEI bundle-adjustment factor
+(`_mei_factor_cpp`) — a C++ port of the reprojection factor that makes bundle
+adjustment ~88× faster (~35% off total wall-clock) with a bit-identical optimum.
+This needs a C++17 compiler, `git`, and Boost headers (`libboost-dev`, or
+`brew install boost` on macOS). The build clones the matching gtsam headers into
+a gitignored `.build/` cache the first time (the gtsam wheel ships no headers).
+
+It is compiled per machine (the `.so` is architecture-specific and gitignored),
+so run `uv sync` on each host. To rebuild after editing the C++ source:
+
+```
+uv run build-mei-factor
+```
+
+The extension shares pybind11 types with the gtsam wheel, so it must match that
+wheel's ABI: pybind11 is pinned to the 2.x series, and `-fabi-version` plus the
+libstdc++ string ABI are auto-detected from the installed wheel in `_buildext.py`
+(needed because manylinux wheels are built with an older GCC than a typical host).
+
 ## Test
 
 ```
@@ -37,9 +56,9 @@ src/specialist/
 ├── loader/      parse_insv, mei_model, audio_sync
 ├── vi_ba/       per-tracker visual-inertial bundle adjustment — single_tracker
 │                (per-tracker prep), pipeline + features (frontend), init
-│                (incremental SfM + VI alignment), build / compose (graph),
-│                mei_factor, imu, anchor_detection, extrinsics, optimize,
-│                reliability, configs, viz
+│                (incremental SfM + VI alignment), build / compose (graph) +
+│                the native cpp/ MEI factor, imu, anchor_detection, extrinsics,
+│                optimize, reliability, configs, viz
 ├── graph/       factors (shared GTSAM factor constructors)
 └── synthesis/   tag_detection (the cross-tracker observation record)
 

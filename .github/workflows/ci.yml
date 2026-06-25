@@ -38,6 +38,8 @@ jobs:
         with:
           python-version: "3.12"
           enable-cache: true
+      - name: Install Boost headers (the native MEI factor build needs them)
+        run: sudo apt-get update && sudo apt-get install -y libboost-all-dev
       - name: Install dependencies
         # robot-descriptions is a private SSH git dep (URDF assets) used only
         # lazily in scripts/track.py; CI has no SSH creds and doesn't need it.
@@ -55,6 +57,8 @@ jobs:
         with:
           python-version: "3.12"
           enable-cache: true
+      - name: Install Boost headers (the native MEI factor build needs them)
+        run: sudo apt-get update && sudo apt-get install -y libboost-all-dev
       - name: Install dependencies
         # robot-descriptions is a private SSH git dep (URDF assets) used only
         # lazily in scripts/track.py; CI has no SSH creds and doesn't need it.

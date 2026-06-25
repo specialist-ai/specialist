@@ -8,7 +8,6 @@ import pytest
 from specialist.loader.mei_model import (
   MeiParams,
   mei_project,
-  mei_project_with_jacobian,
   mei_unproject,
 )
 
@@ -104,57 +103,6 @@ def test_mei_unproject_rejects_bad_shape() -> None:
   params = _undistorted_params()
   with pytest.raises(ValueError):
     mei_unproject(np.zeros((3,)), params)
-
-
-def test_mei_project_with_jacobian_pixel_matches_batch_project() -> None:
-  """The single-point analytical projector returns the same pixel as the
-  batched ``mei_project`` for the X3-like params at a few in-FOV points."""
-  params = _x3_like_params()
-  for p in [
-    np.array([0.05, 0.05, 1.0]),
-    np.array([0.5, 0.2, 1.5]),
-    np.array([1.0, -0.3, 0.8]),
-    np.array([1.5, 0.0, 0.2]),
-  ]:
-    pixel_a, _ = mei_project_with_jacobian(p, params)
-    pixel_b = mei_project(p[None, :], params)[0]
-    assert np.allclose(pixel_a, pixel_b, atol=1e-12)
-
-
-def test_mei_project_jacobian_matches_central_finite_differences() -> None:
-  """Analytical 2×3 Jacobian matches central finite differences on
-  ``mei_project`` to ~1e-5 relative across the FOV including a point
-  beyond the 90° half-angle."""
-  params = _x3_like_params()
-  test_points = [
-    np.array([0.01, 0.02, 1.5]),  # near-axial
-    np.array([0.4, 0.3, 1.0]),
-    np.array([1.0, -0.2, 0.6]),
-    np.array([1.6, 0.0, 0.3]),
-    np.array([1.0, 0.0, -0.1]),  # past 90° half-angle, super-fisheye
-  ]
-  eps = 1e-6
-  for p in test_points:
-    _, jac = mei_project_with_jacobian(p, params)
-    fd = np.zeros((2, 3), dtype=np.float64)
-    for i in range(3):
-      d = np.zeros(3)
-      d[i] = eps
-      pix_p = mei_project((p + d)[None, :], params)[0]
-      pix_m = mei_project((p - d)[None, :], params)[0]
-      fd[:, i] = (pix_p - pix_m) / (2.0 * eps)
-    rel = np.linalg.norm(jac - fd) / max(np.linalg.norm(fd), 1.0)
-    assert rel < 1e-4, f"point {p}: |jac - fd|/|fd| = {rel:.2e}"
-
-
-def test_mei_project_with_jacobian_returns_nan_behind_mirror() -> None:
-  # With ξ > 1 (X3) the unit-sphere shift covers the full forward
-  # hemisphere, so the cheirality check only trips at ξ = 0 (pinhole)
-  # for points with z < 0.
-  params = _undistorted_params()  # xi=0
-  pixel, jac = mei_project_with_jacobian(np.array([0.1, 0.0, -1.0]), params)
-  assert np.all(np.isnan(pixel))
-  assert np.all(np.isnan(jac))
 
 
 def test_mei_from_camera_matrix_validates_shapes() -> None:
