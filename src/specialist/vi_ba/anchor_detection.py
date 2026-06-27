@@ -22,7 +22,22 @@ __all__ = [
   "detect_all_tags",
   "estimate_camera_to_tag_pose",
   "rotate_prior",
+  "tag_corners_local",
 ]
+
+
+def tag_corners_local(tag_size: float) -> Float64Array:
+  """The tag's corners in the tag frame, ``(4, 3)``, in order BL, BR, TR, TL."""
+  half = float(tag_size / 2.0)
+  return np.array(
+    [
+      [-half, -half, 0.0],
+      [+half, -half, 0.0],
+      [+half, +half, 0.0],
+      [-half, +half, 0.0],
+    ],
+    dtype=np.float64,
+  )
 
 
 @dataclass(frozen=True)
@@ -45,18 +60,9 @@ def estimate_camera_to_tag_pose(
   if not np.all(np.isfinite(bearings)) or np.any(bearings[:, 2] <= 1e-3):
     return None
   norm = (bearings[:, :2] / bearings[:, 2:3]).astype(np.float64).reshape(-1, 1, 2)
-  half = float(tag_size / 2.0)
-  obj = np.array(
-    [
-      [-half, -half, 0.0],
-      [+half, -half, 0.0],
-      [+half, +half, 0.0],
-      [-half, +half, 0.0],
-    ],
-    dtype=np.float64,
-  ).reshape(-1, 1, 3)
-  k = np.eye(3, dtype=np.float64)
-  dist = np.zeros(4, dtype=np.float64)
+  obj = tag_corners_local(tag_size).reshape(-1, 1, 3)
+  k = np.eye(3)
+  dist = np.zeros(4)
   n_sols, rvecs, tvecs, _ = cv2.solvePnPGeneric(
     obj, norm, k, dist, flags=cv2.SOLVEPNP_IPPE
   )

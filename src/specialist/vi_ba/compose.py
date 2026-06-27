@@ -19,7 +19,7 @@ _MAX_LANDMARKS_PER_TRACKER = 1_000_000
 
 
 class TrackerKeys:
-  """Collision-free GTSAM keys per tracker; the anchor lives at ``symbol('A', 0)``."""
+  """Collision-free GTSAM keys per tracker; anchor corners at ``symbol('A', 0..3)``."""
 
   def __init__(
     self,
@@ -66,8 +66,9 @@ class TrackerKeys:
   def rear_landmark_key(self, name: str, track_id: int) -> int:
     return self._lm_key(name, 1, track_id)
 
-  def anchor_key(self) -> int:
-    return int(gtsam.symbol(_ANCHOR_CHAR, 0))
+  def anchor_corner_key(self, corner_idx: int) -> int:
+    """Key for one of the anchor tag's four metric corners, ``corner_idx`` 0..3."""
+    return int(gtsam.symbol(_ANCHOR_CHAR, corner_idx))
 
   def vi_graph_kwargs(self, name: str) -> dict[str, Callable[[int], int]]:
     """Per-tracker key callables to pass to ``build_vi_graph``."""
