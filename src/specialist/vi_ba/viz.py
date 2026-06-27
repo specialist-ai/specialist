@@ -312,10 +312,10 @@ class TrackerVizData:
   trajectory_offset_in_gripper: tuple[float, float, float] | None = None
   front_lens_extrinsic: gtsam.Pose3 | None = None
   rear_lens_extrinsic: gtsam.Pose3 | None = None
-  # Per-keyframe ``(n, 2, 3)`` line endpoints (lens centre → tag) for every
-  # factor firing at that keyframe. ``anchor_obs_lines`` is from this
-  # tracker's lens(es) to the world anchor; ``cross_tracker_lines`` is from
-  # this tracker's lens(es) to other trackers' base tags it observed.
+  # Per-keyframe ``(n, 2, 3)`` line endpoints for every factor firing at that
+  # keyframe. ``anchor_obs_lines`` runs from this tracker's lens(es) to the
+  # anchor tag's four metric corner landmarks (the reprojection factors);
+  # ``cross_tracker_lines`` runs to other trackers' gripper tags it observed.
   anchor_obs_lines: list[Float64Array] | None = None
   cross_tracker_lines: list[Float64Array] | None = None
   # ``None`` lets ``log_multi_ba_run`` assign a per-tracker palette color.
