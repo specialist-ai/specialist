@@ -58,7 +58,8 @@ src/specialist/
 │                (per-tracker prep), pipeline + features (frontend), init
 │                (incremental SfM + VI alignment), build / compose (graph) +
 │                the native cpp/ MEI factor, imu, anchor_detection, extrinsics,
-│                optimize, reliability, configs, viz
+│                optimize, landmark_cull, reliability, configs,
+│                viz
 ├── graph/       factors (shared GTSAM factor constructors)
 └── synthesis/   tag_detection (the cross-tracker observation record)
 
