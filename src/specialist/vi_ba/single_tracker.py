@@ -264,8 +264,8 @@ def _finger_joint_angles_per_kf(
   n_keyframes: int,
   kf_rotations: list[Float64Array],
 ) -> list[float]:
-  """``Logmap(base_tag_T_finger)[2]`` per keyframe — the signed rotation about the
-  URDF revolute-joint axis (``+z`` by URDF convention). The base tag is
+  """``Logmap(base_tag_T_finger)[2]`` per keyframe — the signed rotation about
+  the URDF revolute-joint axis (``+z`` by URDF convention). The base tag is
   rigidly mounted to the body so its ``cam_T_tag`` is averaged once over all
   visible keyframes; the finger tag's ``cam_T_tag`` is recovered per kf."""
   cam_T_base_per_kf = _per_kf_cam_T_tag(
@@ -535,6 +535,63 @@ def _fill_camera_poses(
       f = (k - lo) / (hi - lo)
       out.append(pa.compose(gtsam.Pose3.Expmap(f * gtsam.Pose3.Logmap(pa.between(pb)))))
   return out
+
+
+def _anchor_pose_seed(
+  anchor_obs_per_kf: dict[int, dict[str, gtsam.Pose3]],
+  front_extrinsic: gtsam.Pose3,
+  n_keyframes: int,
+) -> list[gtsam.Pose3] | None:
+  """Metric body-pose seed from the front-lens anchor PnP: world (= the anchor
+  tag frame) ``T_body`` at every keyframe that sees the anchor, with gaps
+  SLERP+lerp-filled. The anchor poses are metric (known tag size) and correctly
+  shaped wherever the tag is visible, so this is the seed of choice when the
+  visual odometry is too starved to register; the joint BA then refines it from
+  the anchor, IMU, and reprojection factors. Returns ``None`` when too few
+  keyframes see the anchor to seed a trajectory."""
+  cam_poses = {
+    kf: sides["front"].inverse()
+    for kf, sides in anchor_obs_per_kf.items()
+    if "front" in sides
+  }
+  if len(cam_poses) < max(8, n_keyframes // 4):
+    return None
+  return body_poses_from_camera_poses(
+    _fill_camera_poses(cam_poses, n_keyframes), front_extrinsic
+  )
+
+
+def _anchor_metric_scale(
+  body_poses_unscaled: list[gtsam.Pose3],
+  anchor_obs_per_kf: dict[int, dict[str, gtsam.Pose3]],
+  front_extrinsic: gtsam.Pose3,
+  rear_extrinsic: gtsam.Pose3,
+) -> float | None:
+  """Metric scale from the anchor: the ratio of the anchor-implied body-position
+  spread (from each keyframe's ``cam_T_tag``) to the unscaled visual-odometry
+  spread, over the anchored keyframes. ``None`` if fewer than three anchored
+  keyframes or the visual spread is degenerate."""
+  vo: list[Float64Array] = []
+  anc: list[Float64Array] = []
+  for kf, sides in anchor_obs_per_kf.items():
+    if "front" in sides:
+      ext, cam_T_tag = front_extrinsic, sides["front"]
+    elif "rear" in sides:
+      ext, cam_T_tag = rear_extrinsic, sides["rear"]
+    else:
+      continue
+    body_in_tag = ext.compose(cam_T_tag).inverse()
+    anc.append(np.asarray(body_in_tag.translation(), dtype=np.float64))
+    vo.append(np.asarray(body_poses_unscaled[kf].translation(), dtype=np.float64))
+  if len(vo) < 3:
+    return None
+  vo_arr = np.asarray(vo, dtype=np.float64)
+  anc_arr = np.asarray(anc, dtype=np.float64)
+  vo_spread = float(np.sqrt(((vo_arr - vo_arr.mean(axis=0)) ** 2).sum()))
+  anc_spread = float(np.sqrt(((anc_arr - anc_arr.mean(axis=0)) ** 2).sum()))
+  if vo_spread < 1e-9:
+    return None
+  return anc_spread / vo_spread
 
 
 def _side_lens_and_pose(
@@ -832,8 +889,9 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
 
   # Visual-odometry front-end: recover the real per-keyframe trajectory shape
   # from front-lens correspondences (front owns rotation/shape) instead of the
-  # two-keyframe straight line. Falls back to the straight line above if the
-  # incremental SfM cannot register enough keyframes.
+  # two-keyframe straight line. Falls back to the anchor-PnP seed (or the
+  # straight line) above if the incremental SfM cannot register enough keyframes.
+  anchor_seed_used = False
   if args.frontend.use_visual_odometry:
     sfm_cams, _ = incremental_sfm(
       _bearings_by_track(front_kept, front_lens.params),
@@ -853,10 +911,22 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
         f"{len(sfm_cams)}/{n_keyframes} keyframes"
       )
     else:
-      print(
-        f"  [{name}] visual-odometry init: only {len(sfm_cams)}/{n_keyframes} "
-        f"keyframes registered — using straight-line init"
+      anchor_seed = _anchor_pose_seed(
+        anchor_obs_per_kf, front_lens.extrinsic, n_keyframes
       )
+      if anchor_seed is not None:
+        body_poses_unscaled = anchor_seed
+        anchor_seed_used = True
+        n_anchor_kf = sum("front" in s for s in anchor_obs_per_kf.values())
+        print(
+          f"  [{name}] visual-odometry starved ({len(sfm_cams)}/{n_keyframes}); "
+          f"anchor-pose init from {n_anchor_kf} anchor keyframes"
+        )
+      else:
+        print(
+          f"  [{name}] visual-odometry init: only {len(sfm_cams)}/{n_keyframes} "
+          f"keyframes registered — using straight-line init"
+        )
 
   imu, bias0, gravity_world_initial = _imu_and_initial_gravity(
     args, data, keyframe_times, body_poses_unscaled
@@ -894,17 +964,36 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
     if gravity_world_initial is not None
     else (0.0, 0.0, -9.81)
   )
-  params_pim = make_preintegration_params(
-    gyro_noise_sigma=args.imu.gyro_noise_sigma,
-    accel_noise_sigma=args.imu.accel_noise_sigma,
-    gyro_walk=args.imu.gyro_random_walk,
-    accel_walk=args.imu.accel_random_walk,
-    gravity_world=pim_gravity,
+
+  def _pim_params(
+    gravity: tuple[float, float, float],
+  ) -> gtsam.PreintegrationCombinedParams:
+    return make_preintegration_params(
+      gyro_noise_sigma=args.imu.gyro_noise_sigma,
+      accel_noise_sigma=args.imu.accel_noise_sigma,
+      gyro_walk=args.imu.gyro_random_walk,
+      accel_walk=args.imu.accel_random_walk,
+      gravity_world=gravity,
+    )
+
+  params_pim = _pim_params(pim_gravity)
+  # An anchor seed is already metric, so its scale is 1.0; otherwise take the
+  # scale from a visible anchor, and float it on the IMU only with no anchor.
+  anchor_scale = _anchor_metric_scale(
+    body_poses_visual, anchor_obs_per_kf, front_lens.extrinsic, rear_lens.extrinsic
   )
+  fixed_scale = 1.0 if anchor_seed_used else anchor_scale
   pim_init = preintegrate_between_keyframes(params_pim, imu, keyframe_times, bias0)
-  alignment = visual_inertial_align(
-    body_poses_visual, pim_init, fixed_gravity=gravity_world_initial
-  )
+
+  def _align(poses: list[gtsam.Pose3]) -> Alignment:
+    return visual_inertial_align(
+      poses,
+      pim_init,
+      fixed_gravity=gravity_world_initial,
+      fixed_scale=fixed_scale,
+    )
+
+  alignment = _align(body_poses_visual)
   if alignment.scale < 0.0:
     origin = np.asarray(body_poses_visual[0].translation(), dtype=np.float64)
     body_poses_visual = [
@@ -914,9 +1003,7 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
       )
       for p in body_poses_visual
     ]
-    alignment = visual_inertial_align(
-      body_poses_visual, pim_init, fixed_gravity=gravity_world_initial
-    )
+    alignment = _align(body_poses_visual)
   # Override LSQ-fit gravity with the IMU stationary-window estimate so the
   # world frame stays gravity-aligned (LSQ-fit gravity can drift up to ~30°
   # from the IMU truth, which then tilts the rerun viewer's z-up convention).
@@ -930,13 +1017,7 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
   body_poses, world_rotation = apply_alignment_to_poses(body_poses_visual, alignment)
   world_rot_mat = world_rotation.matrix()
   velocities = [world_rot_mat @ v for v in alignment.velocities]
-  params_aligned = make_preintegration_params(
-    gyro_noise_sigma=args.imu.gyro_noise_sigma,
-    accel_noise_sigma=args.imu.accel_noise_sigma,
-    gyro_walk=args.imu.gyro_random_walk,
-    accel_walk=args.imu.accel_random_walk,
-    gravity_world=(0.0, 0.0, -9.81),
-  )
+  params_aligned = _pim_params((0.0, 0.0, -9.81))
   pim = preintegrate_between_keyframes(params_aligned, imu, keyframe_times, bias0)
 
   use_anchor = args.anchor.tag_id >= 0 and bool(anchor_obs_per_kf)
