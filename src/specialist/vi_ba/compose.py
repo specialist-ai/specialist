@@ -25,8 +25,8 @@ class TrackerKeys:
   """Collision-free GTSAM symbol-key allocator for multi-tracker VI-BA.
   Each tracker gets a unique slice of the integer-key space, indexed by
   ``_MAX_KEYFRAMES_PER_TRACKER`` for poses/velocities/biases and
-  ``_MAX_LANDMARKS_PER_TRACKER`` for each lens's landmarks. Anchor lives
-  at ``symbol('A', 0)``."""
+  ``_MAX_LANDMARKS_PER_TRACKER`` for each lens's landmarks. The anchor tag's
+  four metric corner landmarks live at ``symbol('A', 0..3)``."""
 
   def __init__(
     self,
@@ -74,8 +74,10 @@ class TrackerKeys:
   def rear_landmark_key(self, name: str, track_id: int) -> int:
     return self._lm_key(name, 1, track_id)
 
-  def anchor_key(self) -> int:
-    return int(gtsam.symbol(_ANCHOR_CHAR, 0))
+  def anchor_corner_key(self, corner_idx: int) -> int:
+    """Key for one of the anchor tag's four fixed metric corner landmarks
+    (``corner_idx`` 0..3), which together pin the trajectory to the wall."""
+    return int(gtsam.symbol(_ANCHOR_CHAR, corner_idx))
 
   def vi_graph_kwargs(self, name: str) -> dict[str, Callable[[int], int]]:
     """Per-tracker key callables to pass to ``build_vi_graph``."""

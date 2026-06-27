@@ -28,19 +28,21 @@ import numpy as np
 import numpy.typing as npt
 import tyro
 
-from specialist.graph.factors import (
-  make_anchor_observation_factor,
-  make_anchor_prior,
-  make_cross_tracker_factor,
-)
+from specialist.graph.factors import make_cross_tracker_factor
 from specialist.loader.audio_sync import sync_two_claps
 from specialist.loader.mei_model import MeiParams, mei_project
 from specialist.synthesis.tag_detection import TagObservation
 from specialist.vi_ba.anchor_detection import (
   TagDetection,
   estimate_camera_to_tag_pose,
+  tag_corners_local,
 )
-from specialist.vi_ba.build import LensSetup, build_vi_graph
+from specialist.vi_ba.build import (
+  LensSetup,
+  add_mei_factor,
+  build_vi_graph,
+  huber_pixel_noise,
+)
 from specialist.vi_ba.compose import TrackerKeys
 from specialist.vi_ba.configs import (
   AnchorCfg,
@@ -216,6 +218,36 @@ def _cross_tracker_observations(
   return obs
 
 
+def _anchor_corners_world(ref_anchor: gtsam.Pose3, tag_size: float) -> Float64Array:
+  """The anchor tag's four metric corners in the world frame, ``(4, 3)``."""
+  return np.array(
+    [
+      np.asarray(ref_anchor.transformFrom(gtsam.Point3(*corner)), dtype=np.float64)
+      for corner in tag_corners_local(tag_size)
+    ]
+  )
+
+
+def _anchor_sightings(
+  tracker: PreparedTracker, anchor_tag_id: int
+) -> list[tuple[LensSetup, int, TagDetection]]:
+  """Per ``(lens, keyframe)`` anchor-tag detection. The corner reprojection factors consume
+  exactly these sightings."""
+  out: list[tuple[LensSetup, int, TagDetection]] = []
+  for lens, tags_per_kf in (
+    (tracker.front_lens, tracker.front_tags_per_kf),
+    (tracker.rear_lens, tracker.rear_tags_per_kf),
+  ):
+    sightings = [
+      (kf, det)
+      for kf, dets in enumerate(tags_per_kf)
+      for det in dets
+      if int(det.tag_id) == anchor_tag_id
+    ]
+    out.extend((lens, kf, det) for kf, det in sightings)
+  return out
+
+
 def _factor_observation_lines(
   observer: PreparedTracker,
   observer_poses: list[gtsam.Pose3],
@@ -339,25 +371,6 @@ def _project_tag_axes_per_lens(
   return out
 
 
-# Radius beyond which the anchor σ gets an extra 7× multiplier (PnP at
-# the fisheye optical edge is dominated by distortion noise). Pipeline
-# constant only — the held-out evaluation harness keeps a private
-# duplicate with the same value; if this moves, update it there by hand.
-_EXTREME_RADIUS_FRAC = 0.65
-
-
-def _radius_frac(pixel_center: Float64Array, frame_shape: tuple[int, ...]) -> float:
-  """Fisheye-correct distance from image-center, normalized so the lens
-  optical-circle edge is ``1.0``. Used by the BA σ-inflation; NOT
-  shared with the metric module (intentional — pipeline ↛ eval)."""
-  h, w = frame_shape[:2]
-  cx, cy = float(w) / 2.0, float(h) / 2.0
-  return float(
-    np.sqrt((pixel_center[0] - cx) ** 2 + (pixel_center[1] - cy) ** 2)
-    / (min(w, h) / 2.0)
-  )
-
-
 def _per_keyframe_reproj_rmse_for_viz(
   values: gtsam.Values,
   tracks: dict[int, dict[int, Float64Array]],
@@ -418,12 +431,6 @@ def _mei_to_dict(p: MeiParams) -> dict:
     "p2": float(p.p2),
     "xi": float(p.xi),
   }
-
-
-def _scaled_sigma(base: float, rf: float, pivot: float, scale: float) -> float:
-  if rf <= pivot:
-    return base
-  return base * (1.0 + (rf - pivot) / scale) ** 2
 
 
 def _prepare_cached(
@@ -515,25 +522,6 @@ def _tracks_side_dict(
     str(tid): {str(kf): [float(p[0]), float(p[1])] for kf, p in obs.items()}
     for tid, obs in tracks.items()
   }
-
-
-def _print_capture_diagnostics(
-  trackers: list[PreparedTracker],
-  optimized_body_poses: dict[str, list[gtsam.Pose3]],
-) -> None:
-  """Print the max kf-to-kf speed (a sanity check that any large jump is real
-  IMU-agreeing motion)."""
-  print("\n=== max kf-to-kf speed (real motion if IMU agrees) ===")
-  for name, poses in optimized_body_poses.items():
-    pts = np.array([np.asarray(p.translation(), dtype=np.float64) for p in poses])
-    if pts.shape[0] < 2:
-      continue
-    t_obj = next(t for t in trackers if t.name == name)
-    kf_t = np.asarray(t_obj.keyframe_times, dtype=np.float64)
-    dt = np.diff(kf_t)
-    speed = np.linalg.norm(np.diff(pts, axis=0), axis=1) / np.where(dt > 0, dt, 1.0)
-    i = int(np.argmax(speed))
-    print(f"  [{name}] max={speed[i]:.2f} m/s at kf {i}→{i + 1} (t={kf_t[i]:.2f}s)")
 
 
 def main(args: Args) -> None:
@@ -641,64 +629,38 @@ def main(args: Args) -> None:
       **keys.vi_graph_kwargs(t.name),
     )
 
-  # Anchor variable + per-tracker anchor observation factors.
-  anchor_key = keys.anchor_key()
-  values.insert(anchor_key, ref_anchor)
-  graph.add(
-    make_anchor_prior(
-      anchor_key,
-      ref_anchor,
-      args.anchor.prior_translation_sigma,
-      args.anchor.prior_rotation_sigma,
-    )
-  )
-  pivot = args.anchor.sigma_radius_pivot
-  rscale = args.anchor.sigma_radius_scale
-  sigma_rs: list[float] = []
-  # Extra σ multiplier past _EXTREME_RADIUS_FRAC: the quadratic radius
-  # scaling isn't aggressive enough at the lens optical edge — AprilTag
-  # IPPE PnP fails badly there (fisheye distortion warps corners so PnP
-  # can be off by tens of mm). Multiply σ further so these obs become
-  # soft hints, not tight constraints. The metric module keeps its own
-  # private duplicate of the same threshold for the same reason.
-  extreme_r_mult = 7.0
+  # Reproject the anchor tag's four metric corners through the MEI distortion
+  # model, which stays valid even at the lens edge.
+  anchor_tag_id = int(args.anchor.tag_id)
+  anchor_corners_world = _anchor_corners_world(ref_anchor, args.anchor.tag_size)
+  corner_keys = [keys.anchor_corner_key(j) for j in range(4)]
+  corner_prior = gtsam.noiseModel.Isotropic.Sigma(3, 1.0e-4)
+  corner_noise = huber_pixel_noise(args.anchor.corner_reproj_sigma)
+  for corner_key, corner_xyz in zip(corner_keys, anchor_corners_world, strict=True):
+    point = gtsam.Point3(*corner_xyz)
+    values.insert(corner_key, point)
+    graph.add(gtsam.PriorFactorPoint3(corner_key, point, corner_prior))
+
+  n_anchor_sightings = 0
   for t in trackers:
-    for kf, sides in t.anchor_obs_per_kf.items():
-      for side, cam_T_tag in sides.items():
-        lens = t.front_lens if side == "front" else t.rear_lens
-        tags_per_kf = t.front_tags_per_kf if side == "front" else t.rear_tags_per_kf
-        frames = t.front_frames if side == "front" else t.rear_frames
-        anchor_det = next(
-          (d for d in tags_per_kf[kf] if int(d.tag_id) == int(args.anchor.tag_id)),
-          None,
+    for lens, kf, anchor_det in _anchor_sightings(t, anchor_tag_id):
+      n_anchor_sightings += 1
+      pose_key = keys.pose_key(t.name, kf)
+      # The detected tag direction in the lens frame disambiguates the omni
+      # depth-sign: the corner reprojection deactivates for poses that flip the
+      # frontally-observed tag to the opposite side of the camera.
+      side = "front" if lens is t.front_lens else "rear"
+      cam_T_tag = t.anchor_obs_per_kf.get(kf, {}).get(side)
+      obs_bearing = (
+        None
+        if cam_T_tag is None
+        else np.asarray(cam_T_tag.translation(), dtype=np.float64)
+      )
+      for corner_key, pixel in zip(corner_keys, anchor_det.corners, strict=True):
+        add_mei_factor(
+          graph, pose_key, corner_key, pixel, corner_noise, lens, obs_bearing
         )
-        rf = (
-          _radius_frac(anchor_det.center, frames[0].shape)
-          if anchor_det and frames
-          else pivot
-        )
-        sigma_t = _scaled_sigma(args.anchor.translation_sigma, rf, pivot, rscale)
-        sigma_r = _scaled_sigma(args.anchor.rotation_sigma, rf, pivot, rscale)
-        if rf > _EXTREME_RADIUS_FRAC:
-          sigma_t *= extreme_r_mult
-          sigma_r *= extreme_r_mult
-        sigma_rs.append(sigma_r)
-        graph.add(
-          make_anchor_observation_factor(
-            keys.pose_key(t.name, kf),
-            anchor_key,
-            cam_T_tag,
-            lens.extrinsic,
-            sigma_t,
-            sigma_r,
-            huber_k=args.anchor.huber_k,
-          )
-        )
-  if sigma_rs:
-    print(
-      f"anchor σ_r min/median/max = "
-      f"{min(sigma_rs):.4f}/{float(np.median(sigma_rs)):.4f}/{max(sigma_rs):.4f} rad"
-    )
+  print(f"anchor corner reprojection: {n_anchor_sightings} anchor sightings")
 
   # Cross-tracker tag observation factors. ``tag_on_owner`` is the *owner's*
   # body→base-tag rigid offset, recovered from the owner's own rear-lens
@@ -1042,7 +1004,17 @@ def main(args: Args) -> None:
     bounding_box_diagonal=bbox_diag,
     trajectory_path_length=path_len,
   )
-  _print_capture_diagnostics(trackers, optimized_body_poses)
+  print("\n=== max kf-to-kf speed (real motion if IMU agrees) ===")
+  for name, poses in optimized_body_poses.items():
+    pts = np.array([np.asarray(p.translation(), dtype=np.float64) for p in poses])
+    if pts.shape[0] < 2:
+      continue
+    t_obj = next(t for t in trackers if t.name == name)
+    kf_t = np.asarray(t_obj.keyframe_times, dtype=np.float64)
+    dt = np.diff(kf_t)
+    speed = np.linalg.norm(np.diff(pts, axis=0), axis=1) / np.where(dt > 0, dt, 1.0)
+    i = int(np.argmax(speed))
+    print(f"  [{name}] max={speed[i]:.2f} m/s at kf {i}→{i + 1} (t={kf_t[i]:.2f}s)")
 
   # Raw observations for downstream evaluation. The pipeline does
   # not compute quality metrics — downstream tooling reads this JSON,

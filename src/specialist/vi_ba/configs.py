@@ -56,8 +56,13 @@ class FrontendCfg:
 
 @dataclass
 class ImuCfg:
-  gyro_noise_sigma: float = 0.1
-  accel_noise_sigma: float = 1.0
+  # Noise sigmas at ~5-10x the measured noise floor (Allan deviation on a
+  # stationary capture: gyro ~0.0025 rad/s/sqrtHz, accel ~0.001 m/s2/sqrtHz).
+  # Held a few x above physical so the accelerometer's residual systematic error
+  # (timing / extrinsic) is not over-weighted, which would distort the metric
+  # scale it provides.
+  gyro_noise_sigma: float = 0.0125
+  accel_noise_sigma: float = 0.01
   gyro_random_walk: float = 1.0e-7
   accel_random_walk: float = 1.0e-7
   imu_to_body: tuple[tuple[float, float, float], ...] = (
@@ -71,19 +76,9 @@ class ImuCfg:
 class AnchorCfg:
   tag_id: int
   tag_size: float = 0.1
-  # Per-frame single-tag PnP is only ~cm-accurate at ~1 m (and laterally weak),
-  # so the anchor enters as a soft frame/scale reference, not a hard per-frame
-  # pose; visual odometry owns the trajectory shape. A tight σ here forces the
-  # inflated PnP onto the trajectory (the session_03 2x over-scale).
-  translation_sigma: float = 0.02
-  rotation_sigma: float = 0.05
-  prior_translation_sigma: float = 1.0e-4
-  prior_rotation_sigma: float = 1.0e-4
-  # σ multiplier = (1 + max(0, r − pivot) / scale)² for tag image radius r.
-  sigma_radius_pivot: float = 0.5
-  sigma_radius_scale: float = 0.1
-  # Huber threshold; caps single-frame PnP outliers. None disables.
-  huber_k: float | None = 1.5
+  # The anchor enters the bundle by reprojecting the tag's four known-metric
+  # corners (a fixed-spacing calibration target), which pins absolute scale.
+  corner_reproj_sigma: float = 1.5
 
 
 @dataclass
