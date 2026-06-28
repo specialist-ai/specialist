@@ -368,6 +368,43 @@ def _loop_closure_tracks(
   return tracks
 
 
+def _add_loop_landmarks(
+  front_points: dict[int, Float64Array],
+  front_kept: dict[int, dict[int, Float64Array]],
+  loop_tracks: dict[int, dict[int, Float64Array]],
+  body_poses: list[gtsam.Pose3],
+  lens: LensSetup,
+  min_track_length: int,
+  max_landmark_depth: float,
+  name: str,
+  label: str,
+  anchor_kfs: set[int] | None = None,
+) -> dict[int, Float64Array]:
+  """Add ``loop_tracks`` to the front lens; ``anchor_kfs`` gates their triangulation."""
+  if anchor_kfs:
+    tri_tracks = {
+      t: {k: v for k, v in obs.items() if k in anchor_kfs}
+      for t, obs in loop_tracks.items()
+    }
+  else:
+    tri_tracks = loop_tracks
+  loop_pts = triangulate_lens(
+    tri_tracks,
+    body_poses,
+    lens.extrinsic,
+    lens.params,
+    min_track_length,
+    max_landmark_depth=max_landmark_depth,
+  )
+  front_points.update(loop_pts)
+  front_kept.update(loop_tracks)
+  print(
+    f"  [{name}] {label}: +{len(loop_pts)} landmarks "
+    f"from {len(loop_tracks)} revisit tracks"
+  )
+  return loop_pts
+
+
 def _reject_vo_pose_outliers(
   cam_poses: dict[int, gtsam.Pose3],
 ) -> tuple[dict[int, gtsam.Pose3], list[int]]:
@@ -819,7 +856,10 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
     for tid in rear_unscaled
   }
   loop_tracks: dict[int, dict[int, Float64Array]] = {}
-  if args.frontend.use_visual_odometry and args.frontend.loop_closure:
+  if args.frontend.loop_closure and (
+    args.frontend.use_visual_odometry
+    or (args.frontend.anchored_loop_closure and use_anchor)
+  ):
     loop_tracks = _loop_closure_tracks(
       front_gray,
       front_masks,
@@ -867,20 +907,32 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
       rear_points = _cap_landmarks(rear_points, rear_for_tri, cap)
       if loop_tracks:
         # Merge after the cap so the per-lens budget never culls the revisit landmarks.
-        loop_pts = triangulate_lens(
+        _add_loop_landmarks(
+          front_points,
+          front_kept,
           loop_tracks,
           body_poses,
-          front_lens.extrinsic,
-          front_lens.params,
+          front_lens,
           args.frontend.min_track_length,
-          max_landmark_depth=args.frontend.max_landmark_depth,
+          args.frontend.max_landmark_depth,
+          name,
+          "loop closure",
+          anchor_kfs=anchor_kfs if args.frontend.anchored_loop_closure else None,
         )
-        front_points.update(loop_pts)
-        front_kept.update(loop_tracks)
-        print(
-          f"  [{name}] loop closure: +{len(loop_pts)} landmarks "
-          f"from {len(loop_tracks)} revisit tracks"
-        )
+    elif loop_tracks:
+      # Merge after gating: loop landmarks tie the drifting tail to the early keyframes.
+      _add_loop_landmarks(
+        front_points,
+        front_kept,
+        loop_tracks,
+        body_poses,
+        front_lens,
+        args.frontend.min_track_length,
+        args.frontend.max_landmark_depth,
+        name,
+        "anchored loop closure",
+        anchor_kfs=anchor_kfs,
+      )
   else:
     front_points = front_unscaled_metric
     rear_points = rear_unscaled_metric
