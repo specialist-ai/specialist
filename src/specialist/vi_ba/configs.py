@@ -30,6 +30,12 @@ class FrontendCfg:
   loop_closure: bool = True
   loop_closure_max_dist: float = 0.1
   loop_closure_min_kf_gap: int = 15
+  # Also run loop closure in anchor-seeded mode (it otherwise only runs under
+  # visual odometry). When the anchor leaves view, the trajectory tail dead-
+  # reckons on the IMU and drifts; if that tail revisits earlier anchored poses
+  # the loop-closure landmarks tie it back to the well-localized trajectory
+  # without needing the anchor.
+  anchored_loop_closure: bool = True
   # Use incremental visual odometry (front-lens SfM) for the trajectory shape
   # instead of the two-keyframe straight-line interpolation, and let the anchor
   # enter only as a joint-graph factor (no per-keyframe PnP pose overwrite).
