@@ -838,7 +838,7 @@ wheels = [
 [[package]]
 name = "robot-descriptions"
 version = "0.3.0"
-source = { git = "ssh://git@github.com/T-K-233/specialist_description.git#ad4bc710bbbd32b170c04256b14bcd505c3111e8" }
+source = { git = "ssh://git@github.com/T-K-233/specialist_description.git#140bc8e8394b05708dfdd42e87017305a9673c98" }
 dependencies = [
     { name = "mujoco" },
     { name = "onshape-to-robot" },

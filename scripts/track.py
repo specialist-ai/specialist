@@ -19,7 +19,7 @@ import tyro
 
 from specialist.graph.factors import make_cross_tracker_factor
 from specialist.loader.audio_sync import sync_two_claps
-from specialist.loader.mei_model import MeiParams, mei_project
+from specialist.loader.mei_model import MeiParams, mei_project, mei_unproject
 from specialist.synthesis.tag_detection import TagObservation
 from specialist.vi_ba.anchor_detection import (
   TagDetection,
@@ -28,7 +28,9 @@ from specialist.vi_ba.anchor_detection import (
 )
 from specialist.vi_ba.build import (
   LensSetup,
+  add_mei_base_tag_factor,
   add_mei_factor,
+  add_mei_finger_factor,
   build_vi_graph,
   huber_pixel_noise,
 )
@@ -190,6 +192,43 @@ def _cross_tracker_observations(
             )
             break  # one detection per (kf, side) — owner's tag is unique
   return obs
+
+
+def _finger_symmetry_factor(
+  key_l: int, key_r: int, noise: gtsam.noiseModel.Base
+) -> gtsam.CustomFactor:
+  """Soft URDF mimic prior with residual θ_left + θ_right."""
+
+  def error_func(
+    _this: gtsam.CustomFactor, values: gtsam.Values, jac: list[Float64Array] | None
+  ) -> Float64Array:
+    tl = values.atDouble(key_l)
+    tr = values.atDouble(key_r)
+    if jac is not None:
+      jac[0] = np.array([[1.0]])
+      jac[1] = np.array([[1.0]])
+    return np.array([tl + tr])
+
+  return gtsam.CustomFactor(noise, [key_l, key_r], error_func)
+
+
+def _resolve_urdf_path(explicit: Path | None) -> Path | None:
+  """The gripper URDF: an explicit path, else the cached/downloaded asset, else None."""
+  if explicit is not None:
+    return explicit
+  try:
+    from robot_descriptions import load_asset
+
+    return Path(
+      load_asset(
+        "robots/specialist_gripper/urdf/gripper.urdf",
+        repo_url="https://github.com/T-K-233/specialist_description",
+        cache_dir=str(Path.home() / ".cache" / "specialist_description"),
+      )
+    )
+  except Exception as exc:  # headless env without the gripper-URDF package
+    print(f"  gripper URDF unavailable ({exc}); finger joint factors disabled")
+    return None
 
 
 def _anchor_corners_world(ref_anchor: gtsam.Pose3, tag_size: float) -> Float64Array:
@@ -458,6 +497,7 @@ def _assemble_joint_graph(
   trackers: list[PreparedTracker],
   keys: TrackerKeys,
   args: Args,
+  ref_anchor: gtsam.Pose3,
   cross_obs: list[TagObservation],
   anchor_tag_id: int,
   anchor_corners_world: Float64Array,
@@ -502,6 +542,97 @@ def _assemble_joint_graph(
           graph, pose_key, corner_key, pixel, corner_noise, lens, obs_bearing
         )
   print(f"anchor corner reprojection: {n_anchor_sightings} anchor sightings")
+
+  # Base and finger tags pin one static body_T_base_tag; each finger adds a joint angle.
+  finger_noise = huber_pixel_noise(args.gripper.finger_reproj_sigma)
+  base_tag_noise = huber_pixel_noise(args.gripper.base_tag_reproj_sigma)
+  base_tag_prior_noise = gtsam.noiseModel.Diagonal.Sigmas(
+    np.array(
+      [args.gripper.base_tag_prior_sigma_rot] * 3
+      + [args.gripper.base_tag_prior_sigma_trans] * 3
+    )
+  )
+  sym_noise = gtsam.noiseModel.Isotropic.Sigma(1, args.gripper.finger_symmetry_sigma)
+  base_tag_corners = tag_corners_local(args.gripper.tag_size)
+  base_tag_id_by_name = {
+    t.name: tid for t, tid in zip(trackers, args.base_tag_ids, strict=True)
+  }
+  finger_factor_count = 0
+  base_tag_factor_count = 0
+  for t in trackers:
+    reprojs = {
+      0: t.finger_reproj.get("left_finger"),
+      1: t.finger_reproj.get("right_finger"),
+    }
+    has_fingers = any(r is not None for r in reprojs.values())
+    base_tag_id = base_tag_id_by_name.get(t.name, -1)
+    if t.body_T_base_tag is None or (not has_fingers and base_tag_id <= 0):
+      continue
+    bt_key = keys.base_tag_key(t.name)
+    values.insert(bt_key, t.body_T_base_tag)
+    graph.add(gtsam.PriorFactorPose3(bt_key, t.body_T_base_tag, base_tag_prior_noise))
+    # Base-tag corners reproject through body_T_base_tag into this tracker's rear lens.
+    if base_tag_id > 0:
+      for dets in t.rear_tags_per_kf:
+        det = next((d for d in dets if int(d.tag_id) == base_tag_id), None)
+        if det is None:
+          continue
+        bearing = mei_unproject(
+          np.asarray(det.center, dtype=np.float64).reshape(1, 2), t.rear_lens.params
+        )[0]
+        for j in range(4):
+          add_mei_base_tag_factor(
+            graph,
+            bt_key,
+            det.corners[j],
+            base_tag_noise,
+            t.rear_lens,
+            base_tag_corners[j],
+            bearing,
+          )
+          base_tag_factor_count += 1
+    both_fingers = reprojs[0] is not None and reprojs[1] is not None
+    observed_kf = sorted(
+      {kf for r in reprojs.values() if r is not None for kf in r.observations}
+    )
+    for kf in observed_kf:
+      seen_seed: dict[int, float] = {}
+      for finger_idx, reproj in reprojs.items():
+        obs = None if reproj is None else reproj.observations.get(kf)
+        if reproj is None or obs is None:
+          continue
+        tkey = keys.theta_key(t.name, finger_idx, kf)
+        values.insert(tkey, float(obs.theta_seed))
+        for j in range(4):
+          add_mei_finger_factor(
+            graph,
+            tkey,
+            bt_key,
+            obs.pixels[j],
+            finger_noise,
+            t.rear_lens,
+            reproj.base_T_joint,
+            reproj.corners_in_pivot[j],
+            obs.obs_bearing,
+          )
+          finger_factor_count += 1
+        seen_seed[finger_idx] = float(obs.theta_seed)
+      if both_fingers:
+        for finger_idx in (0, 1):
+          if finger_idx not in seen_seed:  # unseen finger: inferred from the prior only
+            values.insert(
+              keys.theta_key(t.name, finger_idx, kf), -next(iter(seen_seed.values()))
+            )
+        graph.add(
+          _finger_symmetry_factor(
+            keys.theta_key(t.name, 0, kf), keys.theta_key(t.name, 1, kf), sym_noise
+          )
+        )
+  if finger_factor_count or base_tag_factor_count:
+    print(
+      f"base-tag reprojection: {base_tag_factor_count} factors; "
+      f"finger joint-angle reprojection: {finger_factor_count} factors"
+    )
 
   # The owner's body_T_tag comes from its first stationary rear-lens PnP of its tag.
   body_T_tag_by_name = {
@@ -790,6 +921,9 @@ def _build_raw_export(
     t.name: (_pose_to_dict(t.body_T_base_tag) if t.body_T_base_tag else None)
     for t in trackers
   }
+  raw["joint_angles_by_tracker"] = {
+    t.name: t.joint_angles for t in trackers if t.joint_angles
+  }
   raw["anchor_tag_id"] = int(args.anchor.tag_id)
   raw["anchor_tag_size"] = float(args.anchor.tag_size)
   raw["gripper_keypoint_offset"] = [float(x) for x in args.gripper.keypoint_offset]
@@ -1039,6 +1173,9 @@ def main(args: Args) -> None:
     )
   )
 
+  # Resolve the URDF once: the finger joint-angle factors and the viz overlay share it.
+  urdf_path = _resolve_urdf_path(args.urdf_path)
+
   def _prep_one(spec: tuple[str, Path, float, int, int, int]) -> PreparedTracker:
     name, path, start, base_tag_id, left_id, right_id = spec
     print(f"\n=== prep tracker {name!r} ({path.name}, start={start:.3f}s) ===")
@@ -1057,6 +1194,7 @@ def main(args: Args) -> None:
         imu=args.imu,
         anchor=args.anchor,
         gripper=args.gripper,
+        urdf_path=urdf_path,
       ),
       args.prep_cache,
     )
@@ -1104,24 +1242,10 @@ def main(args: Args) -> None:
   )
   mark("joint LM (cull-reoptimize)")
 
+  _adopt_ba_refined_estimates(trackers, result, keys)
+
   stamp = time.strftime("%Y%m%d_%H%M%S")
   rrd_path = args.output_dir / f"track_{stamp}.rrd"
-
-  urdf_path = args.urdf_path
-  if urdf_path is None:
-    try:
-      from robot_descriptions import load_asset
-
-      urdf_path = Path(
-        load_asset(
-          "robots/specialist_gripper/urdf/gripper.urdf",
-          repo_url="https://github.com/T-K-233/specialist_description",
-          cache_dir=str(Path.home() / ".cache" / "specialist_description"),
-        )
-      )
-    except Exception as exc:  # headless env without the gripper-URDF package
-      print(f"  [viz] gripper URDF unavailable ({exc}); skipping URDF overlay")
-      urdf_path = None
 
   tag_size_by_id: dict[int, float] = {
     int(args.anchor.tag_id): float(args.anchor.tag_size),
