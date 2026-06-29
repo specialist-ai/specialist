@@ -12,10 +12,12 @@ import gtsam
 __all__ = ["TrackerKeys"]
 
 _ANCHOR_CHAR = "A"
+_BASE_TAG_CHAR = "G"
 _POSE_CHAR = "p"
 _VEL_CHAR = "v"
 _BIAS_CHAR = "b"
 _LANDMARK_CHAR = "l"
+_ANGLE_CHAR = "a"
 
 _MAX_KEYFRAMES_PER_TRACKER = 100_000
 _MAX_LANDMARKS_PER_TRACKER = 1_000_000
@@ -73,6 +75,21 @@ class TrackerKeys:
 
   def rear_landmark_key(self, name: str, track_id: int) -> int:
     return self._lm_key(name, 1, track_id)
+
+  def theta_key(self, name: str, finger_idx: int, keyframe_idx: int) -> int:
+    """Key for a finger's revolute joint angle (scalar) at one keyframe.
+    ``finger_idx`` 0 = left, 1 = right; collision-free per tracker and finger."""
+    return int(
+      gtsam.symbol(
+        _ANGLE_CHAR,
+        (self.tracker_index(name) * 2 + finger_idx) * self._kf_step + keyframe_idx,
+      )
+    )
+
+  def base_tag_key(self, name: str) -> int:
+    """Key for a tracker's base-tag pose in its body frame (one static ``Pose3``
+    shared across all keyframes; the base + finger tags reproject through it)."""
+    return int(gtsam.symbol(_BASE_TAG_CHAR, self.tracker_index(name)))
 
   def anchor_corner_key(self, corner_idx: int) -> int:
     """Key for one of the anchor tag's four fixed metric corner landmarks

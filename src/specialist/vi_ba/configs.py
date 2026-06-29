@@ -85,6 +85,17 @@ class AnchorCfg:
 class GripperCfg:
   tag_size: float = 0.01
   keypoint_offset: tuple[float, float, float] = (0.1095, 0.0, -0.018)
+  # Finger joint-angle recovery: per-corner reprojection σ (px) and the soft
+  # equal-and-opposite symmetry prior σ (rad) on θ_left + θ_right. The tag pose
+  # in the clamp slot comes from the URDF tag link (urdf_joints.joint_T_tag0).
+  finger_reproj_sigma: float = 1.5
+  finger_symmetry_sigma: float = 0.05
+  # The base-tag pose in the body frame is a BA variable, pinned by reprojecting
+  # the base tag's corners (σ px) and by a loose prior seeded from PnP (rotation
+  # rad / translation m) that anchors its gauge.
+  base_tag_reproj_sigma: float = 1.5
+  base_tag_prior_sigma_rot: float = 0.3
+  base_tag_prior_sigma_trans: float = 0.05
 
 
 @dataclass

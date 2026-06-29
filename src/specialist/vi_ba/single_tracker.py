@@ -35,6 +35,7 @@ from specialist.vi_ba.configs import (
 )
 from specialist.vi_ba.extrinsics import parse_insv_extrinsics
 from specialist.vi_ba.features import detect_orb, match_pair
+from specialist.vi_ba.finger_kinematics import FingerReproj, build_finger_reproj
 from specialist.vi_ba.imu import (
   ImuSamples,
   factory_imu_bias,
@@ -64,6 +65,7 @@ from specialist.vi_ba.pipeline import (
   run_lens_frontend,
   triangulate_lens,
 )
+from specialist.vi_ba.urdf_joints import read_revolute_joints
 
 Float64Array = npt.NDArray[np.float64]
 
@@ -114,6 +116,7 @@ class TrackerArgs:
   keyframe_every: int = 0  # 0 = auto (round(fps/10)); see WindowCfg.keyframe_every
   # Retain decoded keyframes (as JPEG) for the Rerun frame overlay.
   keep_frames: bool = False
+  urdf_path: Path | None = None  # gripper URDF for finger joint kinematics
   # 0 disables the corresponding URDF revolute joint angle recovery.
   left_finger_tag_id: int = 0
   right_finger_tag_id: int = 0
@@ -155,6 +158,10 @@ class PreparedTracker:
   front_rejected: dict[int, dict[int, Float64Array]]
   rear_rejected: dict[int, dict[int, Float64Array]]
   rear_static_mask_rects: list[tuple[int, int, int, int]]
+  # URDF joint name -> kinematic inputs for the joint-angle reprojection factors.
+  finger_reproj: dict[str, FingerReproj]
+  # Per-keyframe finger-tag poses in the body frame from rear-lens PnP; the
+  # cross-tracker finger tie uses them as the owner's hinged body→tag offset.
   body_T_left_finger_per_kf: dict[int, gtsam.Pose3]
   body_T_right_finger_per_kf: dict[int, gtsam.Pose3]
   left_finger_tag_id: int
@@ -660,6 +667,96 @@ def _imu_and_initial_gravity(
   return imu, bias0, gravity_world_initial
 
 
+def _recover_gripper_tags(
+  args: TrackerArgs,
+  rear_tags_per_kf: list[list[TagDetection]],
+  rear_lens: LensSetup,
+  n_keyframes: int,
+  kf_rotations: list[Float64Array],
+) -> tuple[gtsam.Pose3 | None, dict[str, list[float]], dict[str, FingerReproj]]:
+  """Base-tag body pose, per-finger joint angles, and finger reprojection inputs.
+
+  ``body_T_base_tag`` is the mean of the base tag's body-frame pose
+  (``rear_lens.extrinsic ∘ cam_T_tag``) over the rear keyframes that see it.
+  ``joint_angles`` holds each configured finger's per-keyframe URDF
+  revolute-joint angle from PnP (the viz seed and the bundle's per-keyframe
+  fallback). ``finger_reproj`` carries the corner-reprojection inputs the joint
+  bundle refines the angles from, built from the URDF when one is given.
+  """
+  base_tag_obs = anchor_pose_from_tags(
+    rear_tags_per_kf,
+    tag_id=args.base_tag_id,
+    tag_size=args.gripper.tag_size,
+    params=rear_lens.params,
+    kf_rotations=kf_rotations,
+  )
+  body_T_base_tag: gtsam.Pose3 | None = None
+  if base_tag_obs:
+    body_T_base_tag = _mean_pose(
+      [rear_lens.extrinsic.compose(p) for p in base_tag_obs.values()]
+    )
+  if args.base_tag_id > 0 and body_T_base_tag is None:
+    raise ValueError(
+      f"base tag {args.base_tag_id} was configured but never detected in the rear "
+      f"lens across {n_keyframes} keyframes — its base-tag, finger, and cross-tracker "
+      f"factors would all be silently disabled. Wrong id, or the tag out of the "
+      f"rear-lens field of view?"
+    )
+
+  finger_joint_tags = (
+    ("left_finger", args.left_finger_tag_id),
+    ("right_finger", args.right_finger_tag_id),
+  )
+  joint_angles: dict[str, list[float]] = {}
+  for joint_name, finger_id in finger_joint_tags:
+    if finger_id <= 0:
+      continue
+    joint_angles[joint_name] = _finger_joint_angles_per_kf(
+      rear_tags_per_kf,
+      rear_lens,
+      base_tag_id=args.base_tag_id,
+      finger_tag_id=finger_id,
+      tag_size=args.gripper.tag_size,
+      n_keyframes=n_keyframes,
+      kf_rotations=kf_rotations,
+    )
+
+  finger_reproj: dict[str, FingerReproj] = {}
+  if args.urdf_path is not None:
+    # The URDF is authored in the base (URDF root) frame; the bundle's
+    # body_T_base_tag carries each finger joint to the body frame.
+    joints = read_revolute_joints(args.urdf_path)
+    for joint_name, finger_id in finger_joint_tags:
+      if finger_id <= 0:
+        continue
+      joint = joints.get(joint_name)
+      if joint is None or joint.joint_T_tag0 is None:
+        raise ValueError(
+          f"finger tag {finger_id} was configured for '{joint_name}', but "
+          f"{args.urdf_path} has no revolute joint '{joint_name}' carrying an "
+          f"AprilTag frame (revolute joints present: {sorted(joints)}). Wrong URDF?"
+        )
+      if body_T_base_tag is None:
+        continue
+      reproj = build_finger_reproj(
+        joint,
+        rear_tags_per_kf,
+        rear_lens,
+        finger_tag_id=finger_id,
+        body_T_base_tag=body_T_base_tag,
+        tag_size=args.gripper.tag_size,
+        n_keyframes=n_keyframes,
+      )
+      if reproj is None:
+        print(
+          f"  [warn] finger tag {finger_id} ({joint_name}) never detected in the "
+          f"rear lens; its angle stays PnP-only, unrefined by the bundle"
+        )
+      else:
+        finger_reproj[joint_name] = reproj
+  return body_T_base_tag, joint_angles, finger_reproj
+
+
 def _snap_to_anchor_and_fill_gaps(
   args: TrackerArgs,
   anchor_obs_per_kf: dict[int, dict[str, gtsam.Pose3]],
@@ -1146,19 +1243,6 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
   print(f"  [{name}] VIO LSQ |v|max={v_max:.2f} m/s")
   biases = [bias0 for _ in range(n_keyframes)]
 
-  base_tag_obs = anchor_pose_from_tags(
-    rear_tags_per_kf,
-    tag_id=args.base_tag_id,
-    tag_size=args.gripper.tag_size,
-    params=rear_lens.params,
-    kf_rotations=rear_kf_rotations,
-  )
-  body_T_base_tag: gtsam.Pose3 | None = None
-  if base_tag_obs:
-    body_T_base_tag = _mean_pose(
-      [rear_lens.extrinsic.compose(p) for p in base_tag_obs.values()]
-    )
-
   def _per_kf_body_T_finger(finger_id: int) -> dict[int, gtsam.Pose3]:
     if finger_id <= 0:
       return {}
@@ -1181,22 +1265,9 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
   body_T_left_finger_per_kf = _per_kf_body_T_finger(args.left_finger_tag_id)
   body_T_right_finger_per_kf = _per_kf_body_T_finger(args.right_finger_tag_id)
 
-  joint_angles: dict[str, list[float]] = {}
-  for joint_name, finger_id in (
-    ("left_finger", args.left_finger_tag_id),
-    ("right_finger", args.right_finger_tag_id),
-  ):
-    if finger_id <= 0:
-      continue
-    joint_angles[joint_name] = _finger_joint_angles_per_kf(
-      rear_tags_per_kf,
-      rear_lens,
-      base_tag_id=args.base_tag_id,
-      finger_tag_id=finger_id,
-      tag_size=args.gripper.tag_size,
-      n_keyframes=n_keyframes,
-      kf_rotations=rear_kf_rotations,
-    )
+  body_T_base_tag, joint_angles, finger_reproj = _recover_gripper_tags(
+    args, rear_tags_per_kf, rear_lens, n_keyframes, rear_kf_rotations
+  )
 
   return PreparedTracker(
     name=name,
@@ -1225,6 +1296,7 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
     front_rejected=front_rejected,
     rear_rejected=rear_rejected,
     rear_static_mask_rects=static_rects,
+    finger_reproj=finger_reproj,
     body_T_left_finger_per_kf=body_T_left_finger_per_kf,
     body_T_right_finger_per_kf=body_T_right_finger_per_kf,
     left_finger_tag_id=args.left_finger_tag_id,

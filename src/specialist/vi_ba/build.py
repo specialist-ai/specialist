@@ -18,8 +18,12 @@ from gtsam.symbol_shorthand import B, L, V, X
 from specialist.loader.mei_model import MeiParams
 
 try:
-  # Native C++ MEI reprojection factor on (body pose, world landmark).
-  from specialist.vi_ba._mei_factor_cpp import make_mei_factor_cpp
+  # Native C++ MEI reprojection factors (pose+point, base-tag, and finger).
+  from specialist.vi_ba._mei_factor_cpp import (
+    make_mei_base_tag_factor_cpp,
+    make_mei_factor_cpp,
+    make_mei_finger_factor_cpp,
+  )
 except ImportError as _exc:  # pragma: no cover - extension is built by uv sync
   raise ImportError(
     "The native MEI factor extension (specialist.vi_ba._mei_factor_cpp) is not "
@@ -33,7 +37,9 @@ _REAR_LANDMARK_OFFSET = 1_000_000
 
 __all__ = [
   "LensSetup",
+  "add_mei_base_tag_factor",
   "add_mei_factor",
+  "add_mei_finger_factor",
   "build_vi_graph",
   "front_landmark_key",
   "huber_pixel_noise",
@@ -47,6 +53,10 @@ def _as_pixel(v: Float64Array) -> Float64Array:
 
 def _as_vec3(v: Float64Array) -> Float64Array:
   return np.asarray(v, dtype=np.float64).reshape(3)
+
+
+def _as_point3(v: Float64Array) -> gtsam.Point3:
+  return gtsam.Point3(*np.asarray(v, dtype=np.float64).reshape(3))
 
 
 def _gauge_noise() -> gtsam.noiseModel.Base:
@@ -121,6 +131,64 @@ def add_mei_factor(
       lens.extrinsic,
       *_mei_intrinsics(lens.params),
       bearing,
+    )
+  )
+
+
+def add_mei_finger_factor(
+  graph: gtsam.NonlinearFactorGraph,
+  theta_key: int,
+  base_tag_key: int,
+  pixel: Float64Array,
+  noise: gtsam.noiseModel.Base,
+  lens: LensSetup,
+  base_T_joint: gtsam.Pose3,
+  corner_in_pivot: Float64Array,
+  obs_bearing: Float64Array,
+) -> None:
+  """Push one native MEI finger-angle reprojection factor, binary on the scalar
+  joint angle ``theta_key`` and the base-tag pose ``base_tag_key``: the tag corner
+  rides a 1-DoF revolute joint (``base_T_joint`` pivot in the base-tag frame, +z
+  axis), so it reprojects as ``body_T_base_tag · base_T_joint · Rz(theta) ·
+  corner_in_pivot`` through ``lens`` onto ``pixel``. ``obs_bearing`` is the
+  lens-frame tag direction for the ξ>1 behind-camera cheirality guard."""
+  graph.push_back(
+    make_mei_finger_factor_cpp(
+      theta_key,
+      base_tag_key,
+      _as_pixel(pixel),
+      noise,
+      lens.extrinsic,
+      base_T_joint,
+      _as_point3(corner_in_pivot),
+      *_mei_intrinsics(lens.params),
+      _as_vec3(obs_bearing),
+    )
+  )
+
+
+def add_mei_base_tag_factor(
+  graph: gtsam.NonlinearFactorGraph,
+  base_tag_key: int,
+  pixel: Float64Array,
+  noise: gtsam.noiseModel.Base,
+  lens: LensSetup,
+  corner: Float64Array,
+  obs_bearing: Float64Array,
+) -> None:
+  """Push one native MEI base-tag reprojection factor, unary on the base-tag pose
+  ``base_tag_key``: the tag corner is fixed in the base-tag frame, so it
+  reprojects as ``body_T_base_tag · corner`` through ``lens`` onto ``pixel``.
+  ``obs_bearing`` is the lens-frame tag direction for the cheirality guard."""
+  graph.push_back(
+    make_mei_base_tag_factor_cpp(
+      base_tag_key,
+      _as_pixel(pixel),
+      noise,
+      lens.extrinsic,
+      _as_point3(corner),
+      *_mei_intrinsics(lens.params),
+      _as_vec3(obs_bearing),
     )
   )
 
