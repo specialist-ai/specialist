@@ -24,7 +24,6 @@ from specialist.vi_ba.anchor_detection import (
   TagDetection,
   anchor_pose_from_tags,
   detect_all_tags,
-  estimate_camera_to_tag_pose,
 )
 from specialist.vi_ba.build import LensSetup
 from specialist.vi_ba.configs import (
@@ -160,10 +159,6 @@ class PreparedTracker:
   rear_static_mask_rects: list[tuple[int, int, int, int]]
   # URDF joint name -> kinematic inputs for the joint-angle reprojection factors.
   finger_reproj: dict[str, FingerReproj]
-  # Per-keyframe finger-tag poses in the body frame from rear-lens PnP; the
-  # cross-tracker finger tie uses them as the owner's hinged body→tag offset.
-  body_T_left_finger_per_kf: dict[int, gtsam.Pose3]
-  body_T_right_finger_per_kf: dict[int, gtsam.Pose3]
   left_finger_tag_id: int
   right_finger_tag_id: int
   n_keyframes: int
@@ -1243,28 +1238,6 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
   print(f"  [{name}] VIO LSQ |v|max={v_max:.2f} m/s")
   biases = [bias0 for _ in range(n_keyframes)]
 
-  def _per_kf_body_T_finger(finger_id: int) -> dict[int, gtsam.Pose3]:
-    if finger_id <= 0:
-      return {}
-    out: dict[int, gtsam.Pose3] = {}
-    for kf in range(min(n_keyframes, len(rear_tags_per_kf))):
-      corners = next(
-        (d.corners for d in rear_tags_per_kf[kf] if int(d.tag_id) == finger_id),
-        None,
-      )
-      if corners is None:
-        continue
-      cam_T_finger = estimate_camera_to_tag_pose(
-        corners, args.gripper.tag_size, rear_lens.params
-      )
-      if cam_T_finger is None:
-        continue
-      out[kf] = rear_lens.extrinsic.compose(cam_T_finger)
-    return out
-
-  body_T_left_finger_per_kf = _per_kf_body_T_finger(args.left_finger_tag_id)
-  body_T_right_finger_per_kf = _per_kf_body_T_finger(args.right_finger_tag_id)
-
   body_T_base_tag, joint_angles, finger_reproj = _recover_gripper_tags(
     args, rear_tags_per_kf, rear_lens, n_keyframes, rear_kf_rotations
   )
@@ -1297,8 +1270,6 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
     rear_rejected=rear_rejected,
     rear_static_mask_rects=static_rects,
     finger_reproj=finger_reproj,
-    body_T_left_finger_per_kf=body_T_left_finger_per_kf,
-    body_T_right_finger_per_kf=body_T_right_finger_per_kf,
     left_finger_tag_id=args.left_finger_tag_id,
     right_finger_tag_id=args.right_finger_tag_id,
     n_keyframes=n_keyframes,

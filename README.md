@@ -91,9 +91,7 @@ src/specialist/
 │                finger_kinematics + urdf_joints (gripper joint recovery), imu,
 │                anchor_detection, extrinsics, optimize, landmark_cull,
 │                reliability, configs, viz
-├── loader/      parse_insv, mei_model, audio_sync
-├── graph/       factors (shared GTSAM factor constructors)
-└── synthesis/   tag_detection (the cross-tracker observation record)
+└── loader/      parse_insv, mei_model, audio_sync
 
 scripts/
 ├── track.py            the VI-BA driver (N ≥ 1 trackers)
