@@ -13,9 +13,10 @@ from gtsam.symbol_shorthand import B, L, V, X
 from specialist.loader.mei_model import MeiParams
 
 try:
-  # Native C++ MEI reprojection factors (pose+point, base-tag, and finger).
   from specialist.vi_ba._mei_factor_cpp import (
     make_mei_base_tag_factor_cpp,
+    make_mei_cross_finger_factor_cpp,
+    make_mei_cross_tag_factor_cpp,
     make_mei_factor_cpp,
     make_mei_finger_factor_cpp,
   )
@@ -33,6 +34,8 @@ _REAR_LANDMARK_OFFSET = 1_000_000
 __all__ = [
   "LensSetup",
   "add_mei_base_tag_factor",
+  "add_mei_cross_finger_factor",
+  "add_mei_cross_tag_factor",
   "add_mei_factor",
   "add_mei_finger_factor",
   "build_vi_graph",
@@ -168,6 +171,64 @@ def add_mei_base_tag_factor(
       lens.extrinsic,
       _as_point3(corner),
       *_mei_intrinsics(lens.params),
+      _as_vec3(obs_bearing),
+    )
+  )
+
+
+def add_mei_cross_tag_factor(
+  graph: gtsam.NonlinearFactorGraph,
+  observer_key: int,
+  owner_key: int,
+  base_tag_key: int,
+  pixel: Float64Array,
+  noise: gtsam.noiseModel.Base,
+  observer_lens: LensSetup,
+  corner: Float64Array,
+  obs_bearing: Float64Array,
+) -> None:
+  """Push one MEI cross-tracker factor on observer, owner and base-tag poses."""
+  graph.push_back(
+    make_mei_cross_tag_factor_cpp(
+      observer_key,
+      owner_key,
+      base_tag_key,
+      _as_pixel(pixel),
+      noise,
+      observer_lens.extrinsic,
+      _as_point3(corner),
+      *_mei_intrinsics(observer_lens.params),
+      _as_vec3(obs_bearing),
+    )
+  )
+
+
+def add_mei_cross_finger_factor(
+  graph: gtsam.NonlinearFactorGraph,
+  observer_key: int,
+  owner_key: int,
+  base_tag_key: int,
+  theta_key: int,
+  pixel: Float64Array,
+  noise: gtsam.noiseModel.Base,
+  observer_lens: LensSetup,
+  base_T_joint: gtsam.Pose3,
+  corner_in_pivot: Float64Array,
+  obs_bearing: Float64Array,
+) -> None:
+  """Push one MEI cross-tracker finger factor on observer, owner, base tag and angle."""
+  graph.push_back(
+    make_mei_cross_finger_factor_cpp(
+      observer_key,
+      owner_key,
+      base_tag_key,
+      theta_key,
+      _as_pixel(pixel),
+      noise,
+      observer_lens.extrinsic,
+      base_T_joint,
+      _as_point3(corner_in_pivot),
+      *_mei_intrinsics(observer_lens.params),
       _as_vec3(obs_bearing),
     )
   )
