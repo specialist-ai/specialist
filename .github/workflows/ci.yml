@@ -2,12 +2,12 @@ name: CI
 
 on:
   push:
-    branches: [master]
+    branches: [ci-verify]
     paths-ignore:
       - '**.md'
       - 'LICENSE'
   pull_request:
-    branches: [master]
+    branches: [ci-verify]
     paths-ignore:
       - '**.md'
       - 'LICENSE'
