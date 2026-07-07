@@ -44,7 +44,7 @@ def _undistorted_params() -> MeiParams:
   )
 
 
-def test_mei_round_trip_pinhole_centered() -> None:
+def test_mei_unprojects_principal_point_to_optical_axis() -> None:
   params = _undistorted_params()
   pixels = np.array([[320.0, 240.0]])
   bearing = mei_unproject(pixels, params)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import astuple
 
 import gtsam
 import numpy as np
@@ -97,7 +98,6 @@ def _finger_factor(
   params: MeiParams,
   obs_bearing: npt.NDArray[np.float64] | None = None,
 ) -> gtsam.NonlinearFactor:
-  p = params
   bearing = np.zeros(3) if obs_bearing is None else np.asarray(obs_bearing, float)
   return make_mei_finger_factor_cpp(
     _THETA_KEY,
@@ -107,16 +107,7 @@ def _finger_factor(
     extrinsic,
     base_T_joint,
     np.asarray(c, dtype=np.float64).reshape(3),
-    p.fx,
-    p.fy,
-    p.cx,
-    p.cy,
-    p.k1,
-    p.k2,
-    p.k3,
-    p.p1,
-    p.p2,
-    p.xi,
+    *astuple(params),
     bearing,
   )
 
@@ -128,7 +119,6 @@ def _base_tag_factor(
   params: MeiParams,
   obs_bearing: npt.NDArray[np.float64] | None = None,
 ) -> gtsam.NonlinearFactor:
-  p = params
   bearing = np.zeros(3) if obs_bearing is None else np.asarray(obs_bearing, float)
   return make_mei_base_tag_factor_cpp(
     _BASE_TAG_KEY,
@@ -136,16 +126,7 @@ def _base_tag_factor(
     _noise(),
     extrinsic,
     np.asarray(c, dtype=np.float64).reshape(3),
-    p.fx,
-    p.fy,
-    p.cx,
-    p.cy,
-    p.k1,
-    p.k2,
-    p.k3,
-    p.p1,
-    p.p2,
-    p.xi,
+    *astuple(params),
     bearing,
   )
 

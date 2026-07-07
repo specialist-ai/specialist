@@ -4,7 +4,6 @@ import math
 
 import gtsam
 import numpy as np
-import numpy.typing as npt
 
 from specialist.vi_ba.imu import (
   ImuSamples,
@@ -16,29 +15,8 @@ from specialist.vi_ba.imu import (
   slice_samples_at_keyframes,
 )
 
-Float64Array = npt.NDArray[np.float64]
-
 _GRAVITY = np.array([0.0, 0.0, -9.81], dtype=np.float64)
-
-
-def _stationary_samples(
-  rng: np.random.Generator,
-  duration: float,
-  rate: int,
-  gyro_bias: Float64Array,
-  accel_bias: Float64Array,
-  gyro_sigma: float,
-  accel_sigma: float,
-  gravity_world: Float64Array,
-  rotation_bw: gtsam.Rot3,
-) -> ImuSamples:
-  n = int(round(duration * rate))
-  t = np.linspace(0.0, duration, n, endpoint=False, dtype=np.float64)
-  # Stationary reading: accel in body = -R_bw^T @ g_world + bias + noise.
-  g_body = rotation_bw.matrix().T @ gravity_world
-  accel = -g_body + accel_bias + rng.normal(scale=accel_sigma, size=(n, 3))
-  gyro = gyro_bias + rng.normal(scale=gyro_sigma, size=(n, 3))
-  return ImuSamples(t=t, gyro=gyro.astype(np.float64), accel=accel.astype(np.float64))
+_ZERO_BIAS = gtsam.imuBias.ConstantBias(np.zeros(3), np.zeros(3))
 
 
 def test_from_deg_per_s_converts_units() -> None:
@@ -51,17 +29,13 @@ def test_from_deg_per_s_converts_units() -> None:
 
 def test_zero_motion_preintegration_yields_identity_rotation() -> None:
   rng = np.random.default_rng(0)
-  rotation = gtsam.Rot3()  # body == world
-  samples = _stationary_samples(
-    rng,
-    duration=1.0,
-    rate=1000,
-    gyro_bias=np.zeros(3),
-    accel_bias=np.zeros(3),
-    gyro_sigma=1e-6,
-    accel_sigma=1e-6,
-    gravity_world=_GRAVITY,
-    rotation_bw=rotation,
+  # Body == world, zero bias: accel reads -g_world, gyro reads ~0.
+  n = 1000
+  t = np.linspace(0.0, 1.0, n, endpoint=False, dtype=np.float64)
+  accel = -_GRAVITY + rng.normal(scale=1e-6, size=(n, 3))
+  gyro = rng.normal(scale=1e-6, size=(n, 3))
+  samples = ImuSamples(
+    t=t, gyro=gyro.astype(np.float64), accel=accel.astype(np.float64)
   )
   params = make_preintegration_params(
     gyro_noise_sigma=1e-3,
@@ -70,7 +44,7 @@ def test_zero_motion_preintegration_yields_identity_rotation() -> None:
     accel_walk=1e-4,
     gravity_world=tuple(_GRAVITY),
   )
-  bias = gtsam.imuBias.ConstantBias(np.zeros(3), np.zeros(3))
+  bias = _ZERO_BIAS
   pim = integrate_samples(params, samples, bias)
 
   # deltaRij is R_body_t0_to_body_t1.
@@ -94,7 +68,7 @@ def test_constant_gyro_yields_correct_rotation() -> None:
     accel_walk=1e-5,
     gravity_world=tuple(_GRAVITY),
   )
-  bias = gtsam.imuBias.ConstantBias(np.zeros(3), np.zeros(3))
+  bias = _ZERO_BIAS
   pim = integrate_samples(params, samples, bias)
 
   omega = gtsam.Rot3.Logmap(pim.deltaRij())
@@ -148,7 +122,7 @@ def test_preintegrate_between_keyframes_produces_n_minus_one() -> None:
     accel_walk=1e-5,
     gravity_world=tuple(_GRAVITY),
   )
-  bias = gtsam.imuBias.ConstantBias(np.zeros(3), np.zeros(3))
+  bias = _ZERO_BIAS
   pims = preintegrate_between_keyframes(
     params, samples, np.array([0.0, 0.5, 1.0, 1.5, 2.0]), bias
   )

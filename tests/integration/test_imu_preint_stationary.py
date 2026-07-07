@@ -9,6 +9,7 @@ import gtsam
 import numpy as np
 
 from specialist.vi_ba.imu import (
+  ImuSamples,
   from_deg_per_s,
   integrate_samples,
   make_preintegration_params,
@@ -46,8 +47,6 @@ def test_stationary_orientation_drift_within_budget() -> None:
   g_body = initial_rotation.matrix().T @ gravity_world
   accel_bias = accel_mean + g_body
   bias = gtsam.imuBias.ConstantBias(accel_bias, gyro_bias)
-
-  from specialist.vi_ba.imu import ImuSamples
 
   tail_mask = samples.t >= (samples.t[0] + 3.0)
   tail = ImuSamples(

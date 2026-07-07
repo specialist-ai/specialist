@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import astuple
+
 import gtsam
 import numpy as np
 import numpy.typing as npt
@@ -90,7 +92,6 @@ def _factor(
   params: MeiParams,
   obs_bearing: npt.NDArray[np.float64] | None = None,
 ) -> gtsam.NonlinearFactor:
-  p = params
   bearing = np.zeros(3) if obs_bearing is None else np.asarray(obs_bearing, float)
   return make_mei_cross_tag_factor_cpp(
     _OBS,
@@ -100,16 +101,7 @@ def _factor(
     _noise(),
     ext,
     np.asarray(c, dtype=np.float64).reshape(3),
-    p.fx,
-    p.fy,
-    p.cx,
-    p.cy,
-    p.k1,
-    p.k2,
-    p.k3,
-    p.p1,
-    p.p2,
-    p.xi,
+    *astuple(params),
     bearing,
   )
 
@@ -212,7 +204,6 @@ def _cross_finger_factor(
   params: MeiParams,
   obs_bearing: npt.NDArray[np.float64] | None = None,
 ) -> gtsam.NonlinearFactor:
-  p = params
   bearing = np.zeros(3) if obs_bearing is None else np.asarray(obs_bearing, float)
   return make_mei_cross_finger_factor_cpp(
     _OBS,
@@ -224,16 +215,7 @@ def _cross_finger_factor(
     ext,
     btj,
     np.asarray(c, dtype=np.float64).reshape(3),
-    p.fx,
-    p.fy,
-    p.cx,
-    p.cy,
-    p.k1,
-    p.k2,
-    p.k3,
-    p.p1,
-    p.p2,
-    p.xi,
+    *astuple(params),
     bearing,
   )
 
