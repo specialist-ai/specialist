@@ -30,8 +30,6 @@ class TrackerKeys:
     if len(set(tracker_names)) != len(tracker_names):
       raise ValueError(f"tracker names must be unique: {list(tracker_names)}")
     self._names: list[str] = list(tracker_names)
-    self._kf_step = int(_MAX_KEYFRAMES_PER_TRACKER)
-    self._lm_step = int(_MAX_LANDMARKS_PER_TRACKER)
 
   def tracker_index(self, name: str) -> int:
     if name not in self._names:
@@ -41,7 +39,9 @@ class TrackerKeys:
   def _kf_key(self, char: str, name: str, keyframe_idx: int) -> int:
     """Collision-free key for a per-keyframe variable in one tracker's slice."""
     return int(
-      gtsam.symbol(char, self.tracker_index(name) * self._kf_step + keyframe_idx)
+      gtsam.symbol(
+        char, self.tracker_index(name) * _MAX_KEYFRAMES_PER_TRACKER + keyframe_idx
+      )
     )
 
   def pose_key(self, name: str, keyframe_idx: int) -> int:
@@ -58,7 +58,7 @@ class TrackerKeys:
     return int(
       gtsam.symbol(
         _LANDMARK_CHAR,
-        (self.tracker_index(name) * 2 + half) * self._lm_step + track_id,
+        (self.tracker_index(name) * 2 + half) * _MAX_LANDMARKS_PER_TRACKER + track_id,
       )
     )
 
@@ -73,7 +73,8 @@ class TrackerKeys:
     return int(
       gtsam.symbol(
         _ANGLE_CHAR,
-        (self.tracker_index(name) * 2 + finger_idx) * self._kf_step + keyframe_idx,
+        (self.tracker_index(name) * 2 + finger_idx) * _MAX_KEYFRAMES_PER_TRACKER
+        + keyframe_idx,
       )
     )
 

@@ -50,7 +50,7 @@ def _seed_theta(
   t_lb = np.asarray(lens_T_body.translation(), dtype=np.float64)
   r_bj = body_T_joint.rotation().matrix()
   t_bj = np.asarray(body_T_joint.translation(), dtype=np.float64)
-  cx, cy, cz = corners_in_pivot[:, 0], corners_in_pivot[:, 1], corners_in_pivot[:, 2]
+  cx, cy, cz = corners_in_pivot.T
   best_theta, best_err = lower, np.inf
   for theta in np.linspace(lower, upper, _THETA_SCAN_SAMPLES):
     c, s = np.cos(theta), np.sin(theta)
@@ -84,7 +84,7 @@ def build_finger_reproj(
   )
   observations: dict[int, FingerKfObs] = {}
   for kf in range(min(n_keyframes, len(tags_per_kf))):
-    det = next((d for d in tags_per_kf[kf] if int(d.tag_id) == finger_tag_id), None)
+    det = next((d for d in tags_per_kf[kf] if d.tag_id == finger_tag_id), None)
     if det is None:
       continue
     pixels = np.asarray(det.corners, dtype=np.float64)

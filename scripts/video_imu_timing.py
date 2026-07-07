@@ -60,35 +60,34 @@ class TimingSummary:
 
 def _read_fisheye_grays(
   video_path: Path, max_frames: int, lens: str
-) -> tuple[list[npt.NDArray[np.uint8]], list[float]]:
+) -> tuple[list[npt.NDArray[np.uint8]], list[float], float]:
   frames = read_lens_grays(video_path, lens, max_frames=max_frames)
   cap = cv2.VideoCapture(str(video_path))
   fps = float(cap.get(cv2.CAP_PROP_FPS)) or 60.0
   cap.release()
   ts = [i / fps for i in range(len(frames))]
-  return frames, ts
+  return frames, ts, fps
 
 
 def _flow_magnitudes(grays: list[Float64Array], args: TimingArgs) -> Float64Array:
   """Median Lucas-Kanade flow magnitude per frame transition."""
+
+  def corners(img: np.ndarray) -> np.ndarray | None:
+    return cv2.goodFeaturesToTrack(
+      img,
+      maxCorners=args.flow_max_corners,
+      qualityLevel=args.flow_quality_level,
+      minDistance=args.flow_min_distance_px,
+    )
+
   mags: list[float] = []
   prev = grays[0].astype(np.uint8)
-  prev_pts = cv2.goodFeaturesToTrack(
-    prev,
-    maxCorners=args.flow_max_corners,
-    qualityLevel=args.flow_quality_level,
-    minDistance=args.flow_min_distance_px,
-  )
+  prev_pts = corners(prev)
   for k in range(1, len(grays)):
     curr = grays[k].astype(np.uint8)
     if prev_pts is None or len(prev_pts) < 10:
       mags.append(0.0)
-      prev_pts = cv2.goodFeaturesToTrack(
-        curr,
-        maxCorners=args.flow_max_corners,
-        qualityLevel=args.flow_quality_level,
-        minDistance=args.flow_min_distance_px,
-      )
+      prev_pts = corners(curr)
       prev = curr
       continue
     next_pts, status, _ = cv2.calcOpticalFlowPyrLK(prev, curr, prev_pts, None)
@@ -101,20 +100,9 @@ def _flow_magnitudes(grays: list[Float64Array], args: TimingArgs) -> Float64Arra
         mags.append(float(np.median(np.linalg.norm(delta, axis=1))))
       else:
         mags.append(0.0)
-    prev_pts = cv2.goodFeaturesToTrack(
-      curr,
-      maxCorners=args.flow_max_corners,
-      qualityLevel=args.flow_quality_level,
-      minDistance=args.flow_min_distance_px,
-    )
+    prev_pts = corners(curr)
     prev = curr
   return np.asarray([0.0, *mags], dtype=np.float64)
-
-
-def _resample(
-  src_t: Float64Array, src_v: Float64Array, dst_t: Float64Array
-) -> Float64Array:
-  return np.interp(dst_t, src_t, src_v)
 
 
 def _estimate_offset(
@@ -131,7 +119,7 @@ def _estimate_offset(
   offsets = np.arange(-max_offset, max_offset + step, step)
   best_off, best_corr = 0.0, -np.inf
   for off in offsets:
-    shifted = _resample(imu_t + off, gyro_mag, video_t)
+    shifted = np.interp(video_t, imu_t + off, gyro_mag)
     z = (shifted - shifted.mean()) / (shifted.std() + 1e-9)
     corr = float(np.dot(flow, z) / flow.size)
     if corr > best_corr:
@@ -176,8 +164,7 @@ def _estimate_rolling_shutter(
   applied_offset: float,
 ) -> ShearResult | None:
   """Per-frame: shear (px/px) / gyro_yaw_rate_pix -> readout time (s)."""
-  height = grays[0].shape[0]
-  width = grays[0].shape[1]
+  height, width = grays[0].shape[:2]
   # Degrees per pixel for a ~190° fisheye spanning the half-frame width.
   deg_per_pixel = 190.0 / width
 
@@ -250,11 +237,12 @@ def main(args: TimingArgs) -> None:
   args.output_dir.mkdir(parents=True, exist_ok=True)
   data: InsvData = load_insv(args.input_insv)
 
-  grays, video_t_list = _read_fisheye_grays(args.input_insv, args.max_frames, args.lens)
+  grays, video_t_list, fps = _read_fisheye_grays(
+    args.input_insv, args.max_frames, args.lens
+  )
   if len(grays) < 5:
     raise RuntimeError(f"only {len(grays)} frames decoded — capture too short?")
   video_t = np.asarray(video_t_list, dtype=np.float64)
-  fps = 1.0 / float(np.median(np.diff(video_t)))
 
   flow_mag = _flow_magnitudes(grays, args)
   gyro_mag = np.linalg.norm(data.gyro_deg, axis=1)

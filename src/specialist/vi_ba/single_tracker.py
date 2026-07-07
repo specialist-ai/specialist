@@ -230,12 +230,14 @@ def _per_kf_cam_T_tag(
   return out
 
 
+def _translation(pose: gtsam.Pose3) -> Float64Array:
+  return np.asarray(pose.translation(), dtype=np.float64)
+
+
 def _mean_pose(poses: list[gtsam.Pose3]) -> gtsam.Pose3:
   """Mean translation and log-mean rotation about the first pose."""
   ref = poses[0]
-  translations = np.stack(
-    [np.asarray(p.translation(), dtype=np.float64) for p in poses]
-  )
+  translations = np.stack([_translation(p) for p in poses])
   log_sum = np.zeros(3)
   for p in poses:
     log_sum += gtsam.Rot3.Logmap(ref.rotation().between(p.rotation()))
@@ -324,12 +326,7 @@ def _loop_closure_tracks(
 ) -> dict[int, dict[int, Float64Array]]:
   """Recover tracks broken by fast lifts via ORB loop closure."""
   orb = [detect_orb(f, n_features, 20, m) for f, m in zip(frames, masks, strict=True)]
-  centers = np.asarray(
-    [
-      np.asarray(p.compose(lens.extrinsic).translation(), dtype=np.float64)
-      for p in body_poses
-    ]
-  )
+  centers = np.asarray([_translation(p.compose(lens.extrinsic)) for p in body_poses])
   n = len(frames)
   parent: dict[tuple[int, int], tuple[int, int]] = {}
 
@@ -434,7 +431,7 @@ def _reject_vo_pose_outliers(
     ks = sorted(kept)
     if len(ks) < 5:
       break
-    c = {k: np.asarray(kept[k].translation(), dtype=np.float64) for k in ks}
+    c = {k: _translation(kept[k]) for k in ks}
     steps = [
       float(np.linalg.norm(c[ks[i + 1]] - c[ks[i]])) / (ks[i + 1] - ks[i])
       for i in range(len(ks) - 1)
@@ -517,8 +514,8 @@ def _anchor_metric_scale(
     else:
       continue
     body_in_tag = ext.compose(cam_T_tag).inverse()
-    anc.append(np.asarray(body_in_tag.translation(), dtype=np.float64))
-    vo.append(np.asarray(body_poses_unscaled[kf].translation(), dtype=np.float64))
+    anc.append(_translation(body_in_tag))
+    vo.append(_translation(body_poses_unscaled[kf]))
   if len(vo) < 3:
     return None
   vo_arr = np.asarray(vo, dtype=np.float64)
@@ -700,8 +697,8 @@ def _snap_to_anchor_and_fill_gaps(
     jumps = [
       float(
         np.linalg.norm(
-          np.asarray(body_poses[sorted_kfs[i]].translation())
-          - np.asarray(body_poses[sorted_kfs[i - 1]].translation())
+          _translation(body_poses[sorted_kfs[i]])
+          - _translation(body_poses[sorted_kfs[i - 1]])
         )
       )
       for i in range(1, len(sorted_kfs))
@@ -727,17 +724,14 @@ def _snap_to_anchor_and_fill_gaps(
       fwd_pose[k] = nav.pose()
       fwd_vel[k] = np.asarray(nav.velocity(), dtype=np.float64)
     dp = (
-      np.asarray(body_poses[b].translation(), dtype=np.float64)
-      - np.asarray(fwd_pose[b].translation(), dtype=np.float64)
-      if bidir
-      else np.zeros(3)
+      _translation(body_poses[b]) - _translation(fwd_pose[b]) if bidir else np.zeros(3)
     )
     for k in range(a + 1, b):
       if k in anchor_obs_per_kf:
         continue
       p = fwd_pose[k]
       if bidir:
-        tk = np.asarray(p.translation(), dtype=np.float64) + (k - a) / (b - a) * dp
+        tk = _translation(p) + (k - a) / (b - a) * dp
         body_poses[k] = gtsam.Pose3(p.rotation(), gtsam.Point3(*tk))
       else:
         body_poses[k] = p
@@ -887,10 +881,10 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
       _bearings_by_track(front_kept, front_lens.params),
       min_shared=args.frontend.init_min_shared_tracks,
     )
-    sfm_cams, _vo_outliers = _reject_vo_pose_outliers(sfm_cams)
-    if _vo_outliers:
+    sfm_cams, vo_outliers = _reject_vo_pose_outliers(sfm_cams)
+    if vo_outliers:
       print(
-        f"  [{name}] visual-odometry rejected {len(_vo_outliers)} rotation-spike kfs"
+        f"  [{name}] visual-odometry rejected {len(vo_outliers)} rotation-spike kfs"
       )
     if len(sfm_cams) >= max(8, n_keyframes // 4):
       body_poses_unscaled = body_poses_from_camera_poses(
@@ -940,7 +934,6 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
     min_landmark_depth=0.01,
     max_landmark_depth=1000.0,
   )
-  body_poses_visual = body_poses_unscaled
 
   # Placeholder vertical gravity; without a stationary window the LSQ-fit value sticks.
   pim_gravity = (
@@ -964,13 +957,13 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
       gravity_world=gravity,
     )
 
-  params_pim = _pim_params(pim_gravity)
+  params_initial = _pim_params(pim_gravity)
   # Scale: 1.0 for an anchor seed, else from a visible anchor, else floated on the IMU.
   anchor_scale = _anchor_metric_scale(
-    body_poses_visual, anchor_obs_per_kf, front_lens.extrinsic, rear_lens.extrinsic
+    body_poses_unscaled, anchor_obs_per_kf, front_lens.extrinsic, rear_lens.extrinsic
   )
   fixed_scale = 1.0 if anchor_seed_used else anchor_scale
-  pim_init = preintegrate_between_keyframes(params_pim, imu, keyframe_times, bias0)
+  pim_init = preintegrate_between_keyframes(params_initial, imu, keyframe_times, bias0)
 
   def _align(poses: list[gtsam.Pose3]) -> Alignment:
     return visual_inertial_align(
@@ -980,17 +973,17 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
       fixed_scale=fixed_scale,
     )
 
-  alignment = _align(body_poses_visual)
+  alignment = _align(body_poses_unscaled)
   if alignment.scale < 0.0:
-    origin = np.asarray(body_poses_visual[0].translation(), dtype=np.float64)
-    body_poses_visual = [
+    origin = _translation(body_poses_unscaled[0])
+    body_poses_unscaled = [
       gtsam.Pose3(
         p.rotation(),
-        gtsam.Point3(*(2.0 * origin - np.asarray(p.translation(), dtype=np.float64))),
+        gtsam.Point3(*(2.0 * origin - _translation(p))),
       )
-      for p in body_poses_visual
+      for p in body_poses_unscaled
     ]
-    alignment = _align(body_poses_visual)
+    alignment = _align(body_poses_unscaled)
   # Prefer the IMU stationary-window gravity to the LSQ fit, which can tilt the world.
   if gravity_world_initial is not None:
     alignment = Alignment(
@@ -999,7 +992,7 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
       velocities=alignment.velocities,
     )
   print(f"  [{name}] VI scale={alignment.scale:.4f}")
-  body_poses, world_rotation = apply_alignment_to_poses(body_poses_visual, alignment)
+  body_poses, world_rotation = apply_alignment_to_poses(body_poses_unscaled, alignment)
   world_rot_mat = world_rotation.matrix()
   velocities = [world_rot_mat @ v for v in alignment.velocities]
   params_aligned = _pim_params((0.0, 0.0, -9.81))
@@ -1023,15 +1016,6 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
     else None
   )
 
-  align_mat = alignment.scale * world_rotation.matrix()
-  front_unscaled_metric = {
-    tid: align_mat @ np.asarray(front_unscaled[tid], dtype=np.float64)
-    for tid in front_unscaled
-  }
-  rear_unscaled_metric = {
-    tid: align_mat @ np.asarray(rear_unscaled[tid], dtype=np.float64)
-    for tid in rear_unscaled
-  }
   loop_tracks: dict[int, dict[int, Float64Array]] = {}
   if args.frontend.loop_closure and (
     args.frontend.use_visual_odometry
@@ -1049,21 +1033,16 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
     )
   if use_anchor:
     anchor_kfs = set(anchor_obs_per_kf.keys())
-    if args.frontend.use_visual_odometry:
-      # Vision owns every keyframe pose, so triangulate the full tracks.
-      front_for_tri = front_kept
-      rear_for_tri = rear_kept
-    else:
+    if not args.frontend.use_visual_odometry:
+      # Without VO, keep only the tracks covisible with an anchor keyframe.
       front_kept = {
         t: front_kept[t] for t in front_kept if anchor_kfs & front_kept[t].keys()
       }
       rear_kept = {
         t: rear_kept[t] for t in rear_kept if anchor_kfs & rear_kept[t].keys()
       }
-      front_for_tri = front_kept
-      rear_for_tri = rear_kept
     front_points = triangulate_lens(
-      {t: front_for_tri[t] for t in front_for_tri if t in front_unscaled},
+      {t: front_kept[t] for t in front_kept if t in front_unscaled},
       body_poses,
       front_lens.extrinsic,
       front_lens.params,
@@ -1071,7 +1050,7 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
       max_landmark_depth=args.frontend.max_landmark_depth,
     )
     rear_points = triangulate_lens(
-      {t: rear_for_tri[t] for t in rear_for_tri if t in rear_unscaled},
+      {t: rear_kept[t] for t in rear_kept if t in rear_unscaled},
       body_poses,
       rear_lens.extrinsic,
       rear_lens.params,
@@ -1080,8 +1059,8 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
     )
     if args.frontend.use_visual_odometry:
       cap = args.frontend.vo_max_landmarks_per_lens
-      front_points = _cap_landmarks(front_points, front_for_tri, cap)
-      rear_points = _cap_landmarks(rear_points, rear_for_tri, cap)
+      front_points = _cap_landmarks(front_points, front_kept, cap)
+      rear_points = _cap_landmarks(rear_points, rear_kept, cap)
       if loop_tracks:
         # Merge after the cap so the per-lens budget never culls the revisit landmarks.
         _add_loop_landmarks(
@@ -1111,8 +1090,15 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
         anchor_kfs=anchor_kfs,
       )
   else:
-    front_points = front_unscaled_metric
-    rear_points = rear_unscaled_metric
+    align_mat = alignment.scale * world_rotation.matrix()
+    front_points = {
+      tid: align_mat @ np.asarray(front_unscaled[tid], dtype=np.float64)
+      for tid in front_unscaled
+    }
+    rear_points = {
+      tid: align_mat @ np.asarray(rear_unscaled[tid], dtype=np.float64)
+      for tid in rear_unscaled
+    }
 
   front_tracks_tri = {t: front_kept[t] for t in front_points if t in front_kept}
   rear_tracks_tri = {t: rear_kept[t] for t in rear_points if t in rear_kept}
