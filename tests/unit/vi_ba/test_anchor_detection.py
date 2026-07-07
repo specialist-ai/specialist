@@ -20,6 +20,7 @@ from specialist.vi_ba.anchor_detection import (
   TagDetection,
   anchor_pose_from_tags,
   estimate_camera_to_tag_pose,
+  tag_corners_local,
 )
 
 
@@ -43,39 +44,23 @@ def _project_tag(
   cam_T_tag: gtsam.Pose3, tag_size: float, params: MeiParams
 ) -> np.ndarray:
   """Project the four tag corners in pupil_apriltags's order (BL, BR, TR, TL)."""
-  half = tag_size / 2.0
-  corners_tag = np.array(
-    [
-      [-half, -half, 0.0],
-      [+half, -half, 0.0],
-      [+half, +half, 0.0],
-      [-half, +half, 0.0],
-    ],
-    dtype=np.float64,
-  )
   corners_cam = np.stack(
-    [np.asarray(cam_T_tag.transformFrom(gtsam.Point3(*c))) for c in corners_tag],
+    [
+      np.asarray(cam_T_tag.transformFrom(gtsam.Point3(*c)))
+      for c in tag_corners_local(tag_size)
+    ],
     axis=0,
   )
   return mei_project(corners_cam, params)
 
 
-def _ipp_e_solutions(
+def _ippe_solutions(
   corners_px: np.ndarray, tag_size: float, params: MeiParams
 ) -> list[gtsam.Pose3]:
   """Direct cv2 enumeration of both IPPE solutions, for test setup."""
   bearings = mei_unproject(corners_px.astype(np.float64), params)
   norm = (bearings[:, :2] / bearings[:, 2:3]).reshape(-1, 1, 2)
-  half = tag_size / 2.0
-  obj = np.array(
-    [
-      [-half, -half, 0.0],
-      [+half, -half, 0.0],
-      [+half, +half, 0.0],
-      [-half, +half, 0.0],
-    ],
-    dtype=np.float64,
-  ).reshape(-1, 1, 3)
+  obj = tag_corners_local(tag_size).reshape(-1, 1, 3)
   n, rvecs, tvecs, _ = cv2.solvePnPGeneric(
     obj,
     norm,
@@ -141,7 +126,7 @@ def test_temporal_prior_picks_solution_close_to_prior() -> None:
   tag_size = 0.10
   cam_T_tag = _camera_facing_tag_pose((1.0, 0.5, 0.0), 0.10, 0.20)
   corners = _project_tag(cam_T_tag, tag_size, params)
-  solutions = _ipp_e_solutions(corners, tag_size, params)
+  solutions = _ippe_solutions(corners, tag_size, params)
   if len(solutions) < 2:
     pytest.skip("IPPE returned a single solution for this geometry")
 

@@ -21,6 +21,7 @@ Guardrail properties:
 from __future__ import annotations
 
 import math
+from dataclasses import astuple
 
 import gtsam
 import numpy as np
@@ -70,7 +71,6 @@ def _factor(
   params: MeiParams,
   obs_bearing: npt.NDArray[np.float64] | None = None,
 ) -> gtsam.NonlinearFactor:
-  p = params
   bearing = np.zeros(3) if obs_bearing is None else np.asarray(obs_bearing, float)
   return make_mei_factor_cpp(
     _POSE_KEY,
@@ -78,16 +78,7 @@ def _factor(
     np.asarray(pixel, dtype=np.float64).reshape(2),
     _noise(),
     extrinsic,
-    p.fx,
-    p.fy,
-    p.cx,
-    p.cy,
-    p.k1,
-    p.k2,
-    p.k3,
-    p.p1,
-    p.p2,
-    p.xi,
+    *astuple(params),
     bearing,
   )
 
