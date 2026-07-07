@@ -29,6 +29,14 @@ __all__ = [
 ]
 
 
+@dataclass(frozen=True)
+class Frame:
+  """One keyframe's 2D keypoints and their descriptors."""
+
+  keypoints: Float64Array
+  descriptors: np.ndarray
+
+
 def parallel_map(fn: Callable[..., _R], *iterables: Iterable[object]) -> list[_R]:
   """Ordered ``ThreadPoolExecutor.map`` over ``iterables`` for native per-item
   work that releases the GIL. Results come back in input order."""
@@ -264,14 +272,6 @@ def dis_flow_track(
       )
     )
   return frames_out, matches_between
-
-
-@dataclass(frozen=True)
-class Frame:
-  """One keyframe's 2D keypoints and their descriptors."""
-
-  keypoints: Float64Array
-  descriptors: np.ndarray
 
 
 def detect_orb(

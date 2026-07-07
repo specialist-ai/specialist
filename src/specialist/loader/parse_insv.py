@@ -58,8 +58,6 @@ class InsvData:
   """
 
   source_path: Path
-  camera: str
-  model: str
   imu_timestamps: npt.NDArray[np.float64]
   gyro_deg: npt.NDArray[np.float64]
   accel: npt.NDArray[np.float64]
@@ -90,10 +88,8 @@ def load_insv(path: str | Path) -> InsvData:
   accel = np.empty((n, 3))
   for i, s in enumerate(imu_samples):
     ts[i] = float(s["timestamp_ms"]) * 1e-3
-    gx, gy, gz = s["gyro"]
-    ax, ay, az = s["accl"]
-    gyro[i, 0], gyro[i, 1], gyro[i, 2] = float(gx), float(gy), float(gz)
-    accel[i, 0], accel[i, 1], accel[i, 2] = float(ax), float(ay), float(az)
+    gyro[i] = s["gyro"]
+    accel[i] = s["accl"]
 
   lens = meta["Lens"]["Data"]
   fisheye = lens["fisheye_params"]
@@ -108,8 +104,6 @@ def load_insv(path: str | Path) -> InsvData:
   default_meta = meta["Default"]["Metadata"]
   return InsvData(
     source_path=path,
-    camera=str(parser.camera),
-    model=str(parser.model),
     imu_timestamps=ts,
     gyro_deg=gyro,
     accel=accel,

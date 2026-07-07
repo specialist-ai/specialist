@@ -32,40 +32,31 @@ def cull_outlier_landmarks(
   body_poses: list[gtsam.Pose3],
   lens: LensSetup,
 ) -> dict[int, dict[int, Float64Array]]:
-  """Filtered tracks for the landmarks worth keeping: ``{tid: {kf: pixel}}``
-  holding only the surviving observations of the surviving landmarks. An
-  observation survives only if the landmark projects in front of that
-  keyframe's camera (depth above ``MIN_DEPTH``) within ``MAX_RESIDUAL_PX`` of
-  where it was seen. A landmark survives iff at least ``MIN_OBSERVATIONS`` such
-  observations remain and the camera centers behind them span at least
-  ``MIN_PARALLAX`` of parallax — the latter drops the degenerate
-  near-zero-baseline triangulations the bundle pushes toward infinity. Keys of
-  the result are the landmark ids to keep."""
+  """Filtered tracks ``{tid: {kf: pixel}}`` keeping only the surviving
+  observations of the surviving landmarks, judged by the module survival
+  constants. Result keys are the landmark ids to keep."""
   kept: dict[int, dict[int, Float64Array]] = {}
   for tid, p in points.items():
     obs = tracks.get(tid)
     if not obs:
       continue
     point = np.asarray(p, dtype=np.float64)
-    landmark = gtsam.Point3(float(point[0]), float(point[1]), float(point[2]))
     survivors: dict[int, Float64Array] = {}
     centers: list[Float64Array] = []
     for kf, pixel in obs.items():
       if not (0 <= kf < len(body_poses)):
         continue
       world_T_lens = body_poses[kf].compose(lens.extrinsic)
-      p_lens = np.asarray(world_T_lens.transformTo(landmark), dtype=np.float64)
+      p_lens = np.asarray(world_T_lens.transformTo(point), dtype=np.float64)
       if p_lens[2] <= MIN_DEPTH:
         continue
       pred = mei_project(p_lens[None, :], lens.params)[0]
       if not np.all(np.isfinite(pred)):
         continue
-      if (
-        float(np.linalg.norm(pred - np.asarray(pixel, dtype=np.float64)))
-        > MAX_RESIDUAL_PX
-      ):
+      pixel_arr = np.asarray(pixel, dtype=np.float64)
+      if float(np.linalg.norm(pred - pixel_arr)) > MAX_RESIDUAL_PX:
         continue
-      survivors[kf] = np.asarray(pixel, dtype=np.float64)
+      survivors[kf] = pixel_arr
       centers.append(np.asarray(world_T_lens.translation(), dtype=np.float64))
     if len(survivors) < MIN_OBSERVATIONS:
       continue

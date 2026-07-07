@@ -35,6 +35,10 @@ def _pose_quaternion_xyzw(pose: gtsam.Pose3) -> Float64Array:
   return np.array([q.x(), q.y(), q.z(), q.w()], dtype=np.float64)
 
 
+def _translations(poses: list[gtsam.Pose3]) -> Float64Array:
+  return np.asarray([np.asarray(p.translation(), dtype=np.float64) for p in poses])
+
+
 def _pose_transform3d(pose: gtsam.Pose3) -> rr.Transform3D:
   return rr.Transform3D(
     translation=np.asarray(pose.translation(), dtype=np.float64),
@@ -134,7 +138,7 @@ def _send_lens_tag_columns(
       columns=rr.Boxes2D.columns(
         centers=np.stack(mask_centers),
         half_sizes=np.stack(mask_half_sizes),
-        colors=np.tile(red, (total_masked, 1)),
+        colors=_solid_colors(_RED, total_masked),
         labels=["MASKED"] * total_masked,
         show_labels=[True] * total_masked,
       ).partition(mask_partition),
@@ -334,9 +338,7 @@ def _gripper_points(data: TrackerVizData) -> Float64Array:
         for p in data.urdf_root_poses
       ]
     )
-  return np.asarray(
-    [np.asarray(p.translation(), dtype=np.float64) for p in data.body_poses]
-  )
+  return _translations(data.body_poses)
 
 
 def _floor_z_for(data: TrackerVizData) -> float | None:
@@ -395,9 +397,7 @@ def _log_tracker(
   must already be logged by the caller. Scalar paths are
   ``metrics/<scalar>{metrics_suffix}`` so multi-tracker views with origin
   ``/metrics/<scalar>`` aggregate per-tracker series automatically."""
-  pose_translations = np.asarray(
-    [np.asarray(p.translation(), dtype=np.float64) for p in data.body_poses]
-  )
+  pose_translations = _translations(data.body_poses)
   traj = _gripper_points(data)
 
   _log_static_points(f"{spatial_root}/landmarks/front", data.front_points, _FRONT_COLOR)
@@ -462,10 +462,10 @@ def _log_tracker(
 
   n = len(data.body_poses)
   if data.keyframe_times is not None:
-    times = rr.TimeColumn(
-      _TIMELINE, duration=np.asarray(data.keyframe_times, dtype=np.float64)
-    )
+    trail_times = np.asarray(data.keyframe_times, dtype=np.float64)
+    times = rr.TimeColumn(_TIMELINE, duration=trail_times)
   else:
+    trail_times = np.arange(n, dtype=np.float64)
     times = rr.TimeColumn(_TIMELINE, sequence=np.arange(n, dtype=np.int64))
 
   quats = np.stack([_pose_quaternion_xyzw(p) for p in data.body_poses])
@@ -478,9 +478,7 @@ def _log_tracker(
     poses = (
       data.urdf_root_poses if data.urdf_root_poses is not None else data.body_poses
     )
-    urdf_traj = np.asarray(
-      [np.asarray(p.translation(), dtype=np.float64) for p in poses]
-    )
+    urdf_traj = _translations(poses)
     urdf_quats = np.stack([_pose_quaternion_xyzw(p) for p in poses])
     rr.send_columns(
       f"{spatial_root}/gripper",
@@ -493,7 +491,7 @@ def _log_tracker(
       ),
     )
     if data.joint_angles is not None:
-      assert tree is not None  # set above whenever urdf_path is not None
+      assert tree is not None  # non-None whenever urdf_path is set
       for joint_name, raw_values in data.joint_angles.items():
         joint = tree.get_joint_by_name(joint_name)
         if joint is None:
@@ -514,11 +512,6 @@ def _log_tracker(
           indexes=[times],
           columns=joint.compute_transform_columns(clean),
         )
-  trail_times = (
-    np.asarray(data.keyframe_times, dtype=np.float64)
-    if data.keyframe_times is not None
-    else np.arange(n, dtype=np.float64)
-  )
   rr.send_columns(
     f"{spatial_root}/trajectory",
     indexes=[times],
