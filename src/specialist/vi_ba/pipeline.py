@@ -345,18 +345,25 @@ def triangulate_lens(
   ``min_landmark_depth`` / ``max_landmark_depth`` gate the median-view
   depth — callers triangulating against unscaled visual-frame poses
   should widen these bounds."""
+  if not tracks:
+    return {}
+  # World→lens rotations and centers depend only on the keyframe, so build them
+  # once for all tracks.
+  lens_poses = [pose.compose(extrinsic) for pose in body_poses]
+  lens_rotations = np.stack([pose.rotation().matrix() for pose in lens_poses])
+  lens_centers = np.stack(
+    [np.asarray(pose.translation(), dtype=np.float64) for pose in lens_poses]
+  )
   out: dict[int, Float64Array] = {}
   for tid, obs in tracks.items():
     if len(obs) < min_track_length:
       continue
     kfs = sorted(obs)
     pixels = np.stack([obs[k] for k in kfs])
-    bearings = list(mei_unproject(pixels, params))
-    poses = [body_poses[k] for k in kfs]
     xyz = triangulate_track_multiview(
-      bearings,
-      poses,
-      extrinsic,
+      mei_unproject(pixels, params),
+      lens_rotations[kfs],
+      lens_centers[kfs],
       min_landmark_depth=min_landmark_depth,
       max_landmark_depth=max_landmark_depth,
     )
