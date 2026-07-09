@@ -33,7 +33,7 @@ from specialist.vi_ba.configs import (
   ImuCfg,
 )
 from specialist.vi_ba.extrinsics import parse_insv_extrinsics
-from specialist.vi_ba.features import detect_orb, match_pair
+from specialist.vi_ba.features import detect_orb, match_pair, parallel_map
 from specialist.vi_ba.finger_kinematics import FingerReproj, build_finger_reproj
 from specialist.vi_ba.imu import (
   ImuSamples,
@@ -351,7 +351,7 @@ def _loop_closure_tracks(
   into multi-view tracks spanning the lifts. Triangulated against the (drifted)
   poses these become wide-baseline landmarks whose reprojection inconsistency
   drives the bundle to pull the revisits back together, cancelling the drift."""
-  orb = [detect_orb(f, n_features, 20, m) for f, m in zip(frames, masks, strict=True)]
+  orb = parallel_map(lambda f, m: detect_orb(f, n_features, 20, m), frames, masks)
   centers = np.asarray([_translation(p.compose(lens.extrinsic)) for p in body_poses])
   n = len(frames)
   parent: dict[tuple[int, int], tuple[int, int]] = {}
