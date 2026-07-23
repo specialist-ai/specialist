@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import time
+import traceback
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Iterator
@@ -52,8 +53,11 @@ def optimize_graph(
   graph: gtsam.NonlinearFactorGraph,
   initial_values: gtsam.Values,
   max_iterations: int,
+  gpu: bool = False,
 ) -> OptimizeResult:
-  """Run Levenberg-Marquardt and return values + run stats."""
+  """Run Levenberg-Marquardt and return values + run stats. With ``gpu``,
+  the linear solves run through the Schur/cuDSS path, falling back to the
+  gtsam optimizer when the GPU backend is unavailable or its solve fails."""
   if max_iterations <= 0:
     # Return the initialization untouched — used to evaluate an init in
     # isolation, with no bundle-adjustment refinement.
@@ -64,25 +68,43 @@ def optimize_graph(
       initial_error=initial_error,
       final_error=initial_error,
     )
-  params = gtsam.LevenbergMarquardtParams()
-  params.setMaxIterations(max_iterations)
-  params.setRelativeErrorTol(_RELATIVE_ERROR_TOL)
-  optimizer = gtsam.LevenbergMarquardtOptimizer(graph, initial_values, params)
-  # The optimizer tracks its own error; asking it avoids re-evaluating the
-  # full graph before and after the solve.
-  initial_error = float(optimizer.error())
   begin = time.perf_counter()
-  with _bounded_solve_affinity():
-    result = optimizer.optimize()
-  iterations = int(optimizer.iterations())
-  final_error = float(optimizer.error())
+  values: gtsam.Values | None = None
+  note = ""
+  if gpu:
+    try:
+      from specialist.vi_ba.gpu_lm import lm_solve
+
+      with _bounded_solve_affinity():
+        values, iterations, initial_error, final_error = lm_solve(
+          graph, initial_values, max_iterations, _RELATIVE_ERROR_TOL
+        )
+      note = " (gpu)"
+    except ImportError as exc:
+      print(f"  [LM call] gpu backend unavailable ({exc}); using gtsam", flush=True)
+    except Exception:
+      traceback.print_exc()
+      print("  [LM call] gpu solve failed; using gtsam", flush=True)
+  if values is None:
+    params = gtsam.LevenbergMarquardtParams()
+    params.setMaxIterations(max_iterations)
+    params.setRelativeErrorTol(_RELATIVE_ERROR_TOL)
+    optimizer = gtsam.LevenbergMarquardtOptimizer(graph, initial_values, params)
+    # The optimizer tracks its own error; asking it avoids re-evaluating the
+    # full graph before and after the solve.
+    initial_error = float(optimizer.error())
+    begin = time.perf_counter()  # exclude any failed gpu attempt from the timing
+    with _bounded_solve_affinity():
+      values = optimizer.optimize()
+    iterations = int(optimizer.iterations())
+    final_error = float(optimizer.error())
   print(
     f"  [LM call] {iterations} iters in {time.perf_counter() - begin:.1f}s, "
-    f"error {initial_error:.0f} -> {final_error:.0f}",
+    f"error {initial_error:.0f} -> {final_error:.0f}{note}",
     flush=True,
   )
   return OptimizeResult(
-    values=result,
+    values=values,
     iterations=iterations,
     initial_error=initial_error,
     final_error=final_error,
