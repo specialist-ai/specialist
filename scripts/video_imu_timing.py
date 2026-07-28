@@ -179,6 +179,7 @@ def _estimate_rolling_shutter(
   *,
   args: TimingArgs,
   applied_offset: float,
+  factory_readout: float,
 ) -> ShearResult | None:
   """Per-frame: shear (px/px) / gyro_yaw_rate_pix -> readout time (s)."""
   height, width = grays[0].shape[:2]
@@ -210,7 +211,7 @@ def _estimate_rolling_shutter(
     return None
   return ShearResult(
     measured_readout=float(np.median(readouts)),
-    factory_readout=0.015727,
+    factory_readout=factory_readout,
     n_frames_used=len(readouts),
     median_yaw_rate_dps=float(np.median(np.abs(used_yaw_rates))),
   )
@@ -270,6 +271,7 @@ def main(args: TimingArgs) -> None:
     data.gyro_deg,
     args=args,
     applied_offset=offset.best_offset,
+    factory_readout=data.rolling_shutter_readout,
   )
 
   summary = TimingSummary(
