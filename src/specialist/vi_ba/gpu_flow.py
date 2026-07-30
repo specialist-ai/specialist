@@ -1,4 +1,4 @@
-"""GPU DIS flow: the ``features._iter_dis_flows`` stream, each lens on its own GPU."""
+"""GPU (PyTorch) DIS flow: the same stream ``features._iter_dis_flows`` yields."""
 
 from __future__ import annotations
 
@@ -15,16 +15,16 @@ _FlowPair = tuple[npt.NDArray[np.float32], npt.NDArray[np.float32]]
 __all__ = ["unavailable_reason", "prime", "iter_flows", "shutdown"]
 
 # Per-stream batch, sized from free memory; GPUs under _MIN_FREE_GB stay idle.
-_MAX_BATCH = int(os.environ.get("GPUFLOW_MAX_BATCH", "24"))
+_MAX_BATCH = 24
 _MIN_FREE_GB = 8.0
 _RESERVE_GB = 3.0
 _GB_PER_PAIR = 1.15
 
 # Distinct GPUs one process claims; past the cap, extra streams share the most-free GPU.
-_MAX_GPUS = int(os.environ.get("GPUFLOW_MAX_GPUS", "8"))
+_MAX_GPUS = 8
 
-# Pinned host staging with non-blocking copies; off selects the pageable path.
-_PINNED = os.environ.get("GPUFLOW_PINNED", "1") != "0"
+# Page-locked host staging with non-blocking copies.
+_PINNED = True
 
 _claim_lock = threading.Lock()
 _backend: tuple[Any, Any] | None = None
@@ -98,14 +98,11 @@ def _claim_device() -> tuple[int, int]:
       for i in free
       if i not in _claimed and free[i] >= _MIN_FREE_GB and _device_batch(free[i]) >= 1
     ]
-    if unclaimed and len(_claimed) < _MAX_GPUS:
-      idx = max(unclaimed, key=lambda i: free[i])
-      _claimed[idx] = 1
-      return idx, _device_batch(free[idx])
     shareable = [i for i in free if _device_batch(free[i]) >= 1]
     if not shareable:
       raise RuntimeError("no GPU has enough free memory for the flow backend")
-    idx = max(shareable, key=lambda i: free[i])
+    pool = unclaimed if unclaimed and len(_claimed) < _MAX_GPUS else shareable
+    idx = max(pool, key=lambda i: free[i])
     _claimed[idx] = _claimed.get(idx, 0) + 1
     return idx, _device_batch(free[idx])
 
@@ -316,7 +313,7 @@ def prime(frames: list[np.ndarray], fwd_vr: int, bwd_vr: int) -> _Engine:
   torch = _import_backend()[0]
   tries = torch.cuda.device_count() if torch.cuda.is_available() else 1
   last_exc: Exception | None = None
-  for _ in range(max(1, tries)):
+  for _ in range(tries):
     engine = _Engine(fwd_vr, bwd_vr)  # raises when no GPU is claimable
     try:
       engine.prime(frames)

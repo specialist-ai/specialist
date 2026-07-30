@@ -1,21 +1,22 @@
-"""``vi_ba.single_tracker``: lens concurrency, anchor seed and scale, loop landmarks."""
+"""``vi_ba.single_tracker``: two-lens concurrency, anchor seeds, loop-closure merge."""
 
 from __future__ import annotations
 
-import cv2
 import gtsam
 import numpy as np
 import pytest
 
-from specialist.loader.mei_model import MeiParams, mei_project
+from specialist.loader.mei_model import mei_project
 from specialist.vi_ba.build import LensSetup
-from specialist.vi_ba.pipeline import FrontendConfig, run_lens_frontend
+from specialist.vi_ba.pipeline import LensFrontendConfig, run_lens_frontend
 from specialist.vi_ba.single_tracker import (
   _add_loop_landmarks,
   _anchor_metric_scale,
   _anchor_pose_seed,
   run_two_concurrently,
 )
+from tests.frame_fixtures import translating_frames
+from tests.mei_fixtures import narrow_mei_params
 
 
 def test_returns_results_in_order() -> None:
@@ -30,29 +31,6 @@ def test_propagates_exceptions() -> None:
 
   with pytest.raises(ValueError, match="boom"):
     run_two_concurrently(lambda: 1, boom)
-
-
-def _params() -> MeiParams:
-  return MeiParams(
-    fx=160.0,
-    fy=160.0,
-    cx=120.0,
-    cy=120.0,
-    k1=0.0,
-    k2=0.0,
-    k3=0.0,
-    p1=0.0,
-    p2=0.0,
-    xi=0.8,
-  )
-
-
-def _translating_frames(n: int, shift: int, seed: int) -> list[np.ndarray]:
-  """A textured frame translated ``shift`` px per frame, so every match is an inlier."""
-  rng = np.random.default_rng(seed)
-  base = rng.integers(0, 255, size=(240, 320), dtype=np.uint8)
-  base = cv2.GaussianBlur(base, (0, 0), sigmaX=2.0)
-  return [np.roll(base, shift * k, axis=1)[:, 40:280].copy() for k in range(n)]
 
 
 def _tracks_equal(
@@ -71,10 +49,10 @@ def _tracks_equal(
 
 def test_frontend_parallel_matches_serial() -> None:
   """Concurrent lens frontends yield exactly the serial run's tracks."""
-  params = _params()
-  cfg = FrontendConfig(n_features=300)
-  front = _translating_frames(6, 2, seed=1)
-  rear = _translating_frames(6, 3, seed=2)
+  params = narrow_mei_params()
+  cfg = LensFrontendConfig(n_features=300)
+  front = translating_frames(6, 2, seed=1)
+  rear = translating_frames(6, 3, seed=2)
 
   (pf_orb, pf_tracks), (pr_orb, pr_tracks) = run_two_concurrently(
     lambda: run_lens_frontend(front, params, cfg),
@@ -151,7 +129,7 @@ def test_anchor_metric_scale_none_when_degenerate() -> None:
 
 
 def test_add_loop_landmarks_merges_revisit_into_bundle() -> None:
-  params = _params()
+  params = narrow_mei_params()
   ext = gtsam.Pose3()
   lens = LensSetup(extrinsic=ext, params=params)
   n = 6
@@ -176,10 +154,9 @@ def test_add_loop_landmarks_merges_revisit_into_bundle() -> None:
     loop_tracks,
     body_poses,
     lens,
-    2,
-    5.0,
-    "t",
-    "anchored loop closure",
+    min_track_length=2,
+    max_landmark_depth=5.0,
+    name="t",
   )
 
   assert 99 in front_kept  # loop track reaches the BA reprojection-factor input
@@ -189,7 +166,7 @@ def test_add_loop_landmarks_merges_revisit_into_bundle() -> None:
 
 
 def test_add_loop_landmarks_empty_is_noop() -> None:
-  params = _params()
+  params = narrow_mei_params()
   lens = LensSetup(extrinsic=gtsam.Pose3(), params=params)
   front_points: dict[int, np.ndarray] = {}
   front_kept = {5: {0: np.array([1.0, 1.0])}}
@@ -199,10 +176,9 @@ def test_add_loop_landmarks_empty_is_noop() -> None:
     {},
     [gtsam.Pose3()],
     lens,
-    2,
-    5.0,
-    "t",
-    "anchored loop closure",
+    min_track_length=2,
+    max_landmark_depth=5.0,
+    name="t",
   )
   assert loop_pts == {}
   assert front_points == {}
@@ -211,7 +187,7 @@ def test_add_loop_landmarks_empty_is_noop() -> None:
 
 def test_add_loop_landmarks_reliable_views_resist_drift() -> None:
   """With ``anchor_kfs`` the landmark triangulates from well-localized views alone."""
-  params = _params()
+  params = narrow_mei_params()
   ext = gtsam.Pose3()
   lens = LensSetup(extrinsic=ext, params=params)
   n = 6
@@ -240,16 +216,22 @@ def test_add_loop_landmarks_reliable_views_resist_drift() -> None:
     {99: dict(obs)},
     body_poses,
     lens,
-    2,
-    5.0,
-    "t",
-    "lc",
+    min_track_length=2,
+    max_landmark_depth=5.0,
+    name="t",
     anchor_kfs={1, 4},
   )
   fp_all: dict[int, np.ndarray] = {}
   fk_all: dict[int, dict[int, np.ndarray]] = {}
   _add_loop_landmarks(
-    fp_all, fk_all, {99: dict(obs)}, body_poses, lens, 2, 5.0, "t", "lc"
+    fp_all,
+    fk_all,
+    {99: dict(obs)},
+    body_poses,
+    lens,
+    min_track_length=2,
+    max_landmark_depth=5.0,
+    name="t",
   )
 
   assert 99 in fp_rel and 99 in fp_all

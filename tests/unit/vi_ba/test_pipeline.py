@@ -60,7 +60,7 @@ def test_threshold_zero_keeps_everything_with_two_or_more_obs() -> None:
   obs = _project_one(np.array([0.1, 0.0, 0.5]), params)
   tracks = {1: {0: obs.copy(), 1: obs.copy()}}
   kept, rejected = filter_tracks_by_parallax(tracks, params, min_parallax=0.0)
-  assert 1 in kept
+  assert 1 in kept and 1 not in rejected
 
 
 def test_single_observation_track_rejected() -> None:

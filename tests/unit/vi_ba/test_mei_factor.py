@@ -1,4 +1,4 @@
-"""``_mei_factor_cpp``: zero residual, Jacobian consistency and cheirality past 90°."""
+"""``_mei_factor_cpp``: zero residual, Jacobians, past-90° cheirality, bearing guard."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ import numpy.typing as npt
 import pytest
 
 from specialist.loader.mei_model import MeiParams, mei_project, mei_unproject
+from tests.mei_fixtures import unit_pixel_noise
 
 try:
   from specialist.vi_ba._mei_factor_cpp import make_mei_factor_cpp
@@ -42,11 +43,6 @@ def _params() -> MeiParams:
   )
 
 
-def _noise() -> gtsam.noiseModel.Base:
-  # Isotropic σ=1 px → whitened == unwhitened; makes Jacobian introspection easy.
-  return gtsam.noiseModel.Isotropic.Sigma(2, 1.0)
-
-
 def _factor(
   pixel: npt.NDArray[np.float64],
   extrinsic: gtsam.Pose3,
@@ -58,7 +54,7 @@ def _factor(
     _POSE_KEY,
     _LM_KEY,
     np.asarray(pixel, dtype=np.float64).reshape(2),
-    _noise(),
+    unit_pixel_noise(),
     extrinsic,
     *astuple(params),
     bearing,

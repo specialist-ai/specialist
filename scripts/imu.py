@@ -42,8 +42,8 @@ class AllanResult:
   axis: str
   taus: list[float]
   adev: list[float]
-  white_noise_density: float
-  bias_instability: float
+  white_noise_density_dps: float
+  bias_instability_dps: float
 
 
 @dataclass
@@ -80,20 +80,14 @@ def _build_stationary(
   quiet = mag_smooth < threshold_dps
   if not quiet.any():
     return None
-  best_start, best_len, run_start = -1, 0, -1
-  for i, q in enumerate(quiet):
-    if q and run_start == -1:
-      run_start = i
-    elif not q and run_start != -1:
-      length = i - run_start
-      if length > best_len:
-        best_start, best_len = run_start, length
-      run_start = -1
-  if run_start != -1:
-    length = quiet.size - run_start
-    if length > best_len:
-      best_start, best_len = run_start, length
-  if best_start == -1 or best_len < win * 4:
+  # The False padding turns a run touching either end into a normal edge pair.
+  padded = np.concatenate(([False], quiet, [False])).astype(np.int8)
+  edges = np.flatnonzero(np.diff(padded))
+  starts, ends = edges[::2], edges[1::2]
+  longest = int(np.argmax(ends - starts))
+  best_start = int(starts[longest])
+  best_len = int(ends[longest] - starts[longest])
+  if best_len < win * 4:
     return None
   i0 = best_start + win // 2
   i1 = min(best_start + best_len + win // 2, ts.size)
@@ -118,23 +112,25 @@ def _allan_for_axis(
   taus = np.asarray(taus, dtype=np.float64)
   adev = np.asarray(adev, dtype=np.float64)
 
-  # White-noise density N = ADEV * sqrt(tau) on the -1/2 slope, in signal/sqrt(Hz).
+  # At slope -1/2, ADEV(tau) = N / sqrt(tau), so N is in deg/s/sqrt(Hz).
   short_mask = (taus > 0) & (taus < 1.0)
-  white_noise_density = (
+  white_noise_density_dps = (
     float(np.median(adev[short_mask] * np.sqrt(taus[short_mask])))
     if short_mask.any()
     else float("nan")
   )
 
   long_mask = taus > 1.0
-  bias_instability = float(np.min(adev[long_mask])) if long_mask.any() else float("nan")
+  bias_instability_dps = (
+    float(np.min(adev[long_mask])) if long_mask.any() else float("nan")
+  )
 
   return AllanResult(
     axis=axis,
     taus=taus.tolist(),
     adev=adev.tolist(),
-    white_noise_density=white_noise_density,
-    bias_instability=bias_instability,
+    white_noise_density_dps=white_noise_density_dps,
+    bias_instability_dps=bias_instability_dps,
   )
 
 

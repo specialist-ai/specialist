@@ -20,7 +20,7 @@ UInt8Array = npt.NDArray[np.uint8]
 
 
 def read_lens_grays(
-  video_path: Path, lens: str, *, max_frames: int | None = None
+  video_path: Path, lens: str, *, max_frames: int
 ) -> list[UInt8Array]:
   """Grey frames of ``video_path`` or, for ``rear``, its ``_10_`` sibling."""
   if lens not in ("front", "rear"):
@@ -32,7 +32,7 @@ def read_lens_grays(
     raise RuntimeError(f"OpenCV failed to open {path}")
   try:
     grays: list[UInt8Array] = []
-    while max_frames is None or len(grays) < max_frames:
+    while len(grays) < max_frames:
       ok, frame = cap.read()
       if not ok:
         break
@@ -48,8 +48,6 @@ def finalize_probe(
   output_dir: Path,
   summary: Any,
   log_fn: Callable[[], None],
-  *,
-  extra_lines: list[str] | None = None,
 ) -> None:
   """Save a probe's ``.rrd``, logged by ``log_fn``, and its JSON summary."""
   stamp = time.strftime("%Y%m%d_%H%M%S")
@@ -64,6 +62,4 @@ def finalize_probe(
   json_path.write_text(payload)
   print(payload)
   print(f"\nWrote {rrd_path} and {json_path}")
-  for line in extra_lines or []:
-    print(line)
   print(f"Verdict: {summary.verdict}")

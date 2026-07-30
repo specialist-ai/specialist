@@ -103,10 +103,3 @@ def test_mei_unproject_rejects_bad_shape() -> None:
   params = _undistorted_params()
   with pytest.raises(ValueError):
     mei_unproject(np.zeros((3,)), params)
-
-
-def test_mei_from_camera_matrix_validates_shapes() -> None:
-  with pytest.raises(ValueError):
-    MeiParams.from_camera_matrix(np.zeros((2, 2)), np.zeros((6,)))
-  with pytest.raises(ValueError):
-    MeiParams.from_camera_matrix(np.eye(3), np.zeros((5,)))

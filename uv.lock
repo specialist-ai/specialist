@@ -1283,7 +1283,6 @@ dependencies = [
     { name = "numpy" },
     { name = "opencv-python" },
     { name = "pupil-apriltags" },
-    { name = "pyyaml" },
     { name = "rerun-sdk" },
     { name = "robot-descriptions" },
     { name = "scipy" },
@@ -1298,7 +1297,6 @@ dev = [
     { name = "pybind11" },
     { name = "pytest" },
     { name = "ruff" },
-    { name = "types-pyyaml" },
 ]
 gpu = [
     { name = "cupy-cuda12x", extra = ["ctk"], marker = "sys_platform == 'linux'" },
@@ -1323,7 +1321,6 @@ requires-dist = [
     { name = "pupil-apriltags", specifier = ">=1.0.4" },
     { name = "pybind11", marker = "extra == 'dev'", specifier = "==2.13.6" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
-    { name = "pyyaml", specifier = ">=6.0" },
     { name = "rerun-sdk", specifier = ">=0.21" },
     { name = "robot-descriptions", git = "ssh://git@github.com/T-K-233/specialist_description.git" },
     { name = "ruff", marker = "extra == 'dev'", specifier = "==0.15.0" },
@@ -1331,7 +1328,6 @@ requires-dist = [
     { name = "telemetry-parser", specifier = ">=0.3" },
     { name = "torch", marker = "sys_platform == 'linux' and extra == 'gpu'", specifier = ">=2.11", index = "https://download.pytorch.org/whl/cu129" },
     { name = "triton", marker = "sys_platform == 'linux' and extra == 'gpu'", specifier = ">=3.4", index = "https://download.pytorch.org/whl/cu129" },
-    { name = "types-pyyaml", marker = "extra == 'dev'", specifier = ">=6.0" },
     { name = "tyro", specifier = ">=0.9" },
 ]
 provides-extras = ["gpu", "dev"]
@@ -1501,15 +1497,6 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/2b/e8/66e25efcc18542d58706ce4e50415710593721aae26e794ab1dec34fb66f/typeguard-4.5.1.tar.gz", hash = "sha256:f6f8ecbbc819c9bc749983cc67c02391e16a9b43b8b27f15dc70ed7c4a007274", size = 80121, upload-time = "2026-02-19T16:09:03.392Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/91/88/b55b3117287a8540b76dbdd87733808d4d01c8067a3b339408c250bb3600/typeguard-4.5.1-py3-none-any.whl", hash = "sha256:44d2bf329d49a244110a090b55f5f91aa82d9a9834ebfd30bcc73651e4a8cc40", size = 36745, upload-time = "2026-02-19T16:09:01.6Z" },
-]
-
-[[package]]
-name = "types-pyyaml"
-version = "6.0.12.20260408"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/74/73/b759b1e413c31034cc01ecdfb96b38115d0ab4db55a752a3929f0cd449fd/types_pyyaml-6.0.12.20260408.tar.gz", hash = "sha256:92a73f2b8d7f39ef392a38131f76b970f8c66e4c42b3125ae872b7c93b556307", size = 17735, upload-time = "2026-04-08T04:30:50.974Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/1c/f0/c391068b86abb708882c6d75a08cd7d25b2c7227dab527b3a3685a3c635b/types_pyyaml-6.0.12.20260408-py3-none-any.whl", hash = "sha256:fbc42037d12159d9c801ebfcc79ebd28335a7c13b08a4cfbc6916df78fee9384", size = 20339, upload-time = "2026-04-08T04:30:50.113Z" },
 ]
 
 [[package]]

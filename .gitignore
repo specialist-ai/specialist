@@ -112,6 +112,8 @@ cython_debug/
 # Run artifacts
 **/logs/
 **/artifacts/
+/scratchpad/
+/run_*.sh
 
 # macOS
 .DS_Store
