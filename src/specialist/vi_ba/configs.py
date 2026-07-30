@@ -50,8 +50,15 @@ class ImuCfg:
 
 @dataclass
 class AnchorCfg:
-  tag_id: int
+  # Static wall-tag ids; the first is the reference anchor that pins the world gauge.
+  tag_ids: tuple[int, ...]
   tag_size: float = 0.1
+
+  @property
+  def enabled_tag_ids(self) -> tuple[int, ...]:
+    """``tag_ids`` with the negative (disabled) sentinel filtered out."""
+    return tuple(int(t) for t in self.tag_ids if int(t) >= 0)
+
   # The anchor's four metric corners reproject into the bundle and pin absolute scale.
   corner_reproj_sigma: float = 1.5
 

@@ -175,6 +175,38 @@ class MeiFactorCpp : public NoiseModelFactorN<Pose3, Point3> {
   }
 };
 
+// Unary on the observing pose X (world_T_body): a world-fixed point p
+// reprojects as p_body = X^-1 . p through the lens. Constant world points
+// (anchor tag corners) enter here without becoming graph variables.
+class MeiWorldPointFactorCpp : public NoiseModelFactorN<Pose3> {
+  using Base = NoiseModelFactorN<Pose3>;
+  MeiCorner lens_;
+  Vector3 p_world_;
+
+ public:
+  MeiWorldPointFactorCpp(Key poseKey, const SharedNoiseModel& model,
+                         MeiCorner lens, const Vector3& p_world)
+      : Base(model, poseKey), lens_(std::move(lens)), p_world_(p_world) {}
+
+  Vector evaluateError(const Pose3& pose, OptionalMatrixType H1) const override {
+    const Matrix3 R_bw = pose.rotation().matrix().transpose();
+    const Vector3 p_b = R_bw * (p_world_ - pose.translation());
+
+    Vector2 residual;
+    Matrix23 j_mei_r_lb;
+    if (!lens_.reproject(p_b, residual, j_mei_r_lb)) {
+      if (H1) *H1 = Matrix::Zero(2, 6);
+      return Vector2::Zero();
+    }
+    if (H1) *H1 = pose_to_jac(j_mei_r_lb, p_b);
+    return residual;
+  }
+
+  gtsam::NonlinearFactor::shared_ptr clone() const override {
+    return std::make_shared<MeiWorldPointFactorCpp>(*this);
+  }
+};
+
 // Binary on (theta, body_T_base_tag): a finger tag on a 1-DoF revolute joint
 // (rotation theta about the joint's +z axis) whose pivot is fixed in the base-tag
 // frame (base_T_joint, from the URDF). Camera and tag share the rigid body, so
@@ -364,6 +396,18 @@ static NoiseModelFactor::shared_ptr make_mei_factor_cpp(
                 obs_bearing));
 }
 
+static NoiseModelFactor::shared_ptr make_mei_world_point_factor_cpp(
+    size_t poseKey, const Vector2& pixel, const SharedNoiseModel& model,
+    const Pose3& extrinsic, const Vector3& p_world, double fx, double fy,
+    double cx, double cy, double k1, double k2, double k3, double p1, double p2,
+    double xi, const Vector3& obs_bearing) {
+  return std::make_shared<MeiWorldPointFactorCpp>(
+      poseKey, model,
+      MeiCorner(extrinsic, fx, fy, cx, cy, k1, k2, k3, p1, p2, xi, pixel,
+                obs_bearing),
+      p_world);
+}
+
 static NoiseModelFactor::shared_ptr make_mei_finger_factor_cpp(
     size_t thetaKey, size_t baseTagKey, const Vector2& pixel,
     const SharedNoiseModel& model, const Pose3& extrinsic,
@@ -422,6 +466,12 @@ PYBIND11_MODULE(_mei_factor_cpp, m) {
         py::arg("extrinsic"), py::arg("fx"), py::arg("fy"), py::arg("cx"),
         py::arg("cy"), py::arg("k1"), py::arg("k2"), py::arg("k3"),
         py::arg("p1"), py::arg("p2"), py::arg("xi"), py::arg("obs_bearing"));
+  m.def("make_mei_world_point_factor_cpp", &make_mei_world_point_factor_cpp,
+        py::arg("pose_key"), py::arg("pixel"), py::arg("noise"),
+        py::arg("extrinsic"), py::arg("p_world"), py::arg("fx"), py::arg("fy"),
+        py::arg("cx"), py::arg("cy"), py::arg("k1"), py::arg("k2"),
+        py::arg("k3"), py::arg("p1"), py::arg("p2"), py::arg("xi"),
+        py::arg("obs_bearing"));
   m.def("make_mei_finger_factor_cpp", &make_mei_finger_factor_cpp,
         py::arg("theta_key"), py::arg("base_tag_key"), py::arg("pixel"),
         py::arg("noise"), py::arg("extrinsic"), py::arg("base_T_joint"),

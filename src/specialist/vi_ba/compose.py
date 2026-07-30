@@ -8,7 +8,6 @@ import gtsam
 
 __all__ = ["TrackerKeys"]
 
-_ANCHOR_CHAR = "A"
 _BASE_TAG_CHAR = "G"
 _POSE_CHAR = "p"
 _VEL_CHAR = "v"
@@ -21,7 +20,7 @@ _MAX_LANDMARKS_PER_TRACKER = 1_000_000
 
 
 class TrackerKeys:
-  """Collision-free GTSAM keys per tracker; anchor corners at ``symbol('A', 0..3)``."""
+  """Collision-free GTSAM keys per tracker; anchor corners are constants, keyless."""
 
   def __init__(
     self,
@@ -55,11 +54,8 @@ class TrackerKeys:
 
   def _lm_key(self, name: str, half: int, track_id: int) -> int:
     """A landmark key in a tracker's front (``half=0``) or rear (``half=1``) slot."""
-    return int(
-      gtsam.symbol(
-        _LANDMARK_CHAR,
-        (self.tracker_index(name) * 2 + half) * _MAX_LANDMARKS_PER_TRACKER + track_id,
-      )
+    return self._slot_key(
+      _LANDMARK_CHAR, name, half, _MAX_LANDMARKS_PER_TRACKER, track_id
     )
 
   def front_landmark_key(self, name: str, track_id: int) -> int:
@@ -70,21 +66,19 @@ class TrackerKeys:
 
   def theta_key(self, name: str, finger_idx: int, keyframe_idx: int) -> int:
     """Key for a finger joint angle at ``kf``; ``finger_idx`` 0 is left, 1 is right."""
+    return self._slot_key(
+      _ANGLE_CHAR, name, finger_idx, _MAX_KEYFRAMES_PER_TRACKER, keyframe_idx
+    )
+
+  def _slot_key(self, char: str, name: str, half: int, width: int, index: int) -> int:
+    """One integer key in the tracker's ``half`` slice of a ``width``-wide slot."""
     return int(
-      gtsam.symbol(
-        _ANGLE_CHAR,
-        (self.tracker_index(name) * 2 + finger_idx) * _MAX_KEYFRAMES_PER_TRACKER
-        + keyframe_idx,
-      )
+      gtsam.symbol(char, (self.tracker_index(name) * 2 + half) * width + index)
     )
 
   def base_tag_key(self, name: str) -> int:
     """Key for the tracker's static base-tag pose in its body frame."""
     return int(gtsam.symbol(_BASE_TAG_CHAR, self.tracker_index(name)))
-
-  def anchor_corner_key(self, corner_idx: int) -> int:
-    """Key for one of the anchor tag's four metric corners, ``corner_idx`` 0..3."""
-    return int(gtsam.symbol(_ANCHOR_CHAR, corner_idx))
 
   def vi_graph_kwargs(self, name: str) -> dict[str, Callable[[int], int]]:
     """Per-tracker key callables to pass to ``build_vi_graph``."""

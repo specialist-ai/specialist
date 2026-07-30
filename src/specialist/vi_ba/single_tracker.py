@@ -132,8 +132,11 @@ class PreparedTracker:
   front_points: dict[int, Float64Array]
   rear_points: dict[int, Float64Array]
   decoded_width: int
-  anchor_obs_per_kf: dict[int, dict[str, gtsam.Pose3]]
-  anchor_local: gtsam.Pose3 | None
+  # Prep-reference anchor: the most-sighted configured id.
+  prep_anchor_tag_id: int
+  # ``{tag_id: {kf: {side: cam_T_tag}}}``.
+  anchor_obs_by_tag: dict[int, dict[int, dict[str, gtsam.Pose3]]]
+  anchor_locals_by_tag: dict[int, gtsam.Pose3]
   body_T_base_tag: gtsam.Pose3 | None
   # URDF joint name → per-keyframe angle about the URDF z-axis, NaN with no tag pose.
   joint_angles: dict[str, list[float]]
@@ -173,7 +176,7 @@ class PreparedTracker:
 def _build_non_anchor_tag_masks(
   frames: list[np.ndarray],
   tags_per_kf: list[list[TagDetection]],
-  exclude_tag_id: int,
+  exclude_tag_ids: set[int],
   pad_px: int,
 ) -> list[np.ndarray]:
   masks: list[np.ndarray] = []
@@ -181,7 +184,7 @@ def _build_non_anchor_tag_masks(
     h, w = frame.shape[:2]
     mask = np.full((h, w), 255, dtype=np.uint8)
     for tag in tags:
-      if exclude_tag_id >= 0 and int(tag.tag_id) == exclude_tag_id:
+      if int(tag.tag_id) in exclude_tag_ids:
         continue
       corners = np.asarray(tag.corners, dtype=np.float64)
       x0 = max(int(np.floor(corners[:, 0].min())) - pad_px, 0)
@@ -213,6 +216,85 @@ def _apply_static_mask_rects(
   return masks
 
 
+# Anchor-detection lens side: name, lens, per-kf tag detections, gyro increments.
+_LensSide = tuple[str, LensSetup, list[list[TagDetection]], list[Float64Array]]
+
+
+def _detect_anchor_obs(
+  tag_id: int,
+  tag_size: float,
+  lens_sides: tuple[_LensSide, ...],
+) -> dict[int, dict[str, gtsam.Pose3]]:
+  """``{kf: {side: cam_T_tag}}`` for one anchor id across both lens sides."""
+  obs: dict[int, dict[str, gtsam.Pose3]] = {}
+  for side, lens, tags, rotations in lens_sides:
+    for kf, pose in anchor_pose_from_tags(
+      tags,
+      tag_id,
+      tag_size,
+      lens.params,
+      kf_rotations=rotations,
+    ).items():
+      obs.setdefault(kf, {})[side] = pose
+  return obs
+
+
+def _choose_prep_anchor(
+  tag_ids: tuple[int, ...],
+  obs_by_tag: dict[int, dict[int, dict[str, gtsam.Pose3]]],
+) -> int:
+  """The id sighted at most keyframes; a tie goes to the earlier ``tag_ids`` entry."""
+  return max(tag_ids, key=lambda tid: len(obs_by_tag.get(tid, {})))
+
+
+def _print_anchor_geometry(
+  name: str,
+  tag_id: int,
+  lens_sides: tuple[_LensSide, ...],
+  obs: dict[int, dict[str, gtsam.Pose3]],
+) -> None:
+  """Print per-anchor edge length (px), bearing half-angle and PnP incidence angle."""
+  edges: list[float] = []
+  half_angles: list[float] = []
+  for _side, lens, tags, _rotations in lens_sides:
+    for dets in tags:
+      for det in dets:
+        if int(det.tag_id) != tag_id:
+          continue
+        corners = np.asarray(det.corners, dtype=np.float64)
+        edge = np.linalg.norm(np.roll(corners, -1, axis=0) - corners, axis=1)
+        edges.append(float(edge.min()))
+        bearing = mei_unproject(corners.mean(axis=0).reshape(1, 2), lens.params)[0]
+        norm = float(np.linalg.norm(bearing))
+        if np.isfinite(norm) and norm > 1e-9:
+          half_angles.append(
+            float(np.degrees(np.arccos(np.clip(bearing[2] / norm, -1.0, 1.0))))
+          )
+  incidences: list[float] = []
+  for sides in obs.values():
+    for pose in sides.values():
+      t = np.asarray(pose.translation(), dtype=np.float64)
+      dist = float(np.linalg.norm(t))
+      if dist < 1e-9:
+        continue
+      cos_incidence = -float(pose.rotation().matrix()[:, 2] @ t) / dist
+      incidences.append(float(np.degrees(np.arccos(np.clip(cos_incidence, -1.0, 1.0)))))
+  if not edges:
+    return
+
+  def med_p90(values: list[float]) -> str:
+    if not values:
+      return "-/-"
+    return f"{float(np.median(values)):.0f}/{float(np.percentile(values, 90)):.0f}"
+
+  print(
+    f"  [{name}] anchor {tag_id} geometry: {len(edges)} sightings, "
+    f"edge px min/median {min(edges):.0f}/{float(np.median(edges)):.0f}, "
+    f"half-angle median/p90 {med_p90(half_angles)} deg, "
+    f"incidence median/p90 {med_p90(incidences)} deg"
+  )
+
+
 def _per_kf_cam_T_tag(
   tags_per_kf: list[list[TagDetection]],
   lens: LensSetup,
@@ -228,6 +310,19 @@ def _per_kf_cam_T_tag(
   ).items():
     out[kf] = p
   return out
+
+
+def _first_sighting_local(
+  obs: dict[int, dict[str, gtsam.Pose3]],
+  front_lens: LensSetup,
+  rear_lens: LensSetup,
+  body_poses: list[gtsam.Pose3],
+) -> gtsam.Pose3:
+  """An anchor's local-world pose from its first sighting, front lens preferred."""
+  first_kf = min(obs)
+  lens, cam_T_tag = _side_lens_and_pose(obs[first_kf], front_lens, rear_lens)
+  assert cam_T_tag is not None
+  return body_poses[first_kf].compose(lens.extrinsic).compose(cam_T_tag)
 
 
 def _translation(pose: gtsam.Pose3) -> Float64Array:
@@ -686,12 +781,8 @@ def _snap_to_anchor_and_fill_gaps(
   name: str,
 ) -> gtsam.Pose3:
   """Local-world anchor pose; without VO, snap anchored keyframes, IMU-fill gaps."""
-  first_kf = min(anchor_obs_per_kf.keys())
-  sides = anchor_obs_per_kf[first_kf]
-  first_lens, first_cam_T_tag = _side_lens_and_pose(sides, front_lens, rear_lens)
-  assert first_cam_T_tag is not None
-  anchor_local = (
-    body_poses[first_kf].compose(first_lens.extrinsic).compose(first_cam_T_tag)
+  anchor_local = _first_sighting_local(
+    anchor_obs_per_kf, front_lens, rear_lens, body_poses
   )
   if args.frontend.use_visual_odometry:
     return anchor_local
@@ -774,7 +865,6 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
     lambda: detect_all_tags(rear_gray),
   )
 
-  # Gyro rotation increments carry the tag disambiguation prior through fast rotation.
   imu_to_body = np.asarray(args.imu.imu_to_body, dtype=np.float64)
   body_deltas = keyframe_delta_rotations(
     _body_imu_samples(data, imu_to_body), keyframe_times
@@ -787,26 +877,34 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
   front_kf_rotations = lens_kf_rotations(front_lens)
   rear_kf_rotations = lens_kf_rotations(rear_lens)
 
-  anchor_obs_per_kf: dict[int, dict[str, gtsam.Pose3]] = {}
-  if args.anchor.tag_id >= 0:
-    for side, lens, tags, rotations in (
-      ("front", front_lens, front_tags_per_kf, front_kf_rotations),
-      ("rear", rear_lens, rear_tags_per_kf, rear_kf_rotations),
-    ):
-      for kf, pose in anchor_pose_from_tags(
-        tags,
-        args.anchor.tag_id,
-        args.anchor.tag_size,
-        lens.params,
-        kf_rotations=rotations,
-      ).items():
-        anchor_obs_per_kf.setdefault(kf, {})[side] = pose
+  lens_sides = (
+    ("front", front_lens, front_tags_per_kf, front_kf_rotations),
+    ("rear", rear_lens, rear_tags_per_kf, rear_kf_rotations),
+  )
+  obs_by_tag = {
+    tag_id: _detect_anchor_obs(tag_id, args.anchor.tag_size, lens_sides)
+    for tag_id in args.anchor.enabled_tag_ids
+  }
+  prep_anchor_tag_id = _choose_prep_anchor(args.anchor.tag_ids, obs_by_tag)
+  anchor_obs_per_kf: dict[int, dict[str, gtsam.Pose3]] = obs_by_tag.get(
+    prep_anchor_tag_id, {}
+  )
+  if prep_anchor_tag_id != args.anchor.tag_ids[0]:
+    n_ref = len(obs_by_tag.get(args.anchor.tag_ids[0], {}))
+    print(
+      f"  [{name}] prep reference anchor: tag {prep_anchor_tag_id} "
+      f"({len(anchor_obs_per_kf)} sighted keyframes vs {n_ref} for "
+      f"tag {args.anchor.tag_ids[0]})"
+    )
+  for tag_id, obs in obs_by_tag.items():
+    _print_anchor_geometry(name, tag_id, lens_sides, obs)
 
+  anchor_tag_ids = set(obs_by_tag)
   front_masks = _build_non_anchor_tag_masks(
-    front_gray, front_tags_per_kf, args.anchor.tag_id, args.frontend.mask_tag_pad
+    front_gray, front_tags_per_kf, anchor_tag_ids, args.frontend.mask_tag_pad
   )
   rear_masks = _build_non_anchor_tag_masks(
-    rear_gray, rear_tags_per_kf, args.anchor.tag_id, args.frontend.mask_tag_pad
+    rear_gray, rear_tags_per_kf, anchor_tag_ids, args.frontend.mask_tag_pad
   )
   static_rects = list(args.frontend.mask_rear_rects)
   _apply_static_mask_rects(rear_masks, static_rects)
@@ -1006,7 +1104,7 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
   params_aligned = _pim_params((0.0, 0.0, -9.81))
   pim = preintegrate_between_keyframes(params_aligned, imu, keyframe_times, bias0)
 
-  use_anchor = args.anchor.tag_id >= 0 and bool(anchor_obs_per_kf)
+  use_anchor = bool(anchor_obs_per_kf)
   anchor_local: gtsam.Pose3 | None = (
     _snap_to_anchor_and_fill_gaps(
       args,
@@ -1023,6 +1121,17 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
     if use_anchor
     else None
   )
+
+  # Each sighted anchor's pose in this tracker's local world, for the shared-world BFS.
+  anchor_locals_by_tag: dict[int, gtsam.Pose3] = {}
+  if anchor_local is not None:
+    anchor_locals_by_tag[prep_anchor_tag_id] = anchor_local
+  for tag_id, obs in obs_by_tag.items():
+    if tag_id == prep_anchor_tag_id or not obs:
+      continue
+    anchor_locals_by_tag[tag_id] = _first_sighting_local(
+      obs, front_lens, rear_lens, body_poses
+    )
 
   loop_tracks: dict[int, dict[int, Float64Array]] = {}
   if args.frontend.loop_closure and (
@@ -1136,8 +1245,9 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
     front_points=front_points,
     rear_points=rear_points,
     decoded_width=decoded_width,
-    anchor_obs_per_kf=anchor_obs_per_kf,
-    anchor_local=anchor_local,
+    prep_anchor_tag_id=prep_anchor_tag_id,
+    anchor_obs_by_tag=obs_by_tag,
+    anchor_locals_by_tag=anchor_locals_by_tag,
     body_T_base_tag=body_T_base_tag,
     joint_angles=joint_angles,
     keyframe_times=keyframe_times,
