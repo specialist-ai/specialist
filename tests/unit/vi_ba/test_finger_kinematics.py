@@ -8,7 +8,7 @@ import numpy as np
 from specialist.vi_ba._mei_factor_cpp import make_mei_finger_factor_cpp
 
 from specialist.loader.mei_model import MeiParams, mei_project
-from specialist.vi_ba.anchor_detection import TagDetection, tag_corners_local
+from specialist.vi_ba.anchor_detection import TagDetection, tag_corners_in_frame
 from specialist.vi_ba.build import LensSetup
 from specialist.vi_ba.finger_kinematics import build_finger_reproj
 from specialist.vi_ba.urdf_joints import RevoluteJoint
@@ -24,10 +24,7 @@ _JOINT_T_TAG0 = gtsam.Pose3(gtsam.Rot3(), gtsam.Point3(0.02, 0.03, 0.0))
 
 
 def _detect(pose_cam_T_tag: gtsam.Pose3, tag_id: int) -> TagDetection:
-  cam_pts = np.array(
-    [pose_cam_T_tag.transformFrom(gtsam.Point3(*c)) for c in tag_corners_local(_TAG)]
-  )
-  px = mei_project(cam_pts, _PARAMS)
+  px = mei_project(tag_corners_in_frame(pose_cam_T_tag, _TAG), _PARAMS)
   return TagDetection(tag_id=tag_id, center=px.mean(0), corners=px)
 
 

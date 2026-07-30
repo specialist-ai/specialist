@@ -1,8 +1,9 @@
 """Tests for ``specialist.vi_ba.init``.
 
-Two-view essential-matrix init, SLERP + linear-t pose interpolation, and
-DLT triangulation. All tests are synthetic — construct a known camera
-pair, project known 3D landmarks, and check recovery.
+Two-view essential-matrix init, SLERP + linear-t pose interpolation,
+multi-view closest-point triangulation, and visual-inertial scale/gravity
+alignment, over synthetic camera pairs and preintegrated
+constant-acceleration IMU windows.
 """
 
 from __future__ import annotations
@@ -93,23 +94,22 @@ def test_body_poses_from_camera_poses_with_translation_extrinsic() -> None:
 
 
 def test_pick_init_pair_finds_widest_with_min_shared() -> None:
-  # 5 frames. track A: in frames {0,1,2}. track B: in frames {0,1,2,3}.
-  # track C: in frames {0,4}. Min shared = 2 → should return (0, 4, 2).
+  # Tracks 0 and 1 both span keyframes 0..2; track 2 spans only {0, 4}, so pairs
+  # (0, 4) and (0, 3) fall below min_shared=2 and the widest survivor is (0, 2).
   tracks: dict[int, dict[int, Float64Array]] = {
     0: {0: np.zeros(2), 1: np.zeros(2), 2: np.zeros(2)},
     1: {0: np.zeros(2), 1: np.zeros(2), 2: np.zeros(2), 3: np.zeros(2)},
     2: {0: np.zeros(2), 4: np.zeros(2)},
   }
-  first, last, n_shared = pick_init_pair(tracks, n_keyframes=5, min_shared=2)
-  assert (first, last, n_shared) == (0, 4, 1) or n_shared >= 2
+  last, n_shared = pick_init_pair(tracks, n_keyframes=5, min_shared=2)
+  assert (last, n_shared) == (2, 2)
 
 
 def test_pick_init_pair_falls_back_to_best_when_below_threshold() -> None:
   tracks: dict[int, dict[int, Float64Array]] = {
     0: {0: np.zeros(2), 1: np.zeros(2)},
   }
-  first, last, n_shared = pick_init_pair(tracks, n_keyframes=3, min_shared=10)
-  assert first == 0
+  last, n_shared = pick_init_pair(tracks, n_keyframes=3, min_shared=10)
   assert last == 1
   assert n_shared == 1
 
@@ -165,13 +165,6 @@ def _pim_with_motion(
   return integrate_samples(params, samples, bias)
 
 
-def _stationary_pim(
-  dt_total: float,
-  gravity_world: np.ndarray,
-) -> gtsam.PreintegratedCombinedMeasurements:
-  return _pim_with_motion(dt_total, gravity_world, np.zeros(3))
-
-
 _ACCEL_PHASES = [
   np.array([0.4, 0.3, 0.2]),
   np.array([-0.2, -0.1, 0.0]),
@@ -200,7 +193,7 @@ def test_visual_inertial_align_stationary_recovers_gravity_only() -> None:
   dt = 0.1
   n_kf = 6
   body_poses = [gtsam.Pose3() for _ in range(n_kf)]
-  pims = [_stationary_pim(dt, gravity) for _ in range(n_kf - 1)]
+  pims = [_pim_with_motion(dt, gravity, np.zeros(3)) for _ in range(n_kf - 1)]
 
   align = visual_inertial_align(body_poses, pims)
   assert isinstance(align, Alignment)

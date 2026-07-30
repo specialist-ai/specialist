@@ -4,9 +4,7 @@ Demuxes mono PCM via ``ffmpeg``, builds a Butterworth-lowpassed rectified
 envelope, and detects clap onsets with ``scipy.signal.find_peaks`` (a
 ``mean + threshold_sigmas·std`` height threshold + minimum spacing). The
 returned offset is the median of the largest cluster of pairwise
-clap-to-clap proposals, which stays robust to spurious and periodic claps
-where a cross-correlation side-lobe would shift the lag by a whole
-inter-clap spacing.
+clap-to-clap proposals (see ``_best_lag``).
 """
 
 from __future__ import annotations
@@ -24,12 +22,7 @@ from scipy.signal import butter, find_peaks, sosfiltfilt
 
 Float64Array = npt.NDArray[np.float64]
 
-__all__ = [
-  "ClapSyncResult",
-  "decode_mono_pcm",
-  "detect_clap_times",
-  "sync_two_claps",
-]
+__all__ = ["ClapSyncResult", "sync_two_claps"]
 
 
 @dataclass(frozen=True)
@@ -72,7 +65,7 @@ def _resolve_ffmpeg() -> str:
   )
 
 
-def decode_mono_pcm(
+def _decode_mono_pcm(
   source: str | Path,
   target_rate: int = 16_000,
 ) -> tuple[Float64Array, int]:
@@ -91,7 +84,7 @@ def decode_mono_pcm(
     "-ac",
     "1",
     "-ar",
-    str(int(target_rate)),
+    str(target_rate),
     "-f",
     "f32le",
     "-",
@@ -100,10 +93,10 @@ def decode_mono_pcm(
   if result.returncode != 0:
     raise RuntimeError(f"ffmpeg failed for {src}:\n{result.stderr.decode()}")
   pcm = np.frombuffer(result.stdout, dtype=np.float32).astype(np.float64)
-  return pcm, int(target_rate)
+  return pcm, target_rate
 
 
-def detect_clap_times(
+def _detect_clap_times(
   samples: Float64Array,
   rate: int,
   envelope_cutoff: float = 50.0,
@@ -119,17 +112,18 @@ def detect_clap_times(
     return np.zeros(0)
   sos = butter(4, envelope_cutoff, btype="low", fs=rate, output="sos")
   envelope = sosfiltfilt(sos, np.abs(samples))
-  threshold = float(envelope.mean()) + float(threshold_sigmas) * float(envelope.std())
+  threshold = float(envelope.mean()) + threshold_sigmas * float(envelope.std())
   min_distance = max(1, int(round(min_separation * rate)))
   peak_indices, _ = find_peaks(envelope, height=threshold, distance=min_distance)
-  return np.asarray(peak_indices / float(rate), dtype=np.float64)
+  return np.asarray(peak_indices / rate, dtype=np.float64)
 
 
 def _best_lag(
   times_a: Float64Array,
   times_b: Float64Array,
+  *,
+  match_tolerance: float,
   max_search: float = 30.0,
-  match_tolerance: float = 0.05,
 ) -> tuple[float, int]:
   """Lag (B − A) that the most clap pairs agree on. Returns
   ``(lag, agreeing_pair_count)``.
@@ -163,10 +157,10 @@ def sync_two_claps(
 ) -> ClapSyncResult:
   """End-to-end: demux both files, detect claps, return the lag that
   aligns clip A onto clip B's clock (``t_B = t_A + offset``)."""
-  pcm_a, rate = decode_mono_pcm(source_a)
-  pcm_b, _ = decode_mono_pcm(source_b)
-  claps_a = detect_clap_times(pcm_a, rate)
-  claps_b = detect_clap_times(pcm_b, rate)
+  pcm_a, rate = _decode_mono_pcm(source_a)
+  pcm_b, _ = _decode_mono_pcm(source_b)
+  claps_a = _detect_clap_times(pcm_a, rate)
+  claps_b = _detect_clap_times(pcm_b, rate)
   if claps_a.size == 0 or claps_b.size == 0:
     raise RuntimeError(
       f"no claps detected (a={claps_a.size}, b={claps_b.size}); "

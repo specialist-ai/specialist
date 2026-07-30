@@ -1,23 +1,24 @@
-"""Tests for ``single_tracker.run_two_concurrently`` — the per-lens parallelism
-helper must return results in order and produce output identical to running the
-two lens frontends sequentially."""
+"""Tests for ``specialist.vi_ba.single_tracker``: the two-lens concurrency
+helper, the anchor-PnP pose and metric-scale seeds, and the loop-closure
+landmark merge."""
 
 from __future__ import annotations
 
-import cv2
 import gtsam
 import numpy as np
 import pytest
 
-from specialist.loader.mei_model import MeiParams, mei_project
+from specialist.loader.mei_model import mei_project
 from specialist.vi_ba.build import LensSetup
-from specialist.vi_ba.pipeline import FrontendConfig, run_lens_frontend
+from specialist.vi_ba.pipeline import LensFrontendConfig, run_lens_frontend
 from specialist.vi_ba.single_tracker import (
   _add_loop_landmarks,
   _anchor_metric_scale,
   _anchor_pose_seed,
   run_two_concurrently,
 )
+from tests.frame_fixtures import translating_frames
+from tests.mei_fixtures import narrow_omni_params
 
 
 def test_returns_results_in_order() -> None:
@@ -32,31 +33,6 @@ def test_propagates_exceptions() -> None:
 
   with pytest.raises(ValueError, match="boom"):
     run_two_concurrently(lambda: 1, boom)
-
-
-def _params() -> MeiParams:
-  return MeiParams(
-    fx=160.0,
-    fy=160.0,
-    cx=120.0,
-    cy=120.0,
-    k1=0.0,
-    k2=0.0,
-    k3=0.0,
-    p1=0.0,
-    p2=0.0,
-    xi=0.8,
-  )
-
-
-def _translating_frames(n: int, shift: int, seed: int) -> list[np.ndarray]:
-  """A textured 240x240 frame translated by ``shift`` px per frame — pure
-  translation so DIS flow and essential RANSAC are unambiguous (every match an
-  inlier), making the frontend output seed-independent and reproducible."""
-  rng = np.random.default_rng(seed)
-  base = rng.integers(0, 255, size=(240, 320), dtype=np.uint8)
-  base = cv2.GaussianBlur(base, (0, 0), sigmaX=2.0)
-  return [np.roll(base, shift * k, axis=1)[:, 40:280].copy() for k in range(n)]
 
 
 def _tracks_equal(
@@ -74,12 +50,12 @@ def _tracks_equal(
 
 
 def test_frontend_parallel_matches_serial() -> None:
-  """The headline win: running the two lens frontends concurrently must yield
-  the exact same tracks as running them one after another."""
-  params = _params()
-  cfg = FrontendConfig(n_features=300)
-  front = _translating_frames(6, 2, seed=1)
-  rear = _translating_frames(6, 3, seed=2)
+  """Running the two lens frontends concurrently yields the exact same tracks
+  as running them one after another."""
+  params = narrow_omni_params()
+  cfg = LensFrontendConfig(n_features=300)
+  front = translating_frames(6, 2, seed=1)
+  rear = translating_frames(6, 3, seed=2)
 
   (pf_orb, pf_tracks), (pr_orb, pr_tracks) = run_two_concurrently(
     lambda: run_lens_frontend(front, params, cfg),
@@ -163,7 +139,7 @@ def test_add_loop_landmarks_merges_revisit_into_bundle() -> None:
   """A revisit track spanning two baselined keyframes triangulates to its true
   world point and lands in ``front_kept``, without dropping pre-existing
   tracks."""
-  params = _params()
+  params = narrow_omni_params()
   ext = gtsam.Pose3()
   lens = LensSetup(extrinsic=ext, params=params)
   n = 6
@@ -188,10 +164,9 @@ def test_add_loop_landmarks_merges_revisit_into_bundle() -> None:
     loop_tracks,
     body_poses,
     lens,
-    2,
-    5.0,
-    "t",
-    "anchored loop closure",
+    min_track_length=2,
+    max_landmark_depth=5.0,
+    name="t",
   )
 
   assert 99 in front_kept  # loop track reaches the BA reprojection-factor input
@@ -202,7 +177,7 @@ def test_add_loop_landmarks_merges_revisit_into_bundle() -> None:
 
 def test_add_loop_landmarks_empty_is_noop() -> None:
   """No revisit tracks leaves ``front_points`` and ``front_kept`` unchanged."""
-  params = _params()
+  params = narrow_omni_params()
   lens = LensSetup(extrinsic=gtsam.Pose3(), params=params)
   front_points: dict[int, np.ndarray] = {}
   front_kept = {5: {0: np.array([1.0, 1.0])}}
@@ -212,10 +187,9 @@ def test_add_loop_landmarks_empty_is_noop() -> None:
     {},
     [gtsam.Pose3()],
     lens,
-    2,
-    5.0,
-    "t",
-    "anchored loop closure",
+    min_track_length=2,
+    max_landmark_depth=5.0,
+    name="t",
   )
   assert loop_pts == {}
   assert front_points == {}
@@ -226,7 +200,7 @@ def test_add_loop_landmarks_reliable_views_resist_drift() -> None:
   """With ``anchor_kfs`` the revisit landmark triangulates from the
   well-localized views alone, so a drifted anchor-free view cannot pull it off
   truth."""
-  params = _params()
+  params = narrow_omni_params()
   ext = gtsam.Pose3()
   lens = LensSetup(extrinsic=ext, params=params)
   n = 6
@@ -255,16 +229,22 @@ def test_add_loop_landmarks_reliable_views_resist_drift() -> None:
     {99: dict(obs)},
     body_poses,
     lens,
-    2,
-    5.0,
-    "t",
-    "lc",
+    min_track_length=2,
+    max_landmark_depth=5.0,
+    name="t",
     anchor_kfs={1, 4},
   )
   fp_all: dict[int, np.ndarray] = {}
   fk_all: dict[int, dict[int, np.ndarray]] = {}
   _add_loop_landmarks(
-    fp_all, fk_all, {99: dict(obs)}, body_poses, lens, 2, 5.0, "t", "lc"
+    fp_all,
+    fk_all,
+    {99: dict(obs)},
+    body_poses,
+    lens,
+    min_track_length=2,
+    max_landmark_depth=5.0,
+    name="t",
   )
 
   assert 99 in fp_rel and 99 in fp_all

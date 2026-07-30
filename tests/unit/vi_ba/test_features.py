@@ -54,15 +54,13 @@ def test_detect_orb_respects_mask() -> None:
   )
 
 
-def test_match_pair_identical_frames_matches_all_points() -> None:
+def test_match_pair_identical_frames_returns_well_formed_matches() -> None:
   rng = np.random.default_rng(1)
   img = _textured_image(rng)
   a = detect_orb(img, n_features=200, fast_threshold=12)
   # Identical descriptors: the ratio test can still reject when the
   # second-best is equally close.
   matches = match_pair(a, a, ratio=0.99)
-  # With noisy uniform descriptors ratio test can still cull most; require
-  # just that the structure is right and some matches survive.
   assert matches.ndim == 2 and matches.shape[1] == 2
   assert matches.shape[0] > 0
 

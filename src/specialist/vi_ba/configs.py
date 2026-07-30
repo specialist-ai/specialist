@@ -6,9 +6,22 @@ flags (e.g. ``--frontend.orb-n-features 500``).
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import itertools
+from dataclasses import dataclass, field
+from pathlib import Path
 
 import numpy as np
+
+__all__ = [
+  "AnchorCfg",
+  "Args",
+  "FrontendCfg",
+  "GripperCfg",
+  "ImuCfg",
+  "SolverCfg",
+  "WindowCfg",
+  "validate",
+]
 
 
 @dataclass
@@ -27,34 +40,20 @@ class FrontendCfg:
   max_landmark_depth: float = 5.0
   mask_rear_rects: tuple[tuple[int, int, int, int], ...] = ((728, 1425, 2153, 2880),)
   init_min_shared_tracks: int = 60
-  # Loop closure: re-match ORB features between spatially-close, non-adjacent
-  # keyframes (the fingertip writing revisits the workspace) to recover tracks
-  # the fast lifts break, adding wide-baseline landmarks that tie the revisits
-  # together in the bundle and cancel the drift accumulated across each lift.
+  # Re-match ORB features between spatially-close, non-adjacent keyframes to
+  # recover tracks the intervening motion breaks.
   loop_closure: bool = True
   loop_closure_max_dist: float = 0.1
   loop_closure_min_kf_gap: int = 15
-  # Also run loop closure in anchor-seeded mode (it otherwise only runs under
-  # visual odometry). When the anchor leaves view, the trajectory tail dead-
-  # reckons on the IMU and drifts; if that tail revisits earlier anchored poses
-  # the loop-closure landmarks tie it back to the well-localized trajectory
-  # without needing the anchor.
+  # Triangulate the revisit loop landmarks from the anchor-covisible views alone.
   anchored_loop_closure: bool = True
-  # Use incremental visual odometry (front-lens SfM) for the trajectory shape
-  # instead of the two-keyframe straight-line interpolation, and let the anchor
-  # enter only as a joint-graph factor (no per-keyframe PnP pose overwrite).
-  # Triangulates both lenses against the vision trajectory so the near-field
-  # rear structure survives to constrain scale.
-  use_visual_odometry: bool = True
-  # Cap on triangulated landmarks per lens in visual-odometry mode (keeps the
-  # longest-track, best-constrained landmarks). The dense far-field front
-  # structure is redundant; capping keeps the joint BA tractable.
-  vo_max_landmarks_per_lens: int = 400
-  # Cap on reprojection observations per track fed to the joint BA in
-  # visual-odometry mode (endpoints + evenly-spaced middle, preserving the
-  # track's baseline). Long VO tracks otherwise add ~15 factors each; capping
-  # the factor count keeps BA runtime near the anchor-snapped baseline.
-  vo_max_obs_per_track: int = 8
+  # Cap on triangulated landmarks per lens (keeps the longest-track,
+  # best-constrained landmarks). The dense far-field front structure is
+  # redundant; capping keeps the joint BA tractable.
+  max_landmarks_per_lens: int = 400
+  # Cap on reprojection observations per track fed to the joint BA (endpoints +
+  # evenly-spaced middle).
+  max_obs_per_track: int = 8
 
 
 @dataclass
@@ -82,31 +81,20 @@ class AnchorCfg:
   tag_ids: tuple[int, ...]
   tag_size: float = 0.1
 
+  # The anchor enters the bundle by reprojecting the tag's four known-metric
+  # corners (a fixed-spacing calibration target), which pins absolute scale.
+  corner_reproj_sigma: float = 1.5
+
   @property
   def enabled_tag_ids(self) -> tuple[int, ...]:
     """``tag_ids`` with the negative (disabled) sentinel filtered out."""
     return tuple(int(t) for t in self.tag_ids if int(t) >= 0)
-
-  # The anchor enters the bundle by reprojecting the tag's four known-metric
-  # corners (a fixed-spacing calibration target), which pins absolute scale.
-  corner_reproj_sigma: float = 1.5
 
 
 @dataclass
 class GripperCfg:
   tag_size: float = 0.01
   keypoint_offset: tuple[float, float, float] = (0.1095, 0.0, -0.018)
-  # Finger joint-angle recovery: per-corner reprojection σ (px) and the soft
-  # equal-and-opposite symmetry prior σ (rad) on θ_left + θ_right. The tag pose
-  # in the clamp slot comes from the URDF tag link (urdf_joints.joint_T_tag0).
-  finger_reproj_sigma: float = 1.5
-  finger_symmetry_sigma: float = 0.05
-  # The base-tag pose in the body frame is a BA variable, pinned by reprojecting
-  # the base tag's corners (σ px) and by a loose prior seeded from PnP (rotation
-  # rad / translation m) that anchors its gauge.
-  base_tag_reproj_sigma: float = 1.5
-  base_tag_prior_sigma_rot: float = 0.3
-  base_tag_prior_sigma_trans: float = 0.05
 
 
 @dataclass
@@ -125,3 +113,96 @@ class WindowCfg:
   # 0 = auto: a ~0.10s keyframe interval via round(fps/10). Set positive to
   # override.
   keyframe_every: int = 0
+
+
+@dataclass
+class Args:
+  """One run's full configuration: the inputs, the window, the tag ids that
+  identify anchors and grippers, and the nested per-stage knobs above."""
+
+  input_insvs: tuple[Path, ...]
+  window: WindowCfg
+  anchor: AnchorCfg
+  output_dir: Path = Path("logs")
+  tracker_names: tuple[str, ...] = ()  # auto-derive ("tracker_0", "tracker_1", ...)
+  urdf_path: Path | None = None
+  log_frames_in_rrd: bool = False
+  open_viewer: bool = True
+  # One id per tracker; cross-tracker disambiguation needs distinct ids.
+  base_tag_ids: tuple[int, ...] = ()
+  # Per-tracker finger tag ids (or 0 to disable for that tracker). Used to
+  # recover the URDF revolute-joint angles each keyframe.
+  left_finger_tag_ids: tuple[int, ...] = ()
+  right_finger_tag_ids: tuple[int, ...] = ()
+  # Lighter frontend feature budget so the joint graph stays cheap; override per run.
+  frontend: FrontendCfg = field(
+    default_factory=lambda: FrontendCfg(orb_n_features=500, init_min_shared_tracks=30)
+  )
+  imu: ImuCfg = field(default_factory=ImuCfg)
+  gripper: GripperCfg = field(default_factory=GripperCfg)
+  solver: SolverCfg = field(default_factory=SolverCfg)
+
+
+def validate(args: Args) -> None:
+  """Every invariant the run configuration must satisfy before any prep starts:
+  one input, one base tag per input, per-tracker id lists sized to the inputs,
+  distinct base and anchor ids, disjoint tag-id kinds, and a positive solver
+  iteration count."""
+  if not args.input_insvs:
+    raise ValueError("at least one .insv input required")
+  if args.solver.max_iterations < 1:
+    raise ValueError(
+      f"--solver.max-iterations must be positive, got {args.solver.max_iterations}"
+    )
+  if not args.base_tag_ids:
+    raise ValueError(
+      f"--base-tag-ids must be supplied (one per input, got "
+      f"{len(args.input_insvs)} inputs)"
+    )
+  for field_name, ids in (
+    ("base_tag_ids", args.base_tag_ids),
+    ("left_finger_tag_ids", args.left_finger_tag_ids),
+    ("right_finger_tag_ids", args.right_finger_tag_ids),
+  ):
+    if ids and len(ids) != len(args.input_insvs):
+      raise ValueError(
+        f"{field_name} length ({len(ids)}) must match "
+        f"input_insvs ({len(args.input_insvs)})"
+      )
+  if len(set(args.base_tag_ids)) != len(args.base_tag_ids):
+    raise ValueError(
+      f"--base-tag-ids must be distinct per tracker for cross-tracker "
+      f"disambiguation, got {list(args.base_tag_ids)}"
+    )
+  if not args.anchor.tag_ids:
+    raise ValueError("--anchor.tag-ids must name at least the reference anchor id")
+  if len(set(args.anchor.tag_ids)) != len(args.anchor.tag_ids):
+    raise ValueError(
+      f"--anchor.tag-ids must be distinct, got {list(args.anchor.tag_ids)}"
+    )
+  _validate_tag_id_disjointness(args)
+
+
+def _validate_tag_id_disjointness(args: Args) -> None:
+  """Anchor, base, and nonzero finger tag ids must be pairwise disjoint: a
+  shared id would let one physical tag enter the graph as two different
+  factor kinds."""
+  groups = (
+    ("--anchor.tag-ids", set(args.anchor.enabled_tag_ids)),
+    ("--base-tag-ids", {int(i) for i in args.base_tag_ids}),
+    (
+      "--left/right-finger-tag-ids",
+      {
+        int(i)
+        for i in (*args.left_finger_tag_ids, *args.right_finger_tag_ids)
+        if int(i) > 0
+      },
+    ),
+  )
+  for (name_a, ids_a), (name_b, ids_b) in itertools.combinations(groups, 2):
+    overlap = ids_a & ids_b
+    if overlap:
+      raise ValueError(
+        f"tag ids {sorted(overlap)} appear in both {name_a} and "
+        f"{name_b}; anchor, base, and finger tags must be disjoint"
+      )

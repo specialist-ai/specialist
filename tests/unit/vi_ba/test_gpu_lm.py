@@ -11,7 +11,7 @@ import scipy.sparse.linalg as spl
 from specialist.vi_ba.build import LensSetup
 from specialist.vi_ba.gpu_lm import SparseSystem, lm_solve
 from specialist.vi_ba.optimize import optimize_graph
-from tests.unit.vi_ba.test_build import _front_only_graph, _params, _project_point
+from tests.mei_fixtures import front_only_graph, pinhole_params, project_point
 
 
 def _scene(
@@ -20,7 +20,7 @@ def _scene(
   """Visual-only graph over exact projections with perturbed landmark
   initials, so LM has genuine work and a near-zero optimum."""
   rng = np.random.default_rng(7)
-  params = _params()
+  params = pinhole_params()
   extrinsic = gtsam.Pose3()
   poses = [
     gtsam.Pose3(gtsam.Rot3(), gtsam.Point3(0.25 * i, 0.0, 0.0)) for i in range(n_poses)
@@ -30,11 +30,11 @@ def _scene(
     for tid in range(n_points)
   }
   tracks = {
-    tid: {i: _project_point(poses[i], extrinsic, xyz, params) for i in range(n_poses)}
+    tid: {i: project_point(poses[i], extrinsic, xyz, params) for i in range(n_poses)}
     for tid, xyz in points.items()
   }
   noisy_points = {tid: xyz + rng.normal(0.0, 0.02, 3) for tid, xyz in points.items()}
-  return _front_only_graph(
+  return front_only_graph(
     poses, LensSetup(extrinsic=extrinsic, params=params), tracks, noisy_points
   )
 

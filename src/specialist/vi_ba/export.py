@@ -1,0 +1,197 @@
+"""The run's JSON export: the raw observations downstream evaluation reads.
+
+Deliberately free of derived metrics — the pipeline writes geometry and
+observations, and any evaluator reconstructs what it needs and writes its own
+metrics file, so the two stay decoupled.
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import TypedDict
+
+import gtsam
+import numpy as np
+import numpy.typing as npt
+
+from specialist.loader.mei_model import MeiParams
+from specialist.vi_ba.anchor_detection import TagDetection
+from specialist.vi_ba.build import LensSetup
+from specialist.vi_ba.compose import CulledPoints
+from specialist.vi_ba.configs import Args
+from specialist.vi_ba.single_tracker import PreparedTracker
+
+Float64Array = npt.NDArray[np.float64]
+
+__all__ = ["Summary", "TrackerSummary", "build_raw_export", "write_run_json"]
+
+
+@dataclass(frozen=True)
+class TrackerSummary:
+  """One tracker's line in the run summary."""
+
+  name: str
+  n_keyframes: int
+  anchor_obs: int
+  bounding_box_diagonal: float
+  path_length: float
+
+
+@dataclass(frozen=True)
+class Summary:
+  """The run's header line in the exported JSON: what was processed, and the
+  solve's own account of how it went."""
+
+  sources: tuple[str, ...]
+  tracker_names: tuple[str, ...]
+  cross_tracker_obs: int
+  initial_graph_error: float
+  final_graph_error: float
+  solver_iterations: int
+
+
+class _PoseDict(TypedDict):
+  """A pose as the JSON carries it: row-major rotation plus translation."""
+
+  R: list[list[float]]
+  t: list[float]
+
+
+def _pose_to_dict(p: gtsam.Pose3) -> _PoseDict:
+  return _PoseDict(
+    R=[list(map(float, row)) for row in p.rotation().matrix()],
+    t=[float(x) for x in p.translation()],
+  )
+
+
+def _mei_to_dict(p: MeiParams) -> dict[str, float]:
+  return {k: float(v) for k, v in asdict(p).items()}
+
+
+def _lens_side_dict(lens: LensSetup, decoded_width: int) -> dict[str, object]:
+  """One lens's extrinsic, intrinsics, and decoded frame shape (per-lens frames
+  decode square) for the export."""
+  return {
+    "extrinsic": _pose_to_dict(lens.extrinsic),
+    "params": _mei_to_dict(lens.params),
+    "frame_shape": [decoded_width, decoded_width],
+  }
+
+
+def _tags_side_list(
+  tags_per_kf: list[list[TagDetection]],
+) -> list[list[dict[str, object]]]:
+  """One lens's per-keyframe AprilTag detections (id + corners) for the export."""
+  return [
+    [
+      {
+        "tag_id": int(d.tag_id),
+        "corners": [[float(p[0]), float(p[1])] for p in d.corners],
+      }
+      for d in tags
+    ]
+    for tags in tags_per_kf
+  ]
+
+
+def _tracks_side_dict(
+  tracks: dict[int, dict[int, Float64Array]],
+) -> dict[str, dict[str, list[float]]]:
+  """One lens's ``{track_id: {keyframe: pixel}}`` observations for the export."""
+  return {
+    str(tid): {str(kf): [float(p[0]), float(p[1])] for kf, p in obs.items()}
+    for tid, obs in tracks.items()
+  }
+
+
+def build_raw_export(
+  trackers: list[PreparedTracker],
+  optimized_body_poses: dict[str, list[gtsam.Pose3]],
+  culled_points: CulledPoints,
+  anchor_poses_world: dict[int, gtsam.Pose3],
+  audio_offset_by_name: dict[str, float],
+  reference_tag_id: int,
+  args: Args,
+) -> dict[str, object]:
+  """Every raw observation the run produced, as one flat JSON-ready dict."""
+  raw: dict[str, object] = {}
+  raw["body_poses_by_tracker"] = {
+    t.name: [_pose_to_dict(p) for p in optimized_body_poses[t.name]] for t in trackers
+  }
+  raw["ref_anchor_pose_world"] = _pose_to_dict(anchor_poses_world[reference_tag_id])
+  raw["anchor_poses_world"] = {
+    str(tag_id): _pose_to_dict(p) for tag_id, p in anchor_poses_world.items()
+  }
+  raw["lens_by_tracker"] = {
+    t.name: {
+      "front": _lens_side_dict(t.front_lens, t.decoded_width),
+      "rear": _lens_side_dict(t.rear_lens, t.decoded_width),
+    }
+    for t in trackers
+  }
+  raw["anchor_obs_by_tracker"] = {
+    t.name: [
+      {"tag_id": tag_id, "kf": int(kf), "side": side, "cam_T_tag": _pose_to_dict(p)}
+      for tag_id, obs in t.anchor_obs_by_tag.items()
+      for kf, sides in obs.items()
+      for side, p in sides.items()
+    ]
+    for t in trackers
+  }
+  raw["tag_detections_by_tracker"] = {
+    t.name: {
+      "front": _tags_side_list(t.front_tags_per_kf),
+      "rear": _tags_side_list(t.rear_tags_per_kf),
+    }
+    for t in trackers
+  }
+  raw["tracks_by_tracker"] = {
+    t.name: {
+      "front": _tracks_side_dict(t.front_tracks_tri),
+      "rear": _tracks_side_dict(t.rear_tracks_tri),
+    }
+    for t in trackers
+  }
+  raw["landmarks_by_tracker"] = {
+    t.name: {
+      "front": {
+        str(tid): [float(x) for x in p] for tid, p in culled_points[t.name][0].items()
+      },
+      "rear": {
+        str(tid): [float(x) for x in p] for tid, p in culled_points[t.name][1].items()
+      },
+    }
+    for t in trackers
+  }
+  raw["kf_times_by_tracker"] = {
+    t.name: [float(x) for x in t.keyframe_times] for t in trackers
+  }
+  raw["audio_offset_by_tracker"] = audio_offset_by_name
+  raw["body_T_base_tag_by_tracker"] = {
+    t.name: (_pose_to_dict(t.body_T_base_tag) if t.body_T_base_tag else None)
+    for t in trackers
+  }
+  raw["joint_angles_by_tracker"] = {
+    t.name: t.joint_angles for t in trackers if t.joint_angles
+  }
+  raw["anchor_tag_id"] = int(reference_tag_id)
+  raw["anchor_tag_size"] = float(args.anchor.tag_size)
+  raw["gripper_keypoint_offset"] = [float(x) for x in args.gripper.keypoint_offset]
+  return raw
+
+
+def write_run_json(
+  path: Path,
+  summary: Summary,
+  per_tracker: list[TrackerSummary],
+  raw: dict[str, object],
+) -> None:
+  """Write the run's JSON: the summary header, the per-tracker lines, and the
+  raw observations, flattened into one object. Assembling it here keeps the
+  file's shape visible in the module that owns the contract."""
+  document = asdict(summary)
+  document["per_tracker"] = [asdict(t) for t in per_tracker]
+  document.update(raw)
+  path.write_text(json.dumps(document, indent=2, default=str))

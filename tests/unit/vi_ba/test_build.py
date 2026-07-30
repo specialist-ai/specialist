@@ -1,7 +1,5 @@
-"""Tests for ``specialist.vi_ba.build`` and ``specialist.vi_ba.optimize``:
-dual-lens graph assembly + LM wrapper. Synthetic 3-pose scenes verify
-factor counts, gauge prior placement, and LM convergence.
-"""
+"""Dual-lens graph assembly and the LM wrapper: factor counts, gauge prior
+placement, and convergence over small synthetic scenes."""
 
 from __future__ import annotations
 
@@ -10,7 +8,6 @@ import numpy as np
 import pytest
 from gtsam.symbol_shorthand import B, V, X
 
-from specialist.loader.mei_model import MeiParams, mei_project
 from specialist.vi_ba.build import (
   LensSetup,
   build_vi_graph,
@@ -23,57 +20,9 @@ from specialist.vi_ba.imu import (
   make_preintegration_params,
 )
 from specialist.vi_ba.optimize import optimize_graph
-
-
-def _params() -> MeiParams:
-  return MeiParams(
-    fx=500.0,
-    fy=500.0,
-    cx=320.0,
-    cy=240.0,
-    k1=0.0,
-    k2=0.0,
-    k3=0.0,
-    p1=0.0,
-    p2=0.0,
-    xi=0.0,  # pinhole-like
-  )
-
-
-def _project_point(
-  pose_wb: gtsam.Pose3,
-  extrinsic: gtsam.Pose3,
-  world_xyz: np.ndarray,
-  params: MeiParams,
-) -> np.ndarray:
-  t_wl = pose_wb.compose(extrinsic)
-  p_lens = t_wl.transformTo(gtsam.Point3(*world_xyz))
-  return mei_project(np.asarray(p_lens)[None, :], params)[0]
-
+from tests.mei_fixtures import front_only_graph, pinhole_params, project_point
 
 _GRAVITY = np.array([0.0, 0.0, -9.81])
-
-
-def _front_only_graph(
-  body_poses: list[gtsam.Pose3],
-  front: LensSetup,
-  front_tracks: dict,
-  front_points: dict,
-) -> tuple[gtsam.NonlinearFactorGraph, gtsam.Values]:
-  """Visual-only graph (no IMU, no rear lens), gauge-pinned at both ends."""
-  return build_vi_graph(
-    body_poses=body_poses,
-    preintegrated=None,
-    front=front,
-    front_tracks=front_tracks,
-    front_points=front_points,
-    rear=None,
-    rear_tracks=None,
-    rear_points=None,
-    sigma=1.0,
-    weak_pose_sigmas=(0.3,) * 6,
-    anchor_last_pose=True,
-  )
 
 
 def _imu_only_graph(
@@ -92,27 +41,27 @@ def _imu_only_graph(
     front=front,
     front_tracks={},
     front_points={},
-    rear=None,
-    rear_tracks=None,
-    rear_points=None,
+    rear=front,
+    rear_tracks={},
+    rear_points={},
     sigma=1.0,
   )
 
 
 def test_build_graph_minimum_two_poses_one_landmark() -> None:
-  params = _params()
+  params = pinhole_params()
   extrinsic = gtsam.Pose3()
   poses = [gtsam.Pose3(), gtsam.Pose3(gtsam.Rot3(), gtsam.Point3(0.3, 0.0, 0.0))]
 
   xyz = np.array([0.1, 0.05, 2.0])
-  pix_a = _project_point(poses[0], extrinsic, xyz, params)
-  pix_b = _project_point(poses[1], extrinsic, xyz, params)
+  pix_a = project_point(poses[0], extrinsic, xyz, params)
+  pix_b = project_point(poses[1], extrinsic, xyz, params)
 
   front_setup = LensSetup(extrinsic=extrinsic, params=params)
   front_tracks = {7: {0: pix_a, 1: pix_b}}
   front_points = {7: xyz}
 
-  graph, values = _front_only_graph(poses, front_setup, front_tracks, front_points)
+  graph, values = front_only_graph(poses, front_setup, front_tracks, front_points)
 
   # 2 tight priors (first + last), 0 intermediate priors, 2 projection factors.
   assert graph.size() == 4
@@ -121,7 +70,7 @@ def test_build_graph_minimum_two_poses_one_landmark() -> None:
 
 
 def test_build_graph_dual_lens_uses_disjoint_landmark_keys() -> None:
-  params = _params()
+  params = pinhole_params()
   poses = [gtsam.Pose3(), gtsam.Pose3(gtsam.Rot3(), gtsam.Point3(0.3, 0.0, 0.0))]
   extrinsic = gtsam.Pose3()
 
@@ -130,14 +79,14 @@ def test_build_graph_dual_lens_uses_disjoint_landmark_keys() -> None:
 
   front_tracks = {
     0: {
-      0: _project_point(poses[0], extrinsic, xyz_front, params),
-      1: _project_point(poses[1], extrinsic, xyz_front, params),
+      0: project_point(poses[0], extrinsic, xyz_front, params),
+      1: project_point(poses[1], extrinsic, xyz_front, params),
     }
   }
   rear_tracks = {
     0: {
-      0: _project_point(poses[0], extrinsic, xyz_rear, params),
-      1: _project_point(poses[1], extrinsic, xyz_rear, params),
+      0: project_point(poses[0], extrinsic, xyz_rear, params),
+      1: project_point(poses[1], extrinsic, xyz_rear, params),
     }
   }
 
@@ -164,7 +113,7 @@ def test_build_graph_dual_lens_uses_disjoint_landmark_keys() -> None:
 
 
 def test_build_graph_weak_priors_on_intermediate_keyframes() -> None:
-  params = _params()
+  params = pinhole_params()
   extrinsic = gtsam.Pose3()
   poses = [
     gtsam.Pose3(gtsam.Rot3(), gtsam.Point3(0.0, 0.0, 0.0)),
@@ -172,7 +121,7 @@ def test_build_graph_weak_priors_on_intermediate_keyframes() -> None:
     gtsam.Pose3(gtsam.Rot3(), gtsam.Point3(0.2, 0.0, 0.0)),
     gtsam.Pose3(gtsam.Rot3(), gtsam.Point3(0.3, 0.0, 0.0)),
   ]
-  graph, _ = _front_only_graph(
+  graph, _ = front_only_graph(
     poses, LensSetup(extrinsic=extrinsic, params=params), {}, {}
   )
   # 2 tight priors + 2 weak priors (frames 1, 2) = 4 total.
@@ -180,7 +129,7 @@ def test_build_graph_weak_priors_on_intermediate_keyframes() -> None:
 
 
 def test_optimize_graph_converges_from_small_perturbation() -> None:
-  params = _params()
+  params = pinhole_params()
   extrinsic = gtsam.Pose3()
   true_poses = [
     gtsam.Pose3(),
@@ -194,8 +143,8 @@ def test_optimize_graph_converges_from_small_perturbation() -> None:
   front_points = {}
   for tid, xyz in enumerate(xyzs):
     front_tracks[tid] = {
-      0: _project_point(true_poses[0], extrinsic, xyz, params),
-      1: _project_point(true_poses[1], extrinsic, xyz, params),
+      0: project_point(true_poses[0], extrinsic, xyz, params),
+      1: project_point(true_poses[1], extrinsic, xyz, params),
     }
     front_points[tid] = xyz
 
@@ -203,7 +152,7 @@ def test_optimize_graph_converges_from_small_perturbation() -> None:
     true_poses[0],
     gtsam.Pose3(gtsam.Rot3(), gtsam.Point3(0.25, 0.02, 0.01)),
   ]
-  graph, values = _front_only_graph(
+  graph, values = front_only_graph(
     init_poses,
     LensSetup(extrinsic=extrinsic, params=params),
     front_tracks,
@@ -236,7 +185,7 @@ def _stationary_pim() -> gtsam.PreintegratedCombinedMeasurements:
 
 
 def test_build_vi_graph_adds_velocity_bias_imu_factors() -> None:
-  params = _params()
+  params = pinhole_params()
   extrinsic = gtsam.Pose3()
   poses = [gtsam.Pose3(), gtsam.Pose3()]
   vel = [np.zeros(3), np.zeros(3)]
@@ -258,7 +207,7 @@ def test_build_vi_graph_adds_velocity_bias_imu_factors() -> None:
 
 
 def test_build_vi_graph_wrong_pim_count_raises() -> None:
-  params = _params()
+  params = pinhole_params()
   extrinsic = gtsam.Pose3()
   poses = [gtsam.Pose3(), gtsam.Pose3(), gtsam.Pose3()]
   vel = [np.zeros(3)] * 3
@@ -274,7 +223,7 @@ def test_build_vi_graph_wrong_pim_count_raises() -> None:
 def test_build_vi_graph_stationary_lm_converges() -> None:
   """2 poses, one IMU factor and no visual: LM keeps the state
   near-stationary."""
-  params = _params()
+  params = pinhole_params()
   extrinsic = gtsam.Pose3()
   poses = [gtsam.Pose3(), gtsam.Pose3()]
   vel = [np.zeros(3), np.array([0.05, 0.0, 0.0])]  # slight init perturbation

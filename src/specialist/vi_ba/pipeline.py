@@ -28,22 +28,22 @@ from specialist.vi_ba.init import triangulate_track_multiview
 Float64Array = npt.NDArray[np.float64]
 
 __all__ = [
-  "FrontendConfig",
+  "LensFrontendConfig",
   "capture_duration",
   "decode_dual_keyframes",
   "filter_tracks_by_parallax",
   "keyframe_timestamps",
   "lens_setups",
   "probe_capture",
+  "resolve_keyframe_every",
   "run_lens_frontend",
-  "scaled_mei",
   "triangulate_lens",
   "unproject_tracks",
 ]
 
 
 @dataclass(frozen=True)
-class FrontendConfig:
+class LensFrontendConfig:
   n_features: int = 2000
   ransac_threshold: float = 3.0
   max_half_angle: float = float(np.deg2rad(70.0))
@@ -52,7 +52,9 @@ class FrontendConfig:
   gpu_flow: bool = False
 
 
-def scaled_mei(offset: LensOffset, decoded_full_width: int, lens_idx: int) -> MeiParams:
+def _scaled_mei(
+  offset: LensOffset, decoded_full_width: int, lens_idx: int
+) -> MeiParams:
   """Rescale raw-sensor MEI intrinsics into decoded per-lens pixel coords.
 
   ``lens_idx = 0`` selects the front (left half), ``1`` the rear (right
@@ -81,14 +83,14 @@ def lens_setups(
   """Per-lens MEI setups at the decode resolution: the ``offset_v3``
   intrinsics are authored in the camera's raw stitched frame and rescale by
   the ratio of the decoded stitched width (two square lenses) to the raw
-  one (see ``scaled_mei``)."""
+  one (see ``_scaled_mei``)."""
   front = LensSetup(
     extrinsic=extrinsics.body_T_front_lens,
-    params=scaled_mei(extrinsics.front, 2 * decoded_width, lens_idx=0),
+    params=_scaled_mei(extrinsics.front, 2 * decoded_width, lens_idx=0),
   )
   rear = LensSetup(
     extrinsic=extrinsics.body_T_rear_lens,
-    params=scaled_mei(extrinsics.rear, 2 * decoded_width, lens_idx=1),
+    params=_scaled_mei(extrinsics.rear, 2 * decoded_width, lens_idx=1),
   )
   return front, rear
 
@@ -265,7 +267,7 @@ def keyframe_timestamps(
 def run_lens_frontend(
   frames: list[np.ndarray],
   params: MeiParams,
-  cfg: FrontendConfig,
+  cfg: LensFrontendConfig,
   masks: list[np.ndarray] | None = None,
 ) -> tuple[list[Frame], dict[int, dict[int, Float64Array]]]:
   """DIS flow → essential-RANSAC → chain for one lens. ``masks[k]`` (optional,

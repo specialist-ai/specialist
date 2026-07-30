@@ -29,6 +29,7 @@ __all__ = [
   "essential_ransac_inliers",
   "match_pair",
   "parallel_map",
+  "set_precompute_concurrency",
 ]
 
 
@@ -150,13 +151,6 @@ def _iter_dis_flows(
     yield from zip(pair_ks, executor.map(calc_pair, pair_ks), strict=True)
 
 
-def _precompute_dis_flows(
-  frames: list[np.ndarray],
-) -> dict[int, _FlowPair]:
-  """Forward+backward DIS flow for every consecutive pair, fully materialized."""
-  return dict(_iter_dis_flows(frames, range(1, len(frames))))
-
-
 _FlowIter = Callable[[list[np.ndarray], range], Iterator[tuple[int, _FlowPair]]]
 
 
@@ -206,6 +200,17 @@ def _mask_ok(xy: Float64Array, mask: np.ndarray) -> npt.NDArray[np.bool_]:
   return vals > 0
 
 
+# Shi-Tomasi seeding: a corner must clear this fraction of the strongest corner
+# response and stand this many pixels clear of any already-tracked point, and a
+# keyframe reseeds once propagation has lost half of its feature budget.
+_CORNER_QUALITY_LEVEL = 0.01
+_CORNER_MIN_DISTANCE = 8.0
+_REDETECT_RATIO = 0.5
+# Pixels of forward-backward round-trip disagreement above which a propagated
+# track is dropped.
+_FB_ERROR_THRESHOLD = 1.0
+
+
 def _detect_corners(
   img: np.ndarray,
   mask: np.ndarray | None,
@@ -231,10 +236,6 @@ def dis_flow_track(
   frames: list[np.ndarray],
   n_features: int,
   masks: list[np.ndarray] | None = None,
-  fb_error_threshold: float = 1.0,
-  min_distance: float = 8.0,
-  quality_level: float = 0.01,
-  redetect_ratio: float = 0.5,
   gpu_flow: bool = False,
 ) -> tuple[list[Frame], list[npt.NDArray[np.int64]]]:
   """Sparse-track propagation via DIS dense optical flow: Shi-Tomasi seeding
@@ -278,7 +279,7 @@ def dis_flow_track(
       disp_bwd = _bilinear_sample_flow(flow_bwd, nxt_xy)
       back_xy = nxt_xy + disp_bwd
       fb = np.linalg.norm(back_xy - prev_xy, axis=1)
-      ok = np.isfinite(fb) & (fb < fb_error_threshold)
+      ok = np.isfinite(fb) & (fb < _FB_ERROR_THRESHOLD)
       h, w = img.shape[:2]
       ok &= _in_bounds(nxt_xy, h, w)
       if mask_k is not None:
@@ -303,7 +304,7 @@ def dis_flow_track(
       per_frame_pts[k] = pts_subpix.reshape(-1, 2).astype(np.float64)
 
     n_active = per_frame_pts[k].shape[0]
-    need_redetect = k == 0 or n_active < int(round(redetect_ratio * n_features))
+    need_redetect = k == 0 or n_active < int(round(_REDETECT_RATIO * n_features))
     if need_redetect:
       if mask_k is None:
         redetect_mask = np.full(img.shape[:2], 255, dtype=np.uint8)
@@ -313,7 +314,7 @@ def dis_flow_track(
         cv2.circle(
           redetect_mask,
           (int(round(float(p[0]))), int(round(float(p[1])))),
-          int(round(float(min_distance))),
+          int(round(_CORNER_MIN_DISTANCE)),
           0,
           thickness=-1,
         )
@@ -321,8 +322,8 @@ def dis_flow_track(
         img,
         redetect_mask,
         max_corners=n_features - n_active,
-        quality_level=quality_level,
-        min_distance=min_distance,
+        quality_level=_CORNER_QUALITY_LEVEL,
+        min_distance=_CORNER_MIN_DISTANCE,
       )
       if new_corners.shape[0]:
         per_frame_pts[k] = np.vstack([per_frame_pts[k], new_corners])

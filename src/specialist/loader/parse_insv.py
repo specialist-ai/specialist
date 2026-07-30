@@ -1,9 +1,9 @@
 """Parse an Insta360 ``.insv`` file via ``telemetry-parser``.
 
-Wraps ``telemetry_parser.Parser`` so the probe scripts get a typed view of
-the bits we actually use: IMU arrays with a single shared timestamp axis,
-the factory MEI intrinsics, the rolling-shutter readout time, and the raw
-``offset_v3`` array that encodes per-lens extrinsics.
+Wraps ``telemetry_parser.Parser`` in a typed view of the bits we actually
+use: IMU arrays with a single shared timestamp axis, the factory MEI
+intrinsics, the rolling-shutter readout time, and the raw ``offset_v3``
+array that encodes per-lens extrinsics.
 
 ``telemetry-parser`` exposes only one ``fisheye_params`` block per file, even
 though the camera has two physical lenses. The dual-lens extrinsics and per-lens
@@ -21,6 +21,8 @@ from pathlib import Path
 import numpy as np
 import numpy.typing as npt
 import telemetry_parser
+
+__all__ = ["InsvData", "LensIntrinsics", "load_insv"]
 
 
 @dataclass(frozen=True)
@@ -46,7 +48,7 @@ class LensIntrinsics:
 
 @dataclass(frozen=True)
 class InsvData:
-  """All parsed bits from one ``.insv`` file that the probes consume.
+  """All parsed bits from one ``.insv`` file.
 
   Timestamps are seconds on the video clock; the IMU pre-roll is negative.
   ``gyro_deg`` is deg/s (XYZ, as the source stores it), ``accel`` is m/s^2
@@ -68,7 +70,7 @@ class InsvData:
 
 
 def load_insv(path: str | Path) -> InsvData:
-  """Parse a ``.insv`` file and return the typed view used by the probes."""
+  """Parse a ``.insv`` file and return its typed view."""
   path = Path(path)
   if not path.is_file():
     raise FileNotFoundError(f"insv not found: {path}")
@@ -83,13 +85,9 @@ def load_insv(path: str | Path) -> InsvData:
   n = len(imu_samples)
   if n == 0:
     raise ValueError(f"no IMU samples in {path}")
-  ts = np.empty(n)
-  gyro = np.empty((n, 3))
-  accel = np.empty((n, 3))
-  for i, s in enumerate(imu_samples):
-    ts[i] = float(s["timestamp_ms"]) * 1e-3
-    gyro[i] = s["gyro"]
-    accel[i] = s["accl"]
+  ts = np.array([s["timestamp_ms"] for s in imu_samples], dtype=np.float64) * 1e-3
+  gyro = np.array([s["gyro"] for s in imu_samples], dtype=np.float64)
+  accel = np.array([s["accl"] for s in imu_samples], dtype=np.float64)
 
   lens = meta["Lens"]["Data"]
   fisheye = lens["fisheye_params"]

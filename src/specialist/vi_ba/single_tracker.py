@@ -1,7 +1,8 @@
 """Per-tracker prep for VI-BA: decode → frontend → tag detect → anchor PnP →
 IMU stationary gravity → VI alignment → visual-odometry trajectory (anchor-init
 pose seed as the starved fallback) → metric re-triangulation. Returns a
-``PreparedTracker`` ready for ``track.py`` to compose into a joint factor graph.
+``PreparedTracker`` ready for ``specialist.vi_ba.compose`` to assemble into a
+joint factor graph.
 """
 
 from __future__ import annotations
@@ -10,7 +11,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TypeVar
+from typing import TypedDict, TypeVar
 
 import cv2
 import gtsam
@@ -32,7 +33,7 @@ from specialist.vi_ba.configs import (
   ImuCfg,
 )
 from specialist.vi_ba.extrinsics import parse_insv_extrinsics
-from specialist.vi_ba.features import detect_orb, match_pair, parallel_map
+from specialist.vi_ba.features import Frame, detect_orb, match_pair, parallel_map
 from specialist.vi_ba.finger_kinematics import FingerReproj, build_finger_reproj
 from specialist.vi_ba.imu import (
   ImuSamples,
@@ -53,7 +54,7 @@ from specialist.vi_ba.init import (
   visual_inertial_align,
 )
 from specialist.vi_ba.pipeline import (
-  FrontendConfig,
+  LensFrontendConfig,
   decode_dual_keyframes,
   filter_tracks_by_parallax,
   keyframe_timestamps,
@@ -81,12 +82,18 @@ _LOOP_MIN_INLIERS = 20  # geometrically-verified matches required per pair
 # Visual-odometry pose-spike rejection (``_reject_vo_pose_outliers``).
 _VO_REJECT_FACTOR = 8.0  # residual/median-step ratio marking a PnP teleport
 
+
 __all__ = [
   "PreparedTracker",
   "TrackerArgs",
   "prepare_tracker",
   "run_two_concurrently",
 ]
+
+
+def _enough_registered(n_registered: int, n_keyframes: int) -> bool:
+  """A seed needs a quarter of the keyframes, and at least eight."""
+  return n_registered >= max(8, n_keyframes // 4)
 
 
 def run_two_concurrently(
@@ -110,18 +117,34 @@ class TrackerArgs:
   insv_path: Path
   base_tag_id: int
   anchor: AnchorCfg
-  start: float = 0.0
-  duration: float | None = None
-  keyframe_every: int = 0  # 0 = auto (round(fps/10)); see WindowCfg.keyframe_every
+  start: float
+  duration: float | None
+  keyframe_every: int  # 0 = auto (round(fps/10)); see WindowCfg.keyframe_every
   # Retain decoded keyframes (as JPEG) for the Rerun frame overlay.
-  keep_frames: bool = False
-  urdf_path: Path | None = None  # gripper URDF for finger joint kinematics
+  keep_frames: bool
+  urdf_path: Path | None  # gripper URDF for finger joint kinematics
   # 0 disables the corresponding URDF revolute joint angle recovery.
-  left_finger_tag_id: int = 0
-  right_finger_tag_id: int = 0
-  frontend: FrontendCfg = field(default_factory=FrontendCfg)
-  imu: ImuCfg = field(default_factory=ImuCfg)
-  gripper: GripperCfg = field(default_factory=GripperCfg)
+  left_finger_tag_id: int
+  right_finger_tag_id: int
+  frontend: FrontendCfg
+  imu: ImuCfg
+  gripper: GripperCfg
+
+
+class ViGraphInputs(TypedDict):
+  """One tracker's state and lens data, keyed to ``build_vi_graph``'s
+  parameters so the call site can unpack it directly."""
+
+  body_poses: list[gtsam.Pose3]
+  velocities: list[Float64Array]
+  biases: list[gtsam.imuBias.ConstantBias]
+  preintegrated: list[gtsam.PreintegratedCombinedMeasurements]
+  front: LensSetup
+  front_tracks: dict[int, dict[int, Float64Array]]
+  front_points: dict[int, Float64Array]
+  rear: LensSetup
+  rear_tracks: dict[int, dict[int, Float64Array]]
+  rear_points: dict[int, Float64Array]
 
 
 @dataclass
@@ -140,8 +163,6 @@ class PreparedTracker:
   front_points: dict[int, Float64Array]
   rear_points: dict[int, Float64Array]
   decoded_width: int
-  # Prep-reference anchor: the most-sighted configured id.
-  prep_anchor_tag_id: int
   # ``{tag_id: {kf: {side: cam_T_tag}}}``; ``anchor_locals_by_tag`` gives each
   # sighted tag's pose in this tracker's local world.
   anchor_obs_by_tag: dict[int, dict[int, dict[str, gtsam.Pose3]]]
@@ -165,22 +186,25 @@ class PreparedTracker:
   finger_reproj: dict[str, FingerReproj]
   left_finger_tag_id: int
   right_finger_tag_id: int
-  n_keyframes: int
 
-  def vi_graph_inputs(self) -> dict[str, object]:
+  @property
+  def n_keyframes(self) -> int:
+    return len(self.body_poses)
+
+  def vi_graph_inputs(self) -> ViGraphInputs:
     """Bundle this tracker's state + lens data for ``build_vi_graph``."""
-    return {
-      "body_poses": self.body_poses,
-      "velocities": self.velocities,
-      "biases": self.biases,
-      "preintegrated": self.preintegrated,
-      "front": self.front_lens,
-      "front_tracks": self.front_tracks_tri,
-      "front_points": self.front_points,
-      "rear": self.rear_lens,
-      "rear_tracks": self.rear_tracks_tri,
-      "rear_points": self.rear_points,
-    }
+    return ViGraphInputs(
+      body_poses=self.body_poses,
+      velocities=self.velocities,
+      biases=self.biases,
+      preintegrated=self.preintegrated,
+      front=self.front_lens,
+      front_tracks=self.front_tracks_tri,
+      front_points=self.front_points,
+      rear=self.rear_lens,
+      rear_tracks=self.rear_tracks_tri,
+      rear_points=self.rear_points,
+    )
 
 
 def _build_non_anchor_tag_masks(
@@ -209,9 +233,9 @@ def _build_non_anchor_tag_masks(
 
 def _apply_static_mask_rects(
   masks: list[np.ndarray], rects: list[tuple[int, int, int, int]]
-) -> list[np.ndarray]:
+) -> None:
   if not rects or not masks:
-    return masks
+    return
   h, w = masks[0].shape[:2]
   for x1, y1, x2, y2 in rects:
     x1c, y1c = max(0, x1), max(0, y1)
@@ -223,7 +247,6 @@ def _apply_static_mask_rects(
       )
     for m in masks:
       m[y1c:y2c, x1c:x2c] = 0
-  return masks
 
 
 # One lens side for anchor detection: name, lens, per-kf tag detections, and
@@ -283,6 +306,8 @@ def _print_anchor_geometry(
           half_angles.append(
             float(np.degrees(np.arccos(np.clip(bearing[2] / norm, -1.0, 1.0))))
           )
+  if not edges:
+    return
   incidences: list[float] = []
   for sides in obs.values():
     for pose in sides.values():
@@ -292,8 +317,6 @@ def _print_anchor_geometry(
         continue
       cos_incidence = -float(pose.rotation().matrix()[:, 2] @ t) / dist
       incidences.append(float(np.degrees(np.arccos(np.clip(cos_incidence, -1.0, 1.0)))))
-  if not edges:
-    return
 
   def med_p90(values: list[float]) -> str:
     if not values:
@@ -336,7 +359,6 @@ def _first_sighting_local(
   preferred)."""
   first_kf = min(obs)
   lens, cam_T_tag = _side_lens_and_pose(obs[first_kf], front_lens, rear_lens)
-  assert cam_T_tag is not None
   return body_poses[first_kf].compose(lens.extrinsic).compose(cam_T_tag)
 
 
@@ -445,7 +467,7 @@ def _loop_closure_tracks(
   seen before and after a lift becomes two disconnected tracks and nothing ties
   the revisited poses together — the visual odometry drifts across the lift. Here
   ORB features are re-matched between spatially-close, non-adjacent keyframes
-  (revisits of the writing workspace), geometrically verified, and union-found
+  (revisits of the same region), geometrically verified, and union-found
   into multi-view tracks spanning the lifts. Triangulated against the (drifted)
   poses these become wide-baseline landmarks whose reprojection inconsistency
   drives the bundle to pull the revisits back together, cancelling the drift."""
@@ -529,16 +551,14 @@ def _add_loop_landmarks(
   loop_tracks: dict[int, dict[int, Float64Array]],
   body_poses: list[gtsam.Pose3],
   lens: LensSetup,
+  *,
   min_track_length: int,
   max_landmark_depth: float,
   name: str,
-  label: str,
   anchor_kfs: set[int] | None = None,
 ) -> dict[int, Float64Array]:
   """Triangulate revisit ``loop_tracks`` and merge them into the front-lens
-  landmarks (``front_points``) and tracks (``front_kept``), so they enter the
-  bundle as wide-baseline reprojection factors that tie the revisited poses
-  together and cancel the drift. Mutates ``front_points`` and ``front_kept``.
+  landmarks (``front_points``) and tracks (``front_kept``). Mutates both.
 
   When ``anchor_kfs`` is given, each landmark is triangulated from its
   anchor-covisible (well-localized) views ONLY, while the FULL track — including
@@ -564,7 +584,7 @@ def _add_loop_landmarks(
   front_points.update(loop_pts)
   front_kept.update(loop_tracks)
   print(
-    f"  [{name}] {label}: +{len(loop_pts)} landmarks "
+    f"  [{name}] loop closure: +{len(loop_pts)} landmarks "
     f"from {len(loop_tracks)} revisit tracks"
   )
   return loop_pts
@@ -585,36 +605,37 @@ def _reject_vo_pose_outliers(
   iteratively (worst first) so ``_fill_camera_poses`` interpolates cleanly
   across them.
 
-  The factor is deliberately loose (8×): a genuine real-motion burst can
-  reach ~7× the slow-motion median step, and rejecting those over-interpolates
-  the rotation and wrecks the recovered orientation. Only the far-larger PnP
-  teleports should be cut."""
+  The factor is deliberately loose: a genuine real-motion burst can reach ~7×
+  the slow-motion median step and the threshold sits just above that, because
+  rejecting such a burst over-interpolates the rotation and wrecks the
+  recovered orientation. Only the far-larger PnP teleports should be cut."""
   kept = dict(cam_poses)
   removed: list[int] = []
   for _ in range(len(cam_poses)):
-    ks = sorted(kept)
-    if len(ks) < 5:
+    kfs = sorted(kept)
+    if len(kfs) < 5:
       break
-    c = {k: _translation(kept[k]) for k in ks}
+    centers = {kf: _translation(kept[kf]) for kf in kfs}
     steps = [
-      float(np.linalg.norm(c[ks[i + 1]] - c[ks[i]])) / (ks[i + 1] - ks[i])
-      for i in range(len(ks) - 1)
+      float(np.linalg.norm(centers[kfs[i + 1]] - centers[kfs[i]]))
+      / (kfs[i + 1] - kfs[i])
+      for i in range(len(kfs) - 1)
     ]
     median_step = float(np.median(steps))
     if median_step < 1e-12:
       break
-    worst_k: int | None = None
-    worst_r = 0.0
-    for i in range(1, len(ks) - 1):
-      kp, k, kn = ks[i - 1], ks[i], ks[i + 1]
-      f = (k - kp) / (kn - kp)
-      pred = (1.0 - f) * c[kp] + f * c[kn]
-      r = float(np.linalg.norm(c[k] - pred))
-      if r > worst_r:
-        worst_r, worst_k = r, k
-    if worst_k is not None and worst_r > _VO_REJECT_FACTOR * median_step:
-      del kept[worst_k]
-      removed.append(worst_k)
+    worst_kf: int | None = None
+    worst_residual = 0.0
+    for i in range(1, len(kfs) - 1):
+      prev_kf, kf, next_kf = kfs[i - 1], kfs[i], kfs[i + 1]
+      frac = (kf - prev_kf) / (next_kf - prev_kf)
+      interpolated = (1.0 - frac) * centers[prev_kf] + frac * centers[next_kf]
+      residual = float(np.linalg.norm(centers[kf] - interpolated))
+      if residual > worst_residual:
+        worst_residual, worst_kf = residual, kf
+    if worst_kf is not None and worst_residual > _VO_REJECT_FACTOR * median_step:
+      del kept[worst_kf]
+      removed.append(worst_kf)
     else:
       break
   return kept, sorted(removed)
@@ -662,7 +683,7 @@ def _anchor_pose_seed(
     for kf, sides in anchor_obs_per_kf.items()
     if "front" in sides
   }
-  if len(cam_poses) < max(8, n_keyframes // 4):
+  if not _enough_registered(len(cam_poses), n_keyframes):
     return None
   return body_poses_from_camera_poses(
     _fill_camera_poses(cam_poses, n_keyframes), front_extrinsic
@@ -704,12 +725,12 @@ def _anchor_metric_scale(
 
 def _side_lens_and_pose(
   sides: dict[str, gtsam.Pose3], front_lens: LensSetup, rear_lens: LensSetup
-) -> tuple[LensSetup, gtsam.Pose3 | None]:
+) -> tuple[LensSetup, gtsam.Pose3]:
   """Pick the anchor observation's lens + ``cam_T_tag``, preferring the front
-  lens when both sides saw the tag."""
-  lens = front_lens if "front" in sides else rear_lens
-  cam_T_tag = sides.get("front", sides.get("rear"))
-  return lens, cam_T_tag
+  lens when both sides saw the tag. ``sides`` always carries at least one."""
+  if "front" in sides:
+    return front_lens, sides["front"]
+  return rear_lens, sides["rear"]
 
 
 def _body_imu_samples(data: InsvData, imu_to_body: Float64Array) -> ImuSamples:
@@ -724,20 +745,20 @@ def _body_imu_samples(data: InsvData, imu_to_body: Float64Array) -> ImuSamples:
 def _imu_and_initial_gravity(
   args: TrackerArgs,
   data: InsvData,
+  imu: ImuSamples,
   keyframe_times: Float64Array,
-  body_poses_unscaled: list[gtsam.Pose3],
+  body_poses_prealign: list[gtsam.Pose3],
 ) -> tuple[ImuSamples, gtsam.imuBias.ConstantBias, Float64Array | None]:
   """Body-frame IMU samples, the factory bias, and an initial world gravity.
 
-  Rotates the raw gyro/accel and factory bias into the body frame. When the
-  clip contains a stationary window, rescales the accelerometer so its
-  magnitude there matches |g| = 9.81 m/s², then reads gravity off the mean
-  stationary acceleration and rotates it into the world frame via the nearest
-  keyframe pose. Returns ``gravity_world_initial=None`` when no stationary
-  window falls inside the clip.
+  Rotates the factory bias into the body frame. When the clip contains a
+  stationary window, rescales the accelerometer so its magnitude there
+  matches |g| = 9.81 m/s², then reads gravity off the mean stationary
+  acceleration and rotates it into the world frame via the nearest keyframe
+  pose. Returns ``gravity_world_initial=None`` when no stationary window
+  falls inside the clip.
   """
   imu_to_body = np.asarray(args.imu.imu_to_body, dtype=np.float64)
-  imu = _body_imu_samples(data, imu_to_body)
   raw_factory_bias = factory_imu_bias(data.gyro_calib_numbers)
   bias0 = gtsam.imuBias.ConstantBias(
     imu_to_body @ np.asarray(raw_factory_bias.accelerometer(), dtype=np.float64),
@@ -763,7 +784,7 @@ def _imu_and_initial_gravity(
     t_stationary_mid = 0.5 * (imu.t[first_start] + imu.t[first_end - 1])
     kf_for_g = int(np.argmin(np.abs(keyframe_times - t_stationary_mid)))
     gravity_world_initial = (
-      body_poses_unscaled[kf_for_g].rotation().matrix() @ gravity_body
+      body_poses_prealign[kf_for_g].rotation().matrix() @ gravity_body
     )
   return imu, bias0, gravity_world_initial
 
@@ -858,91 +879,29 @@ def _recover_gripper_tags(
   return body_T_base_tag, joint_angles, finger_reproj
 
 
-def _snap_to_anchor_and_fill_gaps(
-  args: TrackerArgs,
-  anchor_obs_per_kf: dict[int, dict[str, gtsam.Pose3]],
-  front_lens: LensSetup,
-  rear_lens: LensSetup,
-  body_poses: list[gtsam.Pose3],
-  velocities: list[Float64Array],
-  pim: list[gtsam.PreintegratedCombinedMeasurements],
-  bias0: gtsam.imuBias.ConstantBias,
-  n_keyframes: int,
-  name: str,
-) -> gtsam.Pose3:
-  """Anchor pose in this tracker's local world, ``body_poses[first_anchor_kf]``
-  composed with the first anchor sighting.
+@dataclass
+class _LensChannel:
+  """One lens's prep state: decoded grays and tag detections in, tracks and
+  triangulated landmarks out."""
 
-  In visual-odometry mode the vision trajectory is kept and the anchor enters
-  only as a joint-graph factor. Otherwise the anchor owns the trajectory:
-  ``body_poses`` and ``velocities`` are overwritten in place — every anchored
-  keyframe snaps to its PnP pose, and the gaps between anchors are dead-reckoned
-  by IMU forward-propagation (interior gaps distribute the end drift across the
-  gap; the trailing gap is forward-only).
-  """
-  anchor_local = _first_sighting_local(
-    anchor_obs_per_kf, front_lens, rear_lens, body_poses
-  )
-  if args.frontend.use_visual_odometry:
-    return anchor_local
-
-  for kf, kf_sides in anchor_obs_per_kf.items():
-    lens, cam_T_tag = _side_lens_and_pose(kf_sides, front_lens, rear_lens)
-    assert cam_T_tag is not None
-    body_poses[kf] = anchor_local.compose(lens.extrinsic.compose(cam_T_tag).inverse())
-  sorted_kfs = sorted(anchor_obs_per_kf.keys())
-  if len(sorted_kfs) >= 2:
-    jumps = [
-      float(
-        np.linalg.norm(
-          _translation(body_poses[sorted_kfs[i]])
-          - _translation(body_poses[sorted_kfs[i - 1]])
-        )
-      )
-      for i in range(1, len(sorted_kfs))
-    ]
-    i = int(np.argmax(jumps))
-    print(f"  [{name}] max anchor-init Δp: {jumps[i]:.3f} m at kf {sorted_kfs[i + 1]}")
-  first_anchor = sorted_kfs[0]
-  for k in range(first_anchor):
-    body_poses[k] = body_poses[first_anchor]
-    velocities[k] = velocities[first_anchor]
-  for i in range(len(sorted_kfs)):
-    a = sorted_kfs[i]
-    b = sorted_kfs[i + 1] if i + 1 < len(sorted_kfs) else n_keyframes
-    if b - a <= 1:
-      continue
-    # A gap that ends on an anchor kf (b < n_keyframes) has a known end pose, so
-    # the forward-prop drift can distribute across it; the trailing gap cannot.
-    bidir = b < n_keyframes
-    nav = gtsam.NavState(body_poses[a], velocities[a])
-    fwd_pose: dict[int, gtsam.Pose3] = {}
-    fwd_vel: dict[int, Float64Array] = {}
-    for k in range(a + 1, b + 1 if bidir else b):
-      nav = pim[k - 1].predict(nav, bias0)
-      fwd_pose[k] = nav.pose()
-      fwd_vel[k] = np.asarray(nav.velocity(), dtype=np.float64)
-    dp = (
-      _translation(body_poses[b]) - _translation(fwd_pose[b]) if bidir else np.zeros(3)
-    )
-    for k in range(a + 1, b):
-      if k in anchor_obs_per_kf:
-        continue
-      p = fwd_pose[k]
-      if bidir:
-        tk = _translation(p) + (k - a) / (b - a) * dp
-        body_poses[k] = gtsam.Pose3(p.rotation(), gtsam.Point3(*tk))
-      else:
-        body_poses[k] = p
-      velocities[k] = fwd_vel[k]
-  return anchor_local
+  setup: LensSetup
+  gray: list[np.ndarray]
+  tags: list[list[TagDetection]]
+  masks: list[np.ndarray] = field(default_factory=list)
+  feature_frames: list[Frame] = field(default_factory=list)
+  tracks: dict[int, dict[int, Float64Array]] = field(default_factory=dict)
+  kept: dict[int, dict[int, Float64Array]] = field(default_factory=dict)
+  rejected: dict[int, dict[int, Float64Array]] = field(default_factory=dict)
+  landmarks_prealign: dict[int, Float64Array] = field(default_factory=dict)
+  points: dict[int, Float64Array] = field(default_factory=dict)
+  tracks_tri: dict[int, dict[int, Float64Array]] = field(default_factory=dict)
 
 
 def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
   """Run every per-tracker stage. Returns a ``PreparedTracker`` ready for
   joint-graph composition. Body poses are in this tracker's own gravity-
   aligned visual world; the caller aligns trackers to a shared frame via
-  ``anchor_local``."""
+  ``anchor_locals_by_tag``."""
   data = load_insv(args.insv_path)
   extrinsics = parse_insv_extrinsics(data)
   rear_path, fps, decoded_width = probe_capture(args.insv_path)
@@ -969,9 +928,8 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
   )
 
   imu_to_body = np.asarray(args.imu.imu_to_body, dtype=np.float64)
-  body_deltas = keyframe_delta_rotations(
-    _body_imu_samples(data, imu_to_body), keyframe_times
-  )
+  imu = _body_imu_samples(data, imu_to_body)
+  body_deltas = keyframe_delta_rotations(imu, keyframe_times)
 
   def lens_kf_rotations(lens: LensSetup) -> list[Float64Array]:
     r_bl = lens.extrinsic.rotation().matrix()
@@ -1002,164 +960,131 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
   for tag_id, obs in obs_by_tag.items():
     _print_anchor_geometry(name, tag_id, lens_sides, obs)
 
+  front = _LensChannel(setup=front_lens, gray=front_gray, tags=front_tags_per_kf)
+  rear = _LensChannel(setup=rear_lens, gray=rear_gray, tags=rear_tags_per_kf)
   anchor_tag_ids = set(obs_by_tag)
-  front_masks = _build_non_anchor_tag_masks(
-    front_gray, front_tags_per_kf, anchor_tag_ids, args.frontend.mask_tag_pad
-  )
-  rear_masks = _build_non_anchor_tag_masks(
-    rear_gray, rear_tags_per_kf, anchor_tag_ids, args.frontend.mask_tag_pad
-  )
+  for ch in (front, rear):
+    ch.masks = _build_non_anchor_tag_masks(
+      ch.gray, ch.tags, anchor_tag_ids, args.frontend.mask_tag_pad
+    )
   static_rects = list(args.frontend.mask_rear_rects)
-  _apply_static_mask_rects(rear_masks, static_rects)
+  _apply_static_mask_rects(rear.masks, static_rects)
 
-  cfg = FrontendConfig(
+  cfg = LensFrontendConfig(
     n_features=args.frontend.orb_n_features,
     ransac_threshold=args.frontend.ransac_threshold,
     max_half_angle=args.frontend.max_half_angle,
     gpu_flow=args.frontend.gpu_flow,
   )
-  (front_feature_frames, front_tracks), (rear_feature_frames, rear_tracks) = (
+  (front.feature_frames, front.tracks), (rear.feature_frames, rear.tracks) = (
     run_two_concurrently(
       lambda: run_lens_frontend(
-        front_gray,
-        front_lens.params,
+        front.gray,
+        front.setup.params,
         cfg,
-        masks=front_masks,
+        masks=front.masks,
       ),
       lambda: run_lens_frontend(
-        rear_gray,
-        rear_lens.params,
+        rear.gray,
+        rear.setup.params,
         cfg,
-        masks=rear_masks,
+        masks=rear.masks,
       ),
     )
   )
-  front_kept = {
-    t: o for t, o in front_tracks.items() if len(o) >= args.frontend.min_track_length
-  }
-  rear_kept = {
-    t: o for t, o in rear_tracks.items() if len(o) >= args.frontend.min_track_length
-  }
-  front_rejected: dict[int, dict[int, Float64Array]] = {}
-  rear_rejected: dict[int, dict[int, Float64Array]] = {}
-  if args.frontend.min_parallax > 0.0:
-    front_kept, front_rejected = filter_tracks_by_parallax(
-      front_kept, front_lens.params, args.frontend.min_parallax
-    )
-    rear_kept, rear_rejected = filter_tracks_by_parallax(
-      rear_kept, rear_lens.params, args.frontend.min_parallax
-    )
+  for ch in (front, rear):
+    ch.kept = {
+      t: o for t, o in ch.tracks.items() if len(o) >= args.frontend.min_track_length
+    }
+    if args.frontend.min_parallax > 0.0:
+      ch.kept, ch.rejected = filter_tracks_by_parallax(
+        ch.kept, ch.setup.params, args.frontend.min_parallax
+      )
 
-  f_first, f_last, f_shared = pick_init_pair(
-    front_kept, n_keyframes, args.frontend.init_min_shared_tracks
+  f_last, f_shared = pick_init_pair(
+    front.kept, n_keyframes, args.frontend.init_min_shared_tracks
   )
-  r_first, r_last, r_shared = pick_init_pair(
-    rear_kept, n_keyframes, args.frontend.init_min_shared_tracks
+  r_last, r_shared = pick_init_pair(
+    rear.kept, n_keyframes, args.frontend.init_min_shared_tracks
   )
-  if f_shared >= r_shared:
-    init_tracks, init_params, init_extrinsic = (
-      front_kept,
-      front_lens.params,
-      front_lens.extrinsic,
-    )
-    init_first, init_last, init_shared = f_first, f_last, f_shared
-  else:
-    init_tracks, init_params, init_extrinsic = (
-      rear_kept,
-      rear_lens.params,
-      rear_lens.extrinsic,
-    )
-    init_first, init_last, init_shared = r_first, r_last, r_shared
+  init_tracks, init_lens, init_last, init_shared = (
+    (front.kept, front_lens, f_last, f_shared)
+    if f_shared >= r_shared
+    else (rear.kept, rear_lens, r_last, r_shared)
+  )
   if init_shared < 8:
     raise RuntimeError(f"{name}: no lens has ≥8 shared tracks (best={init_shared})")
 
-  shared = [
-    obs for obs in init_tracks.values() if init_first in obs and init_last in obs
-  ]
-  pix_a = np.asarray([obs[init_first] for obs in shared], dtype=np.float64)
+  # The init pair is anchored at keyframe 0.
+  shared = [obs for obs in init_tracks.values() if 0 in obs and init_last in obs]
+  pix_a = np.asarray([obs[0] for obs in shared], dtype=np.float64)
   pix_b = np.asarray([obs[init_last] for obs in shared], dtype=np.float64)
-  bears_a = mei_unproject(pix_a, init_params)
-  bears_b = mei_unproject(pix_b, init_params)
+  bears_a = mei_unproject(pix_a, init_lens.params)
+  bears_b = mei_unproject(pix_b, init_lens.params)
   r_cw_last, t_cw_last, _ = two_view_essential(bears_a, bears_b)
   cam_poses = interpolate_camera_poses(r_cw_last, t_cw_last, n_keyframes)
-  body_poses_unscaled = body_poses_from_camera_poses(cam_poses, init_extrinsic)
+  body_poses_prealign = body_poses_from_camera_poses(cam_poses, init_lens.extrinsic)
 
   # Visual-odometry front-end: recover the real per-keyframe trajectory shape
   # from front-lens correspondences (front owns rotation/shape) instead of the
-  # two-keyframe straight line. Falls back to the anchor-PnP seed (or the
-  # straight line) above if the incremental SfM cannot register enough keyframes.
+  # two-keyframe straight line. Falls back to the anchor-PnP seed, or to that
+  # straight line, when the incremental SfM cannot register enough keyframes.
   anchor_seed_used = False
-  if args.frontend.use_visual_odometry:
-    sfm_cams, _ = incremental_sfm(
-      _bearings_by_track(front_kept, front_lens.params),
-      min_shared=args.frontend.init_min_shared_tracks,
+  sfm_cams, _ = incremental_sfm(
+    _bearings_by_track(front.kept, front_lens.params),
+    min_shared=args.frontend.init_min_shared_tracks,
+  )
+  sfm_cams, vo_outliers = _reject_vo_pose_outliers(sfm_cams)
+  if vo_outliers:
+    print(f"  [{name}] visual-odometry rejected {len(vo_outliers)} rotation-spike kfs")
+  if _enough_registered(len(sfm_cams), n_keyframes):
+    body_poses_prealign = body_poses_from_camera_poses(
+      _fill_camera_poses(sfm_cams, n_keyframes), front_lens.extrinsic
     )
-    sfm_cams, vo_outliers = _reject_vo_pose_outliers(sfm_cams)
-    if vo_outliers:
+    print(
+      f"  [{name}] visual-odometry init: registered "
+      f"{len(sfm_cams)}/{n_keyframes} keyframes"
+    )
+  else:
+    anchor_seed = _anchor_pose_seed(
+      anchor_obs_per_kf, front_lens.extrinsic, n_keyframes
+    )
+    if anchor_seed is not None:
+      body_poses_prealign = anchor_seed
+      anchor_seed_used = True
+      n_anchor_kf = sum("front" in s for s in anchor_obs_per_kf.values())
       print(
-        f"  [{name}] visual-odometry rejected {len(vo_outliers)} rotation-spike kfs"
-      )
-    if len(sfm_cams) >= max(8, n_keyframes // 4):
-      body_poses_unscaled = body_poses_from_camera_poses(
-        _fill_camera_poses(sfm_cams, n_keyframes), front_lens.extrinsic
-      )
-      print(
-        f"  [{name}] visual-odometry init: registered "
-        f"{len(sfm_cams)}/{n_keyframes} keyframes"
+        f"  [{name}] visual-odometry starved ({len(sfm_cams)}/{n_keyframes}); "
+        f"anchor-pose init from {n_anchor_kf} anchor keyframes"
       )
     else:
-      anchor_seed = _anchor_pose_seed(
-        anchor_obs_per_kf, front_lens.extrinsic, n_keyframes
+      print(
+        f"  [{name}] visual-odometry init: only {len(sfm_cams)}/{n_keyframes} "
+        f"keyframes registered — using straight-line init"
       )
-      if anchor_seed is not None:
-        body_poses_unscaled = anchor_seed
-        anchor_seed_used = True
-        n_anchor_kf = sum("front" in s for s in anchor_obs_per_kf.values())
-        print(
-          f"  [{name}] visual-odometry starved ({len(sfm_cams)}/{n_keyframes}); "
-          f"anchor-pose init from {n_anchor_kf} anchor keyframes"
-        )
-      else:
-        print(
-          f"  [{name}] visual-odometry init: only {len(sfm_cams)}/{n_keyframes} "
-          f"keyframes registered — using straight-line init"
-        )
 
   imu, bias0, gravity_world_initial = _imu_and_initial_gravity(
-    args, data, keyframe_times, body_poses_unscaled
+    args, data, imu, keyframe_times, body_poses_prealign
   )
 
-  front_unscaled = triangulate_lens(
-    front_kept,
-    body_poses_unscaled,
-    front_lens.extrinsic,
-    front_lens.params,
-    args.frontend.min_track_length,
-    min_landmark_depth=0.01,
-    max_landmark_depth=1000.0,
-  )
-  rear_unscaled = triangulate_lens(
-    rear_kept,
-    body_poses_unscaled,
-    rear_lens.extrinsic,
-    rear_lens.params,
-    args.frontend.min_track_length,
-    min_landmark_depth=0.01,
-    max_landmark_depth=1000.0,
-  )
+  for ch in (front, rear):
+    ch.landmarks_prealign = triangulate_lens(
+      ch.kept,
+      body_poses_prealign,
+      ch.setup.extrinsic,
+      ch.setup.params,
+      args.frontend.min_track_length,
+      min_landmark_depth=0.01,
+      max_landmark_depth=1000.0,
+    )
 
   # Without a stationary window the LSQ-fit gravity is the only signal we
   # have; preintegration uses a placeholder vertical gravity, then the
   # alignment runs against the same data and the LSQ-fit value sticks.
-  pim_gravity = (
-    (
-      float(gravity_world_initial[0]),
-      float(gravity_world_initial[1]),
-      float(gravity_world_initial[2]),
-    )
-    if gravity_world_initial is not None
-    else (0.0, 0.0, -9.81)
-  )
+  pim_gravity: tuple[float, float, float] = (0.0, 0.0, -9.81)
+  if gravity_world_initial is not None:
+    gx, gy, gz = gravity_world_initial
+    pim_gravity = (float(gx), float(gy), float(gz))
 
   def _pim_params(
     gravity: tuple[float, float, float],
@@ -1176,7 +1101,7 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
   # An anchor seed is already metric, so its scale is 1.0; otherwise take the
   # scale from a visible anchor, and float it on the IMU only with no anchor.
   anchor_scale = _anchor_metric_scale(
-    body_poses_unscaled, anchor_obs_per_kf, front_lens.extrinsic, rear_lens.extrinsic
+    body_poses_prealign, anchor_obs_per_kf, front_lens.extrinsic, rear_lens.extrinsic
   )
   fixed_scale = 1.0 if anchor_seed_used else anchor_scale
   pim_init = preintegrate_between_keyframes(params_initial, imu, keyframe_times, bias0)
@@ -1189,17 +1114,17 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
       fixed_scale=fixed_scale,
     )
 
-  alignment = _align(body_poses_unscaled)
+  alignment = _align(body_poses_prealign)
   if alignment.scale < 0.0:
-    origin = _translation(body_poses_unscaled[0])
-    body_poses_unscaled = [
+    origin = _translation(body_poses_prealign[0])
+    body_poses_prealign = [
       gtsam.Pose3(
         p.rotation(),
         gtsam.Point3(*(2.0 * origin - _translation(p))),
       )
-      for p in body_poses_unscaled
+      for p in body_poses_prealign
     ]
-    alignment = _align(body_poses_unscaled)
+    alignment = _align(body_poses_prealign)
   # Override LSQ-fit gravity with the IMU stationary-window estimate so the
   # world frame stays gravity-aligned (LSQ-fit gravity can drift up to ~30°
   # from the IMU truth, which then tilts the rerun viewer's z-up convention).
@@ -1210,140 +1135,73 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
       velocities=alignment.velocities,
     )
   print(f"  [{name}] VI scale={alignment.scale:.4f}")
-  body_poses, world_rotation = apply_alignment_to_poses(body_poses_unscaled, alignment)
+  body_poses, world_rotation = apply_alignment_to_poses(body_poses_prealign, alignment)
   world_rot_mat = world_rotation.matrix()
   velocities = [world_rot_mat @ v for v in alignment.velocities]
   params_aligned = _pim_params((0.0, 0.0, -9.81))
   pim = preintegrate_between_keyframes(params_aligned, imu, keyframe_times, bias0)
 
   use_anchor = bool(anchor_obs_per_kf)
-  anchor_local: gtsam.Pose3 | None = (
-    _snap_to_anchor_and_fill_gaps(
-      args,
-      anchor_obs_per_kf,
-      front_lens,
-      rear_lens,
-      body_poses,
-      velocities,
-      pim,
-      bias0,
-      n_keyframes,
-      name,
-    )
-    if use_anchor
-    else None
-  )
-
   # Each sighted anchor's pose in this tracker's local world, for the
   # shared-world alignment BFS.
-  anchor_locals_by_tag: dict[int, gtsam.Pose3] = {}
-  if anchor_local is not None:
-    anchor_locals_by_tag[prep_anchor_tag_id] = anchor_local
-  for tag_id, obs in obs_by_tag.items():
-    if tag_id == prep_anchor_tag_id or not obs:
-      continue
-    anchor_locals_by_tag[tag_id] = _first_sighting_local(
-      obs, front_lens, rear_lens, body_poses
-    )
+  anchor_locals_by_tag: dict[int, gtsam.Pose3] = {
+    tag_id: _first_sighting_local(obs, front_lens, rear_lens, body_poses)
+    for tag_id, obs in obs_by_tag.items()
+    if obs
+  }
 
-  loop_tracks: dict[int, dict[int, Float64Array]] = {}
-  if args.frontend.loop_closure and (
-    args.frontend.use_visual_odometry
-    or (args.frontend.anchored_loop_closure and use_anchor)
-  ):
-    loop_tracks = _loop_closure_tracks(
-      front_gray,
-      front_masks,
-      body_poses,
-      front_lens,
-      args.frontend.orb_n_features,
-      max(front_kept, default=0),
-      args.frontend.loop_closure_max_dist,
-      args.frontend.loop_closure_min_kf_gap,
-    )
   if use_anchor:
+    loop_tracks: dict[int, dict[int, Float64Array]] = {}
+    if args.frontend.loop_closure:
+      loop_tracks = _loop_closure_tracks(
+        front.gray,
+        front.masks,
+        body_poses,
+        front_lens,
+        args.frontend.orb_n_features,
+        max(front.kept, default=0),
+        args.frontend.loop_closure_max_dist,
+        args.frontend.loop_closure_min_kf_gap,
+      )
     anchor_kfs = set(anchor_obs_per_kf.keys())
-    if not args.frontend.use_visual_odometry:
-      # Anchor-seeded (no VO): gate tracks to those covisible with an anchor
-      # keyframe, keeping only the well-localized structure. VO mode instead
-      # triangulates the full tracks — vision owns every pose, so the near-field
-      # rear structure survives.
-      front_kept = {
-        t: front_kept[t] for t in front_kept if anchor_kfs & front_kept[t].keys()
-      }
-      rear_kept = {
-        t: rear_kept[t] for t in rear_kept if anchor_kfs & rear_kept[t].keys()
-      }
-    front_points = triangulate_lens(
-      {t: front_kept[t] for t in front_kept if t in front_unscaled},
-      body_poses,
-      front_lens.extrinsic,
-      front_lens.params,
-      args.frontend.min_track_length,
-      max_landmark_depth=args.frontend.max_landmark_depth,
-    )
-    rear_points = triangulate_lens(
-      {t: rear_kept[t] for t in rear_kept if t in rear_unscaled},
-      body_poses,
-      rear_lens.extrinsic,
-      rear_lens.params,
-      args.frontend.min_track_length,
-      max_landmark_depth=args.frontend.max_landmark_depth,
-    )
-    if args.frontend.use_visual_odometry:
-      cap = args.frontend.vo_max_landmarks_per_lens
-      front_points = _cap_landmarks(front_points, front_kept, cap)
-      rear_points = _cap_landmarks(rear_points, rear_kept, cap)
-      if loop_tracks:
-        # Triangulated + merged after the cap so the drift-cancelling revisit
-        # landmarks are never culled by the per-lens landmark budget. With
-        # anchored_loop_closure, triangulate from the anchor-covisible views so
-        # the revisit structure corrects (not fits) the drifted anchor-free tail.
-        _add_loop_landmarks(
-          front_points,
-          front_kept,
-          loop_tracks,
-          body_poses,
-          front_lens,
-          args.frontend.min_track_length,
-          args.frontend.max_landmark_depth,
-          name,
-          "loop closure",
-          anchor_kfs=anchor_kfs if args.frontend.anchored_loop_closure else None,
-        )
-    elif loop_tracks:
-      # Anchor-seeded mode: the gated front_kept dropped the anchor-free tail
-      # tracks, so merge the revisit loop landmarks here (after gating) to tie
-      # the drifting tail back to the early trajectory in the bundle.
+    cap = args.frontend.max_landmarks_per_lens
+    for ch in (front, rear):
+      ch.points = triangulate_lens(
+        {t: ch.kept[t] for t in ch.kept if t in ch.landmarks_prealign},
+        body_poses,
+        ch.setup.extrinsic,
+        ch.setup.params,
+        args.frontend.min_track_length,
+        max_landmark_depth=args.frontend.max_landmark_depth,
+      )
+      ch.points = _cap_landmarks(ch.points, ch.kept, cap)
+    if loop_tracks:
+      # Merged after the cap so the drift-cancelling revisit landmarks are never
+      # culled by the per-lens landmark budget.
       _add_loop_landmarks(
-        front_points,
-        front_kept,
+        front.points,
+        front.kept,
         loop_tracks,
         body_poses,
         front_lens,
-        args.frontend.min_track_length,
-        args.frontend.max_landmark_depth,
-        name,
-        "anchored loop closure",
-        anchor_kfs=anchor_kfs,
+        min_track_length=args.frontend.min_track_length,
+        max_landmark_depth=args.frontend.max_landmark_depth,
+        name=name,
+        anchor_kfs=anchor_kfs if args.frontend.anchored_loop_closure else None,
       )
   else:
     align_mat = alignment.scale * world_rotation.matrix()
-    front_points = {
-      tid: align_mat @ np.asarray(front_unscaled[tid], dtype=np.float64)
-      for tid in front_unscaled
-    }
-    rear_points = {
-      tid: align_mat @ np.asarray(rear_unscaled[tid], dtype=np.float64)
-      for tid in rear_unscaled
-    }
+    for ch in (front, rear):
+      ch.points = {
+        tid: align_mat @ np.asarray(ch.landmarks_prealign[tid], dtype=np.float64)
+        for tid in ch.landmarks_prealign
+      }
 
-  front_tracks_tri = {t: front_kept[t] for t in front_points if t in front_kept}
-  rear_tracks_tri = {t: rear_kept[t] for t in rear_points if t in rear_kept}
-  if args.frontend.use_visual_odometry:
-    m = args.frontend.vo_max_obs_per_track
-    front_tracks_tri = {t: _subsample_obs(o, m) for t, o in front_tracks_tri.items()}
-    rear_tracks_tri = {t: _subsample_obs(o, m) for t, o in rear_tracks_tri.items()}
+  n_obs = args.frontend.max_obs_per_track
+  for ch in (front, rear):
+    ch.tracks_tri = {
+      t: _subsample_obs(ch.kept[t], n_obs) for t in ch.points if t in ch.kept
+    }
 
   v_max = float(max(np.linalg.norm(v) for v in velocities))
   print(f"  [{name}] VIO LSQ |v|max={v_max:.2f} m/s")
@@ -1361,12 +1219,11 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
     preintegrated=pim,
     front_lens=front_lens,
     rear_lens=rear_lens,
-    front_tracks_tri=front_tracks_tri,
-    rear_tracks_tri=rear_tracks_tri,
-    front_points=front_points,
-    rear_points=rear_points,
+    front_tracks_tri=front.tracks_tri,
+    rear_tracks_tri=rear.tracks_tri,
+    front_points=front.points,
+    rear_points=rear.points,
     decoded_width=decoded_width,
-    prep_anchor_tag_id=prep_anchor_tag_id,
     anchor_obs_by_tag=obs_by_tag,
     anchor_locals_by_tag=anchor_locals_by_tag,
     body_T_base_tag=body_T_base_tag,
@@ -1374,15 +1231,14 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
     keyframe_times=keyframe_times,
     front_frames=front_color,
     rear_frames=rear_color,
-    front_keypoints=[f.keypoints for f in front_feature_frames],
-    rear_keypoints=[f.keypoints for f in rear_feature_frames],
+    front_keypoints=[f.keypoints for f in front.feature_frames],
+    rear_keypoints=[f.keypoints for f in rear.feature_frames],
     front_tags_per_kf=front_tags_per_kf,
     rear_tags_per_kf=rear_tags_per_kf,
-    front_rejected=front_rejected,
-    rear_rejected=rear_rejected,
+    front_rejected=front.rejected,
+    rear_rejected=rear.rejected,
     rear_static_mask_rects=static_rects,
     finger_reproj=finger_reproj,
     left_finger_tag_id=args.left_finger_tag_id,
     right_finger_tag_id=args.right_finger_tag_id,
-    n_keyframes=n_keyframes,
   )

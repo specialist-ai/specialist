@@ -20,15 +20,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 import cv2
 import numpy as np
 import numpy.typing as npt
 import rerun as rr
 import tyro
-from _probe import finalize_probe, read_lens_grays
+from _probe import UInt8Array, finalize_probe, read_lens_grays
 
-from specialist.loader.parse_insv import InsvData, load_insv
+from specialist.loader.parse_insv import load_insv
 
 Float64Array = npt.NDArray[np.float64]
 
@@ -39,7 +40,7 @@ class TimingArgs:
 
   input_insv: Path
   output_dir: Path = Path("logs")
-  lens: str = "front"  # 'front' (the _00_ file) or 'rear' (the _10_ sibling)
+  lens: Literal["front", "rear"] = "front"  # _00_ file / _10_ sibling
   max_frames: int = 600
   flow_max_corners: int = 200
   flow_quality_level: float = 0.01
@@ -76,7 +77,7 @@ class TimingSummary:
 
 def _read_fisheye_grays(
   video_path: Path, max_frames: int, lens: str
-) -> tuple[list[npt.NDArray[np.uint8]], list[float], float]:
+) -> tuple[list[UInt8Array], list[float], float]:
   frames = read_lens_grays(video_path, lens, max_frames=max_frames)
   cap = cv2.VideoCapture(str(video_path))
   fps = float(cap.get(cv2.CAP_PROP_FPS)) or 60.0
@@ -85,7 +86,7 @@ def _read_fisheye_grays(
   return frames, ts, fps
 
 
-def _flow_magnitudes(grays: list[Float64Array], args: TimingArgs) -> Float64Array:
+def _flow_magnitudes(grays: list[UInt8Array], args: TimingArgs) -> Float64Array:
   """Median Lucas-Kanade flow magnitude per frame transition."""
 
   def corners(img: np.ndarray) -> np.ndarray | None:
@@ -97,10 +98,10 @@ def _flow_magnitudes(grays: list[Float64Array], args: TimingArgs) -> Float64Arra
     )
 
   mags: list[float] = []
-  prev = grays[0].astype(np.uint8)
+  prev = grays[0]
   prev_pts = corners(prev)
   for k in range(1, len(grays)):
-    curr = grays[k].astype(np.uint8)
+    curr = grays[k]
     if prev_pts is None or len(prev_pts) < 10:
       mags.append(0.0)
       prev_pts = corners(curr)
@@ -147,9 +148,9 @@ def _estimate_offset(
   )
 
 
-def _vertical_line_shear(gray: np.ndarray, threshold: int) -> float | None:
+def _vertical_line_shear(gray: UInt8Array, threshold: int) -> float | None:
   """Median per-pixel horizontal shift along near-vertical Hough line segments."""
-  edges = cv2.Canny(gray.astype(np.uint8), 60, 180)
+  edges = cv2.Canny(gray, 60, 180)
   segments = cv2.HoughLinesP(
     edges, 1, np.pi / 360.0, threshold, minLineLength=80, maxLineGap=10
   )
@@ -171,7 +172,7 @@ def _vertical_line_shear(gray: np.ndarray, threshold: int) -> float | None:
 
 
 def _estimate_rolling_shutter(
-  grays: list[Float64Array],
+  grays: list[UInt8Array],
   video_t: Float64Array,
   imu_t: Float64Array,
   gyro_dps: Float64Array,
@@ -199,7 +200,7 @@ def _estimate_rolling_shutter(
     yaw_rate_px = yaw_rate / deg_per_pixel
     if abs(yaw_rate_px) < 1.0:
       continue
-    # shear (dx/dy) = yaw_rate_px * t_readout / height -> t_readout = ...
+    # shear (dx/dy) = yaw_rate_px * t_readout / height.
     readout = shear_px_per_px * height / yaw_rate_px
     if 0.0 < readout < 0.05:
       readouts.append(readout)
@@ -223,10 +224,7 @@ def _verdict(summary: TimingSummary) -> str:
     parts.append(f"large video<->IMU offset {summary.offset.best_offset * 1e3:.1f} ms")
   if summary.shear is None:
     parts.append("RS shear unmeasured (need yaw motion + vertical edges)")
-  elif (
-    summary.shear is not None
-    and abs(summary.shear.measured_readout - summary.shear.factory_readout) > 5e-3
-  ):
+  elif abs(summary.shear.measured_readout - summary.shear.factory_readout) > 5e-3:
     parts.append(
       f"RS readout mismatch: {summary.shear.measured_readout * 1e3:.2f} ms vs "
       f"{summary.shear.factory_readout * 1e3:.2f} ms factory"
@@ -251,7 +249,7 @@ def _log_to_rerun(
 
 def main(args: TimingArgs) -> None:
   args.output_dir.mkdir(parents=True, exist_ok=True)
-  data: InsvData = load_insv(args.input_insv)
+  data = load_insv(args.input_insv)
 
   grays, video_t_list, fps = _read_fisheye_grays(
     args.input_insv, args.max_frames, args.lens

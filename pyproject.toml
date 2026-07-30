@@ -15,7 +15,6 @@ dependencies = [
   "opencv-python>=4.10",
   "pupil-apriltags>=1.0.4",
   "allantools>=2024.6",
-  "pyyaml>=6.0",
   "robot-descriptions",
   # Wheel-bundled static ffmpeg so multi-clip audio clap-sync works on every
   # platform via `uv sync` (no system ffmpeg / sudo, e.g. the headless server).
@@ -43,7 +42,6 @@ dev = [
   "ruff==0.15.0",
   "mypy>=1.13",
   "pre-commit>=3.8",
-  "types-pyyaml>=6.0",
   # For rebuilding the native MEI factor by hand (`uv run build-mei-factor`).
   "pybind11==2.13.6",
 ]
@@ -91,7 +89,6 @@ exclude = ["src/specialist/vi_ba/gpu_dis/*.py"]
 
 [tool.ruff.lint]
 select = ["E4", "E7", "E9", "F", "I", "B"]
-ignore = ["B011"]
 
 [tool.ruff.lint.per-file-ignores]
 "src/specialist/vi_ba/gpu_dis/*" = ["E702", "E741", "I001", "B905"]
@@ -99,7 +96,7 @@ ignore = ["B011"]
 [tool.mypy]
 python_version = "3.12"
 strict = true
-files = ["src/specialist"]
+files = ["src/specialist", "scripts/track.py"]
 # The vendored DIS kernels are untyped research code.
 exclude = ["src/specialist/vi_ba/gpu_dis/"]
 
@@ -117,6 +114,7 @@ module = [
   "allantools", "allantools.*",
   "imageio_ffmpeg", "imageio_ffmpeg.*",
   "torch", "torch.*", "triton", "triton.*",
+  "robot_descriptions", "robot_descriptions.*",
 ]
 ignore_missing_imports = true
 

@@ -58,16 +58,6 @@ def optimize_graph(
   """Run Levenberg-Marquardt and return values + run stats. With ``gpu``,
   the linear solves run through the Schur/cuDSS path, falling back to the
   gtsam optimizer when the GPU backend is unavailable or its solve fails."""
-  if max_iterations <= 0:
-    # Return the initialization untouched — used to evaluate an init in
-    # isolation, with no bundle-adjustment refinement.
-    initial_error = float(graph.error(initial_values))
-    return OptimizeResult(
-      values=initial_values,
-      iterations=0,
-      initial_error=initial_error,
-      final_error=initial_error,
-    )
   begin = time.perf_counter()
   values: gtsam.Values | None = None
   note = ""

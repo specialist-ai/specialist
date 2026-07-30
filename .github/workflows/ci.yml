@@ -24,9 +24,9 @@ jobs:
         with:
           enable-cache: true
       - name: Run ruff check
-        run: uvx ruff@0.15.0 check --diff src/ tests/
+        run: uvx ruff@0.15.0 check --diff src/ tests/ scripts/
       - name: Run ruff format
-        run: uvx ruff@0.15.0 format --diff src/ tests/
+        run: uvx ruff@0.15.0 format --diff src/ tests/ scripts/
 
   typecheck:
     runs-on: ubuntu-latest
@@ -45,7 +45,7 @@ jobs:
         # lazily in scripts/track.py; CI has no SSH creds and doesn't need it.
         run: uv sync --extra dev --no-install-package robot-descriptions
       - name: Run mypy
-        run: uv run --no-sync mypy src/specialist
+        run: uv run --no-sync mypy
 
   tests:
     runs-on: ubuntu-latest

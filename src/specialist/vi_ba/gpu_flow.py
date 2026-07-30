@@ -8,9 +8,8 @@ stream is handed its own GPU. Pairs are computed in memory-sized batches; frame
 uploads and flow downloads move through page-locked host buffers with
 non-blocking copies.
 
-torch ships in the optional ``gpu`` extra, so it is imported lazily; ``available``
-reports whether the backend can run and the caller (``features.dis_flow_track``)
-falls back to the cv2 path loudly when it cannot.
+torch ships in the optional ``gpu`` extra, so it is imported lazily;
+``unavailable_reason`` reports why the backend cannot run.
 """
 
 from __future__ import annotations
@@ -35,19 +34,17 @@ __all__ = ["unavailable_reason", "prime", "iter_flows", "shutdown"]
 # context plus upload/download staging, and a GPU under _MIN_FREE_GB is skipped. A
 # stream that OOMs while warming halves its batch and retries. expandable_segments
 # keeps the transient allocations from fragmenting.
-_MAX_BATCH = int(os.environ.get("GPUFLOW_MAX_BATCH", "24"))
+_MAX_BATCH = 24
 _MIN_FREE_GB = 8.0
 _RESERVE_GB = 3.0
 _GB_PER_PAIR = 1.15
 
 # Distinct GPUs one process will claim; past the cap, extra streams double up
 # on the most-free GPU.
-_MAX_GPUS = int(os.environ.get("GPUFLOW_MAX_GPUS", "8"))
+_MAX_GPUS = 8
 
-# Page-locked host staging + non-blocking copies make the H2D upload and the
-# (dominant) D2H flow download move at pinned bandwidth without blocking the
-# host. Off restores the plain pageable path for A/B measurement.
-_PINNED = os.environ.get("GPUFLOW_PINNED", "1") != "0"
+# Page-locked host staging with non-blocking copies.
+_PINNED = True
 
 _claim_lock = threading.Lock()
 _backend: tuple[Any, Any] | None = None
@@ -126,14 +123,11 @@ def _claim_device() -> tuple[int, int]:
       for i in free
       if i not in _claimed and free[i] >= _MIN_FREE_GB and _device_batch(free[i]) >= 1
     ]
-    if unclaimed and len(_claimed) < _MAX_GPUS:
-      idx = max(unclaimed, key=lambda i: free[i])
-      _claimed[idx] = 1
-      return idx, _device_batch(free[idx])
     shareable = [i for i in free if _device_batch(free[i]) >= 1]
     if not shareable:
       raise RuntimeError("no GPU has enough free memory for the flow backend")
-    idx = max(shareable, key=lambda i: free[i])
+    pool = unclaimed if unclaimed and len(_claimed) < _MAX_GPUS else shareable
+    idx = max(pool, key=lambda i: free[i])
     _claimed[idx] = _claimed.get(idx, 0) + 1
     return idx, _device_batch(free[idx])
 
@@ -357,7 +351,7 @@ def prime(frames: list[np.ndarray], fwd_vr: int, bwd_vr: int) -> _Engine:
   torch = _import_backend()[0]
   tries = torch.cuda.device_count() if torch.cuda.is_available() else 1
   last_exc: Exception | None = None
-  for _ in range(max(1, tries)):
+  for _ in range(tries):
     engine = _Engine(fwd_vr, bwd_vr)  # raises when no GPU is claimable
     try:
       engine.prime(frames)

@@ -20,6 +20,8 @@ from specialist.loader._camera_math import require_2d, unit_rows
 
 Float64Array = npt.NDArray[np.float64]
 
+__all__ = ["MeiParams", "mei_project", "mei_unproject"]
+
 
 @dataclass(frozen=True)
 class MeiParams:
@@ -35,31 +37,6 @@ class MeiParams:
   p1: float
   p2: float
   xi: float
-
-  @classmethod
-  def from_camera_matrix(
-    cls, camera_matrix: Float64Array, distortion_coeffs: Float64Array
-  ) -> MeiParams:
-    """Build from the ``LensIntrinsics`` arrays parsed out of a ``.insv``."""
-    if camera_matrix.shape != (3, 3):
-      raise ValueError(f"camera_matrix must be 3x3, got {camera_matrix.shape}")
-    if distortion_coeffs.shape != (6,):
-      raise ValueError(
-        f"distortion_coeffs must be (6,) [k1,k2,k3,p1,p2,xi], "
-        f"got {distortion_coeffs.shape}"
-      )
-    return cls(
-      fx=float(camera_matrix[0, 0]),
-      fy=float(camera_matrix[1, 1]),
-      cx=float(camera_matrix[0, 2]),
-      cy=float(camera_matrix[1, 2]),
-      k1=float(distortion_coeffs[0]),
-      k2=float(distortion_coeffs[1]),
-      k3=float(distortion_coeffs[2]),
-      p1=float(distortion_coeffs[3]),
-      p2=float(distortion_coeffs[4]),
-      xi=float(distortion_coeffs[5]),
-    )
 
 
 def mei_project(points_cam: Float64Array, params: MeiParams) -> Float64Array:
@@ -91,15 +68,15 @@ def mei_unproject(pixels: Float64Array, params: MeiParams) -> Float64Array:
 
   Inverts the distorted-pinhole step iteratively (Newton on the radial
   polynomial), then inverts the unit-sphere projection. Returns unit vectors
-  in the camera frame; raises if any pixel sits beyond the model's domain.
+  in the camera frame; pixels beyond the model's domain (negative
+  discriminant) come back NaN, matching ``mei_project``.
   """
   require_2d(pixels, 2, "pixels")
 
   x_d = (pixels[:, 0] - params.cx) / params.fx
   y_d = (pixels[:, 1] - params.cy) / params.fy
 
-  x = x_d.copy()
-  y = y_d.copy()
+  x, y = x_d, y_d
   for _ in range(20):
     r2 = x * x + y * y
     radial = 1.0 + params.k1 * r2 + params.k2 * r2 * r2 + params.k3 * r2**3
@@ -114,8 +91,12 @@ def mei_unproject(pixels: Float64Array, params: MeiParams) -> Float64Array:
       break
 
   r2 = x * x + y * y
-  # Invert sphere shift: solve for sphere point P_s with P_s.z + xi = 1/(...)
-  # giving the closed form below for xi >= 0.
+  # Invert the sphere shift: writing the sphere point as
+  # (factor * x, factor * y, factor - xi), unit norm makes factor a root of
+  # factor**2 * (r2 + 1) - 2 * factor * xi + xi**2 - 1 = 0. The larger root is
+  # the sphere intersection the forward projection came from; both roots are
+  # positive once xi > 1. A negative discriminant puts the pixel outside the
+  # model's domain, so the bearing comes back NaN.
   disc = 1.0 + (1.0 - params.xi * params.xi) * r2
   disc = np.where(disc < 0.0, np.nan, disc)
   factor = (params.xi + np.sqrt(disc)) / (r2 + 1.0)

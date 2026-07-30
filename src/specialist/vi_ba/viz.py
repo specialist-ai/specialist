@@ -1,8 +1,7 @@
-"""Columnar Rerun logging for dual-lens VI-BA. ``log_multi_ba_run`` builds
-one ``TrackerVizData`` per tracker and forwards each to the ``_log_tracker``
-helper parameterised by entity-path roots, so every overlay (RMSE, biases,
-keypoints, tags, reprojections, URDF, ...) is logged uniformly for one or
-many trackers."""
+"""Columnar Rerun logging for dual-lens VI-BA. ``log_multi_ba_run`` takes one
+``TrackerVizData`` per tracker and logs every overlay (RMSE, biases, keypoints,
+tags, reprojections, URDF, ...) under that tracker's entity-path roots, so one
+or many trackers land in the same recording."""
 
 from __future__ import annotations
 
@@ -56,12 +55,12 @@ def _trail_strips(
 
 
 def _log_static_points(
-  path: str, points: dict[int, Float64Array], color: tuple[int, int, int]
+  entity_path: str, points: dict[int, Float64Array], color: tuple[int, int, int]
 ) -> None:
   if not points:
     return
   xyz = np.asarray(list(points.values()), dtype=np.float64)
-  rr.log(path, rr.Points3D(xyz, radii=0.002, colors=color), static=True)
+  rr.log(entity_path, rr.Points3D(xyz, radii=0.002, colors=color), static=True)
 
 
 def _solid_colors(color: tuple[int, int, int], n: int) -> np.ndarray:
@@ -221,8 +220,8 @@ def _send_tag_axes_columns(
 def _send_factor_line_columns(
   entity_path: str,
   lines_per_kf: list[Float64Array],
-  color: tuple[int, int, int],
   times: rr.TimeColumn,
+  color: tuple[int, int, int],
 ) -> None:
   """Per-keyframe 3D ``LineStrips3D`` overlay. ``lines_per_kf[k]`` is an
   ``(n_lines, 2, 3)`` array of (start, end) endpoints; empty arrays yield
@@ -244,15 +243,15 @@ def _send_factor_line_columns(
 
 
 def _send_lens_columns(
-  entity_prefix: str,
-  metrics_prefix: str,
+  entity_path: str,
+  metrics_path: str,
   frames: list[bytes],
   keypoints: list[Float64Array] | None,
-  color: tuple[int, int, int],
   times: rr.TimeColumn,
+  color: tuple[int, int, int],
 ) -> None:
   rr.send_columns(
-    entity_prefix,
+    entity_path,
     indexes=[times],
     columns=rr.EncodedImage.columns(
       blob=frames, media_type=["image/jpeg"] * len(frames)
@@ -260,33 +259,21 @@ def _send_lens_columns(
   )
   if keypoints is None:
     return
-  partition = [int(kp.shape[0]) for kp in keypoints]
-  positions = (
-    np.concatenate(keypoints) if any(p > 0 for p in partition) else np.empty((0, 2))
-  )
-  total = positions.shape[0]
+  _send_point_columns(f"{entity_path}/keypoints", keypoints, times, 10.0, color)
+  counts = np.asarray([kp.shape[0] for kp in keypoints], dtype=np.float64)
   rr.send_columns(
-    f"{entity_prefix}/keypoints",
+    metrics_path,
     indexes=[times],
-    columns=rr.Points2D.columns(
-      positions=positions,
-      radii=np.full(total, 10.0, dtype=np.float32),
-      colors=_solid_colors(color, total),
-    ).partition(partition),
-  )
-  rr.send_columns(
-    metrics_prefix,
-    indexes=[times],
-    columns=rr.Scalars.columns(scalars=np.asarray(partition, dtype=np.float64)),
+    columns=rr.Scalars.columns(scalars=counts),
   )
 
 
 @dataclass
 class TrackerVizData:
-  """Per-tracker payload for ``_log_tracker``. ``log_multi_ba_run`` builds
-  one of these per tracker and forwards it to the internal logger."""
+  """One tracker's Rerun payload, built by ``viz_build.build_run_outputs`` and
+  logged by ``log_multi_ba_run``."""
 
-  name: str = "default"
+  name: str
   body_poses: list[gtsam.Pose3] = field(default_factory=list)
   keyframe_times: Float64Array | None = None
   front_points: dict[int, Float64Array] = field(default_factory=dict)
@@ -310,26 +297,22 @@ class TrackerVizData:
   rear_landmark_reprojections: list[Float64Array] | None = None
   front_tag_axes: list[Float64Array] | None = None
   rear_tag_axes: list[Float64Array] | None = None
-  urdf_root_poses: list[gtsam.Pose3] | None = None
-  # NaN entries hold the last finite angle so dropouts don't snap to zero.
+  urdf_root_poses: list[gtsam.Pose3] = field(default_factory=list)
+  # URDF joint name → per-keyframe angle, NaN where it could not be recovered.
   joint_angles: dict[str, list[float]] | None = None
   trajectory_offset_in_gripper: tuple[float, float, float] | None = None
   front_lens_extrinsic: gtsam.Pose3 | None = None
   rear_lens_extrinsic: gtsam.Pose3 | None = None
-  # Per-keyframe ``(n, 2, 3)`` line endpoints for every factor firing at that
-  # keyframe. ``anchor_obs_lines`` runs from this tracker's lens(es) to the
-  # anchor tag's four metric corner landmarks (the reprojection factors);
-  # ``cross_tracker_lines`` runs to other trackers' gripper tags it observed.
+  # Per-keyframe ``(n, 2, 3)`` lens-to-corner ray endpoints, one strip per firing
+  # reprojection factor: anchor corners, then another tracker's base-tag corners.
   anchor_obs_lines: list[Float64Array] | None = None
   cross_tracker_lines: list[Float64Array] | None = None
-  # ``None`` lets ``log_multi_ba_run`` assign a per-tracker palette color.
-  trajectory_color: tuple[int, int, int] | None = None
 
 
 def _gripper_points(data: TrackerVizData) -> Float64Array:
   """Per-keyframe trajectory points: the URDF root translated by the gripper
-  keypoint offset when a URDF is present, else the raw body translations."""
-  if data.urdf_root_poses is not None and data.trajectory_offset_in_gripper is not None:
+  keypoint offset when an offset is given, else the raw body translations."""
+  if data.trajectory_offset_in_gripper is not None:
     offset = np.asarray(data.trajectory_offset_in_gripper, dtype=np.float64)
     return np.stack(
       [
@@ -341,26 +324,8 @@ def _gripper_points(data: TrackerVizData) -> Float64Array:
   return _translations(data.body_poses)
 
 
-def _floor_z_for(data: TrackerVizData) -> float | None:
-  pts = _gripper_points(data)
-  return float(pts[:, 2].min()) if len(pts) else None
-
-
-def _log_anchor(
-  spatial_root: str,
-  world_T_anchor: gtsam.Pose3 | None,
-  anchor_tag_size: float | None,
-  entity: str,
-) -> None:
-  if anchor_tag_size is None:
-    return
-  half = float(anchor_tag_size) / 2.0
-  if world_T_anchor is not None:
-    rr.log(
-      f"{spatial_root}/{entity}",
-      _pose_transform3d(world_T_anchor),
-      static=True,
-    )
+def _log_anchor(entity: str, world_T_anchor: gtsam.Pose3, tag_size: float) -> None:
+  half = tag_size / 2.0
   square = np.array(
     [
       [+half, -half, 0.0],
@@ -372,12 +337,13 @@ def _log_anchor(
     dtype=np.float64,
   )
   rr.log(
-    f"{spatial_root}/{entity}",
+    f"world/{entity}",
+    _pose_transform3d(world_T_anchor),
     rr.LineStrips3D([square], colors=_YELLOW, radii=0.003),
     static=True,
   )
   rr.log(
-    f"{spatial_root}/{entity}/frame",
+    f"world/{entity}/frame",
     rr.TransformAxes3D(axis_length=half),
     static=True,
   )
@@ -392,6 +358,7 @@ def _log_tracker(
   urdf_path: Path | None,
   anchor_tag_ids: set[int],
   mask_pad_px: int,
+  trajectory_color: tuple[int, int, int],
 ) -> None:
   """Log every per-tracker entity (poses, landmarks, URDF, image overlays,
   scalar metrics). Shared statics (anchor tag, view coordinates, world TF)
@@ -476,9 +443,7 @@ def _log_tracker(
     columns=rr.Transform3D.columns(translation=pose_translations, quaternion=quats),
   )
   if urdf_root_frame is not None:
-    poses = (
-      data.urdf_root_poses if data.urdf_root_poses is not None else data.body_poses
-    )
+    poses = data.urdf_root_poses
     urdf_traj = _translations(poses)
     urdf_quats = np.stack([_pose_quaternion_xyzw(p) for p in poses])
     rr.send_columns(
@@ -492,7 +457,7 @@ def _log_tracker(
       ),
     )
     if data.joint_angles is not None:
-      assert tree is not None  # non-None whenever urdf_path is set
+      assert tree is not None  # reached only on the path that set urdf_root_frame
       for joint_name, raw_values in data.joint_angles.items():
         joint = tree.get_joint_by_name(joint_name)
         if joint is None:
@@ -519,7 +484,7 @@ def _log_tracker(
     columns=rr.LineStrips3D.columns(
       strips=_trail_strips(traj, trail_times, _TRAJECTORY_TRAIL_DURATION),
       radii=np.full(n, 0.002, dtype=np.float32),
-      colors=np.tile(np.asarray(data.trajectory_color, dtype=np.uint8), (n, 1)),
+      colors=_solid_colors(trajectory_color, n),
     ),
   )
   rr.send_columns(
@@ -532,15 +497,15 @@ def _log_tracker(
     _send_factor_line_columns(
       f"{spatial_root}/factor_lines/anchor",
       data.anchor_obs_lines,
-      _YELLOW,
       times,
+      _YELLOW,
     )
   if data.cross_tracker_lines is not None:
     _send_factor_line_columns(
       f"{spatial_root}/factor_lines/cross_tracker",
       data.cross_tracker_lines,
-      _CYAN,
       times,
+      _CYAN,
     )
 
   for lens_name, frames, kps, color in (
@@ -554,8 +519,8 @@ def _log_tracker(
       f"metrics/n_keypoints/{lens_name}{metrics_suffix}",
       frames,
       kps,
-      color,
       times,
+      color,
     )
   for lens_name, tags in (
     ("front", data.front_tag_detections),
@@ -630,15 +595,13 @@ def _log_tracker(
     )
 
 
-def _palette(i: int) -> tuple[int, int, int]:
-  table = (
-    _FRONT_COLOR,
-    _REAR_COLOR,
-    (130, 140, 240),
-    (220, 90, 200),
-    _CYAN,
-  )
-  return table[i % len(table)]
+_TRAJECTORY_PALETTE = (
+  _FRONT_COLOR,
+  _REAR_COLOR,
+  (130, 140, 240),
+  (220, 90, 200),
+  _CYAN,
+)
 
 
 def _multi_blueprint(tracker_names: list[str], floor_z: float | None) -> rrb.Blueprint:
@@ -702,7 +665,7 @@ def log_multi_ba_run(
   trackers: list[TrackerVizData],
   anchor_poses_world: dict[int, gtsam.Pose3],
   reference_tag_id: int,
-  anchor_tag_size: float | None = None,
+  anchor_tag_size: float,
   mask_pad_px: int = 0,
   urdf_path: Path | None = None,
   open_viewer: bool = True,
@@ -713,13 +676,9 @@ def log_multi_ba_run(
   ``/world/anchor_tag``; every other anchor at its solved pose under
   ``/world/anchor_tag_<id>``."""
   rr.init("specialist.vi_ba", spawn=False)
-  for i, t in enumerate(trackers):
-    if not t.name:
-      t.name = f"tracker_{i}"
-    if t.trajectory_color is None:
-      t.trajectory_color = _palette(i)
-  floor_zs = [z for z in (_floor_z_for(t) for t in trackers) if z is not None]
-  floor_z = float(min(floor_zs)) if floor_zs else None
+  gripper_points = [_gripper_points(t) for t in trackers]
+  floor_zs = [float(pts[:, 2].min()) for pts in gripper_points if len(pts)]
+  floor_z = min(floor_zs) if floor_zs else None
   rr.send_blueprint(
     _multi_blueprint([t.name for t in trackers], floor_z),
     make_active=True,
@@ -738,8 +697,8 @@ def log_multi_ba_run(
   rr.log("world", rr.Transform3D(child_frame="world"), static=True)
   for tag_id, pose in anchor_poses_world.items():
     entity = "anchor_tag" if tag_id == reference_tag_id else f"anchor_tag_{tag_id}"
-    _log_anchor("world", pose, anchor_tag_size, entity=entity)
-  for t in trackers:
+    _log_anchor(entity, pose, anchor_tag_size)
+  for i, t in enumerate(trackers):
     _log_tracker(
       t,
       spatial_root=t.name,
@@ -749,5 +708,6 @@ def log_multi_ba_run(
       urdf_path=urdf_path,
       anchor_tag_ids=set(anchor_poses_world),
       mask_pad_px=mask_pad_px,
+      trajectory_color=_TRAJECTORY_PALETTE[i % len(_TRAJECTORY_PALETTE)],
     )
   rr.disconnect()

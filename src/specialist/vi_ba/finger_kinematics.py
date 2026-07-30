@@ -21,12 +21,18 @@ import gtsam
 import numpy as np
 import numpy.typing as npt
 
-from specialist.loader.mei_model import mei_project, mei_unproject
-from specialist.vi_ba.anchor_detection import TagDetection, tag_corners_local
+from specialist.loader.mei_model import mei_project
+from specialist.vi_ba.anchor_detection import (
+  TagDetection,
+  tag_center_bearing,
+  tag_corners_in_frame,
+)
 from specialist.vi_ba.build import LensSetup
 from specialist.vi_ba.urdf_joints import RevoluteJoint
 
 Float64Array = npt.NDArray[np.float64]
+
+__all__ = ["FingerKfObs", "FingerReproj", "build_finger_reproj"]
 
 _THETA_SCAN_SAMPLES = 48
 
@@ -65,15 +71,21 @@ def _seed_theta(
   r_bj = body_T_joint.rotation().matrix()
   t_bj = np.asarray(body_T_joint.translation(), dtype=np.float64)
   cx, cy, cz = corners_in_pivot.T
-  best_theta, best_err = lower, np.inf
-  for theta in np.linspace(lower, upper, _THETA_SCAN_SAMPLES):
-    c, s = np.cos(theta), np.sin(theta)
-    rz = np.column_stack([c * cx - s * cy, s * cx + c * cy, cz])  # Rz(theta) . c
-    p_lens = (rz @ r_bj.T + t_bj) @ r_lb.T + t_lb
-    err = float(np.sum((mei_project(p_lens, lens.params) - pixels) ** 2))
-    if err < best_err:
-      best_err, best_theta = err, float(theta)
-  return best_theta
+  thetas = np.linspace(lower, upper, _THETA_SCAN_SAMPLES)
+  c = np.cos(thetas)[:, None]
+  s = np.sin(thetas)[:, None]
+  rz = np.stack(  # Rz(theta) . c
+    [c * cx - s * cy, s * cx + c * cy, np.broadcast_to(cz, c.shape[:1] + cz.shape)],
+    axis=-1,
+  )
+  p_lens = (rz @ r_bj.T + t_bj) @ r_lb.T + t_lb
+  projected = mei_project(p_lens.reshape(-1, 3), lens.params).reshape(
+    p_lens.shape[:2] + (2,)
+  )
+  errors = np.sum((projected - pixels) ** 2, axis=(1, 2))
+  # A behind-the-mirror corner projects to NaN; an all-NaN scan falls back to
+  # the lower bound.
+  return float(thetas[int(np.argmin(np.where(np.isnan(errors), np.inf, errors)))])
 
 
 def build_finger_reproj(
@@ -85,31 +97,21 @@ def build_finger_reproj(
   tag_size: float,
   n_keyframes: int,
 ) -> FingerReproj | None:
-  """Assemble one finger's reprojection inputs from the URDF. ``base_T_joint`` (the
-  joint origin in the base frame) stays in the URDF root frame; the bundle's
-  ``body_T_base_tag`` variable carries it to the body. ``body_T_base_tag`` here is
-  the seed of that variable, used only to seed each keyframe's joint angle. Returns
-  ``None`` if the finger tag is never detected; ``joint`` must carry an AprilTag
-  frame (``joint_T_tag0``)."""
+  """Assemble one finger's reprojection inputs from the URDF.
+  ``body_T_base_tag`` seeds each keyframe's joint angle. Returns ``None`` if the
+  finger tag is never detected; ``joint`` must carry an AprilTag frame
+  (``joint_T_tag0``)."""
   assert joint.joint_T_tag0 is not None
   base_T_joint = joint.base_T_joint
   body_T_joint_seed = body_T_base_tag.compose(base_T_joint)
-  corners_in_pivot = np.array(
-    [
-      joint.joint_T_tag0.transformFrom(gtsam.Point3(*c))
-      for c in tag_corners_local(tag_size)
-    ],
-    dtype=np.float64,
-  )
+  corners_in_pivot = tag_corners_in_frame(joint.joint_T_tag0, tag_size)
   observations: dict[int, FingerKfObs] = {}
   for kf in range(min(n_keyframes, len(tags_per_kf))):
     det = next((d for d in tags_per_kf[kf] if d.tag_id == finger_tag_id), None)
     if det is None:
       continue
     pixels = np.asarray(det.corners, dtype=np.float64)
-    bearing = mei_unproject(
-      np.asarray(det.center, dtype=np.float64).reshape(1, 2), lens.params
-    )[0]
+    bearing = tag_center_bearing(det, lens.params)
     theta = _seed_theta(
       pixels, corners_in_pivot, body_T_joint_seed, lens, joint.lower, joint.upper
     )
