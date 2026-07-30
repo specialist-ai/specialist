@@ -6,7 +6,7 @@ runs independently."""
 from __future__ import annotations
 
 import os
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TypeVar
@@ -16,6 +16,7 @@ import numpy as np
 import numpy.typing as npt
 
 Float64Array = npt.NDArray[np.float64]
+_FlowPair = tuple[npt.NDArray[np.float32], npt.NDArray[np.float32]]
 _R = TypeVar("_R")
 
 __all__ = [
@@ -109,26 +110,19 @@ def _flow_chunk_size(frames: list[np.ndarray]) -> int:
   return max(1, min(n - 1, chunk))
 
 
-def _precompute_dis_flows(
+def _iter_dis_flows(
   frames: list[np.ndarray],
-  ks: range | None = None,
-) -> dict[int, tuple[npt.NDArray[np.float32], npt.NDArray[np.float32]]]:
-  """Forward+backward DIS flow for the consecutive pairs ``ks`` (each ``k`` is the
-  pair ``(k-1, k)``; default = every pair), computed in parallel. Each pair's flow
-  depends only on its two frames — not on the sequential track propagation that
-  consumes it — so this is bit-identical to per-pair serial ``dis.calc`` (a fresh
-  ``DISOpticalFlow`` with no warm-start flow carries no cross-call state); the
-  parallelism just keeps the cores busy. Callers request bounded chunks (see
-  ``_flow_chunk_size``) so the cached fields do not exhaust RAM."""
-  if ks is None:
-    ks = range(1, len(frames))
+  ks: range,
+) -> Iterator[tuple[int, _FlowPair]]:
+  """Yield ``(k, (forward, backward))`` DIS flow for the consecutive pairs
+  ``ks`` (each ``k`` is the pair ``(k-1, k)``) in order, computed on a worker
+  pool that runs ahead of the consumer. Callers request bounded chunks (see
+  ``_flow_chunk_size``) so the buffered fields do not exhaust RAM."""
   pair_ks = list(ks)
   if not pair_ks:
-    return {}
+    return
 
-  def calc_pair(
-    k: int,
-  ) -> tuple[npt.NDArray[np.float32], npt.NDArray[np.float32]]:
+  def calc_pair(k: int) -> _FlowPair:
     dis = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_MEDIUM)  # type: ignore[attr-defined]
     prev = np.ascontiguousarray(frames[k - 1])
     cur = np.ascontiguousarray(frames[k])
@@ -144,7 +138,14 @@ def _precompute_dis_flows(
   cv2.setNumThreads(max(n_cpu // 8, min(n_cpu, 32)))
   workers = max(1, n_cpu // 16 // _PRECOMPUTE_CONCURRENCY)
   with ThreadPoolExecutor(max_workers=workers) as executor:
-    return dict(zip(pair_ks, executor.map(calc_pair, pair_ks), strict=True))
+    yield from zip(pair_ks, executor.map(calc_pair, pair_ks), strict=True)
+
+
+def _precompute_dis_flows(
+  frames: list[np.ndarray],
+) -> dict[int, _FlowPair]:
+  """Forward+backward DIS flow for every consecutive pair, fully materialized."""
+  return dict(_iter_dis_flows(frames, range(1, len(frames))))
 
 
 def _in_bounds(xy: Float64Array, h: int, w: int) -> npt.NDArray[np.bool_]:
@@ -200,24 +201,27 @@ def dis_flow_track(
   if not frames:
     return [], []
 
-  # Precompute each consecutive pair's flow in parallel, in RAM-bounded chunks
-  # (see _flow_chunk_size); the loop below just samples the cached fields. Each
-  # pair's flow is independent of the sequential propagation, so this stays
-  # bit-identical (the precompute also sets the cv2 thread budget for the lighter
+  # Stream each consecutive pair's flow from a worker pool in RAM-bounded
+  # chunks (see _flow_chunk_size); the loop below samples pair ``k`` as soon as
+  # it is ready (the stream also sets the cv2 thread budget for the lighter
   # ops below).
   chunk_size = _flow_chunk_size(frames)
-  flows: dict[int, tuple[npt.NDArray[np.float32], npt.NDArray[np.float32]]] = {}
+  flow_stream: Iterator[tuple[int, _FlowPair]] = iter(())
+  chunk_end = 1
   per_frame_pts: list[list[np.ndarray]] = [[] for _ in frames]
   matches_between: list[npt.NDArray[np.int64]] = []
 
   for k, img in enumerate(frames):
     mask_k = None if masks is None else masks[k]
-    if k >= 1 and k not in flows:
-      flows = _precompute_dis_flows(frames, range(k, min(k + chunk_size, len(frames))))
+    if k >= 1:
+      if k >= chunk_end:
+        chunk_end = min(k + chunk_size, len(frames))
+        flow_stream = _iter_dis_flows(frames, range(k, chunk_end))
+      flow_k, (flow_fwd, flow_bwd) = next(flow_stream)
+      assert flow_k == k
 
     if k > 0 and per_frame_pts[k - 1]:
       prev_xy = np.asarray(per_frame_pts[k - 1], dtype=np.float64)
-      flow_fwd, flow_bwd = flows[k]
       disp_fwd = _bilinear_sample_flow(flow_fwd, prev_xy)
       nxt_xy = prev_xy + disp_fwd
       disp_bwd = _bilinear_sample_flow(flow_bwd, nxt_xy)

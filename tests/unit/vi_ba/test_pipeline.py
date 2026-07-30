@@ -9,12 +9,13 @@ import cv2
 import numpy as np
 import pytest
 
-from specialist.loader.mei_model import MeiParams, mei_project
+from specialist.loader.mei_model import MeiParams, mei_project, mei_unproject
 from specialist.vi_ba.pipeline import (
   capture_duration,
   decode_dual_keyframes,
   filter_tracks_by_parallax,
   probe_capture,
+  unproject_tracks,
 )
 
 
@@ -97,6 +98,43 @@ def test_rejects_negative_threshold() -> None:
   params = _params()
   with pytest.raises(ValueError):
     filter_tracks_by_parallax({}, params, min_parallax=-1.0)
+
+
+def test_unproject_tracks_batched_slices_match_per_track_scalar() -> None:
+  """Batching every track's pixels through one mei_unproject call and slicing
+  by span returns exactly what unprojecting each track alone would: the
+  per-track bearing rows are identical, kfs come back sorted, and tracks below
+  min_obs are dropped."""
+  params = _params()
+  tracks = {
+    7: {
+      2: np.array([120.0, 90.0]),
+      0: np.array([300.0, 310.0]),
+      1: np.array([50.0, 470.0]),
+    },
+    3: {5: np.array([460.0, 12.0]), 4: np.array([470.0, 495.0])},
+    9: {0: np.array([240.0, 240.0])},  # single obs -> below min_obs
+  }
+  out = {
+    tid: (kfs, bearings)
+    for tid, kfs, bearings in unproject_tracks(
+      tracks, params, min_obs=2, normalize=False
+    )
+  }
+  assert set(out) == {7, 3}  # the single-observation track is filtered out
+  for tid, (kfs, bearings) in out.items():
+    assert kfs == sorted(tracks[tid])  # observations returned in keyframe order
+    expected = mei_unproject(
+      np.asarray([tracks[tid][k] for k in kfs], dtype=np.float64), params
+    )
+    assert np.array_equal(bearings, expected)  # batched slice == scalar unproject
+
+
+def test_unproject_tracks_normalize_returns_unit_rows() -> None:
+  params = _params()
+  tracks = {1: {0: np.array([120.0, 90.0]), 1: np.array([300.0, 310.0])}}
+  [(_, _, bearings)] = list(unproject_tracks(tracks, params, min_obs=2, normalize=True))
+  assert np.allclose(np.linalg.norm(bearings, axis=1), 1.0)
 
 
 def _write_video(path: Path, n_frames: int, width: int, height: int) -> None:

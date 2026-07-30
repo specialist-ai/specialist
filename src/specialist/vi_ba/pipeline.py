@@ -3,6 +3,7 @@ decoding, per-lens visual frontend, and multi-view triangulation."""
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -37,6 +38,7 @@ __all__ = [
   "run_lens_frontend",
   "scaled_mei",
   "triangulate_lens",
+  "unproject_tracks",
 ]
 
 
@@ -273,17 +275,18 @@ def run_lens_frontend(
     n_features=cfg.n_features,
     masks=masks,
   )
-  filtered: list[np.ndarray] = []
-  for k in range(1, len(feature_frames)):
+
+  def ransac_pair(k: int) -> npt.NDArray[np.int64]:
     m = matches_between[k - 1]
     if m.shape[0] == 0:
-      filtered.append(np.empty((0, 2), dtype=np.int64))
-      continue
-    a, b = feature_frames[k - 1], feature_frames[k]
-    pts_a = a.keypoints[m[:, 0]]
-    pts_b = b.keypoints[m[:, 1]]
+      return np.empty((0, 2), dtype=np.int64)
+    pts_a = feature_frames[k - 1].keypoints[m[:, 0]]
+    pts_b = feature_frames[k].keypoints[m[:, 1]]
     bears_a = mei_unproject(pts_a, params)
     bears_b = mei_unproject(pts_b, params)
+    # The cv2 RNG is thread-local, so a per-pair seed keeps the RANSAC
+    # deterministic regardless of which worker draws it.
+    cv2.setRNGSeed(k)
     inliers = essential_ransac_inliers(
       pts_a,
       pts_b,
@@ -293,7 +296,9 @@ def run_lens_frontend(
       fx=params.fx,
       max_half_angle=cfg.max_half_angle,
     )
-    filtered.append(m[inliers])
+    return np.asarray(m[inliers], dtype=np.int64)
+
+  filtered = parallel_map(ransac_pair, range(1, len(feature_frames)))
   tracks = chain_tracks(feature_frames, filtered)
   n_kp = sum(int(len(f.keypoints)) for f in feature_frames)
   n_match = sum(int(m.shape[0]) for m in matches_between)
@@ -303,6 +308,34 @@ def run_lens_frontend(
     f"ransac_inliers={n_in} chained_tracks={len(tracks)}"
   )
   return feature_frames, tracks
+
+
+def unproject_tracks(
+  tracks: dict[int, dict[int, Float64Array]],
+  params: MeiParams,
+  min_obs: int,
+  normalize: bool,
+) -> Iterator[tuple[int, list[int], Float64Array]]:
+  """Yield ``(tid, sorted kfs, bearings)`` for each track with at least
+  ``min_obs`` observations. Unprojection is row-wise, so every track's
+  observations go through one batched ``mei_unproject`` call and each track
+  gets back its slice; ``normalize`` unit-normalizes the bearing rows."""
+  spans: list[tuple[int, list[int], int, int]] = []
+  flat_pixels: list[Float64Array] = []
+  for tid, obs in tracks.items():
+    if len(obs) < min_obs:
+      continue
+    kfs = sorted(obs)
+    start = len(flat_pixels)
+    flat_pixels.extend(obs[k] for k in kfs)
+    spans.append((tid, kfs, start, len(flat_pixels)))
+  if not spans:
+    return
+  bearings = mei_unproject(np.asarray(flat_pixels, dtype=np.float64), params)
+  if normalize:
+    bearings = unit_rows(bearings)
+  for tid, kfs, start, end in spans:
+    yield tid, kfs, bearings[start:end]
 
 
 def filter_tracks_by_parallax(
@@ -317,18 +350,13 @@ def filter_tracks_by_parallax(
     raise ValueError(f"min_parallax must be ≥ 0, got {min_parallax}")
   cos_min = float(np.cos(min_parallax))
   kept: dict[int, dict[int, Float64Array]] = {}
-  rejected: dict[int, dict[int, Float64Array]] = {}
-  for tid, obs in tracks.items():
-    if len(obs) < 2:
-      rejected[tid] = obs
-      continue
-    pixels = np.stack([obs[k] for k in sorted(obs)])
-    bearings = unit_rows(mei_unproject(pixels, params))
+  rejected = {tid: obs for tid, obs in tracks.items() if len(obs) < 2}
+  for tid, _, bearings in unproject_tracks(tracks, params, min_obs=2, normalize=True):
     dots = np.clip(bearings @ bearings.T, -1.0, 1.0)
     if float(dots.min()) <= cos_min:
-      kept[tid] = obs
+      kept[tid] = tracks[tid]
     else:
-      rejected[tid] = obs
+      rejected[tid] = tracks[tid]
   return kept, rejected
 
 
@@ -355,13 +383,11 @@ def triangulate_lens(
     [np.asarray(pose.translation(), dtype=np.float64) for pose in lens_poses]
   )
   out: dict[int, Float64Array] = {}
-  for tid, obs in tracks.items():
-    if len(obs) < min_track_length:
-      continue
-    kfs = sorted(obs)
-    pixels = np.stack([obs[k] for k in kfs])
+  for tid, kfs, bearings in unproject_tracks(
+    tracks, params, min_obs=min_track_length, normalize=False
+  ):
     xyz = triangulate_track_multiview(
-      mei_unproject(pixels, params),
+      bearings,
       lens_rotations[kfs],
       lens_centers[kfs],
       min_landmark_depth=min_landmark_depth,
