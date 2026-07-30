@@ -1574,6 +1574,12 @@ def main(args: Args) -> None:
   else:
     with ThreadPoolExecutor(max_workers=len(specs)) as prep_pool:
       trackers = list(prep_pool.map(_prep_one, specs))
+  # Flow is finished; release the per-stream GPU workers so the linear solver has
+  # device memory for the joint bundle adjustment. A no-op on the cv2 path (no
+  # stream ever primed).
+  from specialist.vi_ba import gpu_flow
+
+  gpu_flow.shutdown()
   mark("trackers prepared")
 
   ref_anchor = _align_to_shared_world(trackers, args.anchor.tag_ids)

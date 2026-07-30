@@ -5,7 +5,9 @@ runs independently."""
 
 from __future__ import annotations
 
+import functools
 import os
+import time
 from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -93,6 +95,13 @@ def set_precompute_concurrency(n: int) -> None:
   _PRECOMPUTE_CONCURRENCY = max(1, n)
 
 
+def _cv2_thread_budget() -> int:
+  """Per-lens cap for cv2's process-global pool, low enough that concurrent lens
+  streams do not oversubscribe the cores."""
+  n_cpu = os.cpu_count() or 32
+  return max(n_cpu // 8, min(n_cpu, 32))
+
+
 def _flow_chunk_size(frames: list[np.ndarray]) -> int:
   """How many consecutive flow pairs to precompute and hold at once, bounded so
   the cached fields fit a fraction of RAM. Each pair holds forward+backward
@@ -135,7 +144,7 @@ def _iter_dis_flows(
   # A single DIS.calc saturates ~32 threads; concurrent calls only help when
   # there are cores to spare. Thread and worker counts never change the output.
   n_cpu = os.cpu_count() or 32
-  cv2.setNumThreads(max(n_cpu // 8, min(n_cpu, 32)))
+  cv2.setNumThreads(_cv2_thread_budget())
   workers = max(1, n_cpu // 16 // _PRECOMPUTE_CONCURRENCY)
   with ThreadPoolExecutor(max_workers=workers) as executor:
     yield from zip(pair_ks, executor.map(calc_pair, pair_ks), strict=True)
@@ -146,6 +155,41 @@ def _precompute_dis_flows(
 ) -> dict[int, _FlowPair]:
   """Forward+backward DIS flow for every consecutive pair, fully materialized."""
   return dict(_iter_dis_flows(frames, range(1, len(frames))))
+
+
+_FlowIter = Callable[[list[np.ndarray], range], Iterator[tuple[int, _FlowPair]]]
+
+
+def _select_flow_iter(frames: list[np.ndarray], gpu: bool) -> _FlowIter:
+  """Pick the flow backend once per lens: the GPU wavefront when requested and
+  runnable, else the cv2 path. Both yield the identical
+  ``(k, (forward, backward))`` stream."""
+  if not gpu:
+    return _iter_dis_flows
+  try:
+    from specialist.vi_ba import gpu_flow
+
+    reason = gpu_flow.unavailable_reason()
+    if reason is not None:
+      raise RuntimeError(reason)
+    begin = time.perf_counter()
+    engine = gpu_flow.prime(
+      frames, _DIS_VARIATIONAL_ITERS, _DIS_BACKWARD_VARIATIONAL_ITERS
+    )
+    print(
+      f"  [flow] GPU DIS backend: cuda:{engine.device_index}, "
+      f"{engine.batch} pairs/window, kernels warmed in "
+      f"{time.perf_counter() - begin:.1f}s",
+      flush=True,
+    )
+
+    # The GPU path never runs ``_iter_dis_flows``, which is where the cv2 path
+    # bounds cv2's process-global pool.
+    cv2.setNumThreads(_cv2_thread_budget())
+    return functools.partial(gpu_flow.iter_flows, engine)
+  except Exception as exc:
+    print(f"  [flow] GPU DIS unavailable ({exc}); using cv2 DIS", flush=True)
+    return _iter_dis_flows
 
 
 def _in_bounds(xy: Float64Array, h: int, w: int) -> npt.NDArray[np.bool_]:
@@ -191,6 +235,7 @@ def dis_flow_track(
   min_distance: float = 8.0,
   quality_level: float = 0.01,
   redetect_ratio: float = 0.5,
+  gpu_flow: bool = False,
 ) -> tuple[list[Frame], list[npt.NDArray[np.int64]]]:
   """Sparse-track propagation via DIS dense optical flow: Shi-Tomasi seeding
   with redetect, and a per-pair propagation step that samples the dense flow
@@ -201,14 +246,20 @@ def dis_flow_track(
   if not frames:
     return [], []
 
-  # Stream each consecutive pair's flow from a worker pool in RAM-bounded
+  # Stream each consecutive pair's flow from the chosen backend in RAM-bounded
   # chunks (see _flow_chunk_size); the loop below samples pair ``k`` as soon as
   # it is ready (the stream also sets the cv2 thread budget for the lighter
   # ops below).
+  flow_iter = _select_flow_iter(frames, gpu_flow)
+  backend = "cv2" if flow_iter is _iter_dis_flows else "gpu"
+  flow_begin = time.perf_counter()
   chunk_size = _flow_chunk_size(frames)
   flow_stream: Iterator[tuple[int, _FlowPair]] = iter(())
   chunk_end = 1
-  per_frame_pts: list[list[np.ndarray]] = [[] for _ in frames]
+  # Each frame's active points live as one packed ``(N, 2)`` float64 array so the
+  # per-pair bilinear sampling, forward-backward gate, and cornerSubPix re-snap all
+  # run on contiguous buffers without materialising per-point Python objects.
+  per_frame_pts: list[Float64Array] = [np.empty((0, 2)) for _ in frames]
   matches_between: list[npt.NDArray[np.int64]] = []
 
   for k, img in enumerate(frames):
@@ -216,12 +267,12 @@ def dis_flow_track(
     if k >= 1:
       if k >= chunk_end:
         chunk_end = min(k + chunk_size, len(frames))
-        flow_stream = _iter_dis_flows(frames, range(k, chunk_end))
+        flow_stream = flow_iter(frames, range(k, chunk_end))
       flow_k, (flow_fwd, flow_bwd) = next(flow_stream)
       assert flow_k == k
 
-    if k > 0 and per_frame_pts[k - 1]:
-      prev_xy = np.asarray(per_frame_pts[k - 1], dtype=np.float64)
+    if k > 0 and per_frame_pts[k - 1].shape[0]:
+      prev_xy = per_frame_pts[k - 1]
       disp_fwd = _bilinear_sample_flow(flow_fwd, prev_xy)
       nxt_xy = prev_xy + disp_fwd
       disp_bwd = _bilinear_sample_flow(flow_bwd, nxt_xy)
@@ -233,15 +284,15 @@ def dis_flow_track(
       if mask_k is not None:
         ok &= _mask_ok(nxt_xy, mask_k)
       sel = np.where(ok)[0]
-      per_frame_pts[k] = list(nxt_xy[sel])
+      per_frame_pts[k] = nxt_xy[sel]
       matches_between.append(
         np.column_stack([sel, np.arange(sel.size)]).astype(np.int64)
       )
     elif k > 0:
       matches_between.append(np.empty((0, 2), dtype=np.int64))
 
-    if per_frame_pts[k]:
-      pts_subpix = np.asarray(per_frame_pts[k], dtype=np.float32).reshape(-1, 1, 2)
+    if per_frame_pts[k].shape[0]:
+      pts_subpix = per_frame_pts[k].astype(np.float32).reshape(-1, 1, 2)
       cv2.cornerSubPix(
         img,
         pts_subpix,
@@ -249,9 +300,9 @@ def dis_flow_track(
         zeroZone=(-1, -1),
         criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 20, 0.03),
       )
-      per_frame_pts[k] = list(pts_subpix.reshape(-1, 2).astype(np.float64))
+      per_frame_pts[k] = pts_subpix.reshape(-1, 2).astype(np.float64)
 
-    n_active = len(per_frame_pts[k])
+    n_active = per_frame_pts[k].shape[0]
     need_redetect = k == 0 or n_active < int(round(redetect_ratio * n_features))
     if need_redetect:
       if mask_k is None:
@@ -273,12 +324,18 @@ def dis_flow_track(
         quality_level=quality_level,
         min_distance=min_distance,
       )
-      for p in new_corners:
-        per_frame_pts[k].append(p.copy())
+      if new_corners.shape[0]:
+        per_frame_pts[k] = np.vstack([per_frame_pts[k], new_corners])
+
+  print(
+    f"  [flow] {backend} DIS tracked {len(frames)} frames in "
+    f"{time.perf_counter() - flow_begin:.1f}s",
+    flush=True,
+  )
 
   frames_out: list[Frame] = []
   for pts in per_frame_pts:
-    kps = np.asarray(pts, dtype=np.float64) if pts else np.empty((0, 2))
+    kps = pts if pts.shape[0] else np.empty((0, 2))
     frames_out.append(
       Frame(
         keypoints=kps,

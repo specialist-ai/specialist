@@ -1,0 +1,393 @@
+"""GPU (PyTorch) optical-flow backend for the DIS frontend.
+
+Drop-in replacement for ``features._iter_dis_flows``: yields the same
+``(k, (forward, backward))`` stream of ``(H, W, 2)`` float32 fields, computed on
+the GPU with the fast propagation-ON anti-diagonal wavefront
+(``gpu_dis.torch_dis_prop_fast``), one Triton launch per diagonal. Each lens
+stream is handed its own GPU. Pairs are computed in memory-sized batches; frame
+uploads and flow downloads move through page-locked host buffers with
+non-blocking copies.
+
+torch ships in the optional ``gpu`` extra, so it is imported lazily; ``available``
+reports whether the backend can run and the caller (``features.dis_flow_track``)
+falls back to the cv2 path loudly when it cannot.
+"""
+
+from __future__ import annotations
+
+import os
+import queue
+import threading
+from typing import Any, Iterator
+
+import numpy as np
+import numpy.typing as npt
+
+_FlowPair = tuple[npt.NDArray[np.float32], npt.NDArray[np.float32]]
+
+__all__ = ["unavailable_reason", "prime", "iter_flows", "shutdown"]
+
+# Per-stream batch. Each batch of B pairs holds the fast wavefront's transient
+# working set at the native 2880x2880 lens resolution; the forward (vr=10) and
+# backward (vr=2) passes run in turn, so the peak is a single pass, budgeted at
+# ~1.15 GB/pair. The batch is sized from mem_get_info free memory: _GB_PER_PAIR is
+# the budgeted per-pair transient, _RESERVE_GB is headroom for the fixed CUDA
+# context plus upload/download staging, and a GPU under _MIN_FREE_GB is skipped. A
+# stream that OOMs while warming halves its batch and retries. expandable_segments
+# keeps the transient allocations from fragmenting.
+_MAX_BATCH = int(os.environ.get("GPUFLOW_MAX_BATCH", "24"))
+_MIN_FREE_GB = 8.0
+_RESERVE_GB = 3.0
+_GB_PER_PAIR = 1.15
+
+# Distinct GPUs one process will claim; past the cap, extra streams double up
+# on the most-free GPU.
+_MAX_GPUS = int(os.environ.get("GPUFLOW_MAX_GPUS", "8"))
+
+# Page-locked host staging + non-blocking copies make the H2D upload and the
+# (dominant) D2H flow download move at pinned bandwidth without blocking the
+# host. Off restores the plain pageable path for A/B measurement.
+_PINNED = os.environ.get("GPUFLOW_PINNED", "1") != "0"
+
+_claim_lock = threading.Lock()
+_backend: tuple[Any, Any] | None = None
+_claimed: dict[int, int] = {}  # device_index -> streams assigned in this process
+_bad: set[int] = set()  # GPUs that failed to warm (shared-box context errors)
+_engines: list["_Engine"] = []
+
+
+def _import_backend() -> tuple[Any, Any]:
+  """Import torch and the vendored fast wavefront. Cached; raises ImportError
+  when torch is not installed (the ``gpu`` extra)."""
+  global _backend
+  if _backend is not None:
+    return _backend
+  # Must be set before torch initializes its CUDA allocator.
+  os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+  import torch
+  import torch._dynamo
+
+  # Dynamo guards on the tensor's device index, so a distinct compiled variant
+  # is cached per GPU; the default recompile limit is too low for one stream per
+  # GPU and dynamo would bail to the eager path.
+  for attr in ("recompile_limit", "cache_size_limit", "accumulated_recompile_limit"):
+    if hasattr(torch._dynamo.config, attr):
+      setattr(torch._dynamo.config, attr, 256)
+
+  from specialist.vi_ba.gpu_dis.torch_dis_prop_fast import TorchDISBatchedPropFast
+
+  _backend = (torch, TorchDISBatchedPropFast)
+  return _backend
+
+
+def _device_batch(free_gb: float) -> int:
+  """Largest per-stream batch that fits ``free_gb`` of free memory, capped."""
+  batch = int((free_gb - _RESERVE_GB) / _GB_PER_PAIR)
+  return max(0, min(_MAX_BATCH, batch))
+
+
+def _free_gb(torch: Any, i: int) -> float:
+  return float(torch.cuda.mem_get_info(i)[0]) / 2**30
+
+
+def unavailable_reason() -> str | None:
+  """``None`` when torch imports and a GPU has room to run, else why it cannot."""
+  try:
+    torch = _import_backend()[0]
+  except ImportError as exc:
+    return f"{exc} (install the 'gpu' extra)"
+  except Exception as exc:  # a broken CUDA install must not break the cv2 path
+    return f"torch failed to import: {exc!r}"
+  try:
+    if not torch.cuda.is_available():
+      return "torch reports no CUDA device"
+    for i in range(torch.cuda.device_count()):
+      free = _free_gb(torch, i)
+      if free >= _MIN_FREE_GB and _device_batch(free) >= 1:
+        return None
+    return "no GPU has enough free memory"
+  except Exception as exc:
+    return f"CUDA probe failed: {exc!r}"
+
+
+def _claim_device() -> tuple[int, int]:
+  """Assign this stream a GPU and its batch: the most-free GPU not yet claimed in
+  this process, or (all claimed / capped) the most-free GPU overall, doubling up.
+  Raises when no GPU can host even one pair."""
+  torch = _import_backend()[0]
+  if not torch.cuda.is_available():
+    raise RuntimeError("CUDA not available")
+  with _claim_lock:
+    free = {
+      i: _free_gb(torch, i) for i in range(torch.cuda.device_count()) if i not in _bad
+    }
+    unclaimed = [
+      i
+      for i in free
+      if i not in _claimed and free[i] >= _MIN_FREE_GB and _device_batch(free[i]) >= 1
+    ]
+    if unclaimed and len(_claimed) < _MAX_GPUS:
+      idx = max(unclaimed, key=lambda i: free[i])
+      _claimed[idx] = 1
+      return idx, _device_batch(free[idx])
+    shareable = [i for i in free if _device_batch(free[i]) >= 1]
+    if not shareable:
+      raise RuntimeError("no GPU has enough free memory for the flow backend")
+    idx = max(shareable, key=lambda i: free[i])
+    _claimed[idx] = _claimed.get(idx, 0) + 1
+    return idx, _device_batch(free[idx])
+
+
+def _drop_claim(idx: int) -> None:
+  """Release this stream's claim on ``idx`` and mark the GPU bad."""
+  with _claim_lock:
+    _bad.add(idx)
+    count = _claimed.get(idx, 0) - 1
+    if count <= 0:
+      _claimed.pop(idx, None)
+    else:
+      _claimed[idx] = count
+
+
+class _Worker(threading.Thread):
+  """One GPU stream: owns a forward (``fwd_vr``) and backward (``bwd_vr``) fast
+  DIS instance plus page-locked staging buffers, and computes memory-sized
+  batches of pair flows off a private job queue."""
+
+  def __init__(self, device_index: int, batch: int, fwd_vr: int, bwd_vr: int):
+    super().__init__(daemon=True)
+    self.device_index = device_index
+    self.batch = batch
+    self._fwd_vr = fwd_vr
+    self._bwd_vr = bwd_vr
+    self._jobs: queue.Queue[Any] = queue.Queue()
+    self._fwd_dis: Any = None
+    self._bwd_dis: Any = None
+    self._pinned = _PINNED
+    self._pin_prev: Any = None
+    self._pin_cur: Any = None
+    self._dev_prev: Any = None
+    self._dev_cur: Any = None
+    self._pin_down: Any = None
+    self.start()
+
+  @property
+  def ready(self) -> bool:
+    return self._fwd_dis is not None
+
+  def submit(self, job: Any) -> None:
+    self._jobs.put(job)
+
+  def run(self) -> None:
+    torch = _import_backend()[0]
+    torch.cuda.set_device(self.device_index)
+    while True:
+      job = self._jobs.get()
+      if job is None:
+        self._release()
+        return
+      frames, tile, result, error, done = job
+      try:
+        result.update(self._compute_tile(frames, tile))
+      except Exception as exc:  # surfaced to the dispatcher's caller
+        error.append(exc)
+      finally:
+        done.set()
+      # The finished job pins a window of flow fields and the lens's whole
+      # frame list; an idle worker would hold them until shutdown.
+      del job, frames, tile, result, error, done
+
+  def _alloc_buffers(self, h: int, w: int) -> None:
+    """Allocate the page-locked host and device staging buffers for the batch.
+    One download buffer is reused for the forward then the backward field. Falls
+    back to the pageable path if the host cannot pin the memory."""
+    torch = _import_backend()[0]
+    dev = f"cuda:{self.device_index}"
+    b = self.batch
+    try:
+      self._pin_prev = torch.empty(b, 1, h, w, dtype=torch.uint8, pin_memory=True)
+      self._pin_cur = torch.empty(b, 1, h, w, dtype=torch.uint8, pin_memory=True)
+      self._pin_down = torch.empty(b, h, w, 2, dtype=torch.float32, pin_memory=True)
+    except RuntimeError:
+      self._pinned = False
+      self._pin_prev = self._pin_cur = self._pin_down = None
+      return
+    self._dev_prev = torch.empty(b, 1, h, w, dtype=torch.uint8, device=dev)
+    self._dev_cur = torch.empty(b, 1, h, w, dtype=torch.uint8, device=dev)
+
+  def _ensure(self, h: int, w: int) -> None:
+    if self._fwd_dis is not None:
+      return
+    torch, batched_cls = _import_backend()
+    dev = f"cuda:{self.device_index}"
+    torch.cuda.set_device(self.device_index)
+    while True:
+      try:
+        fwd = batched_cls(vr_iter=self._fwd_vr, device=dev)
+        bwd = batched_cls(vr_iter=self._bwd_vr, device=dev)
+        # Warm the Triton/Inductor kernels and prove the full batch fits; an
+        # OOM here halves the batch. The compile is thread-safe, so the streams
+        # warm concurrently.
+        blank = torch.zeros(self.batch, 1, h, w, device=dev)
+        fwd.calc(blank, blank)
+        bwd.calc(blank, blank)
+        torch.cuda.synchronize(self.device_index)
+        self._fwd_dis, self._bwd_dis = fwd, bwd
+        if self._pinned:
+          self._alloc_buffers(h, w)
+        return
+      except torch.cuda.OutOfMemoryError:
+        self._fwd_dis = self._bwd_dis = None
+        torch.cuda.empty_cache()
+        if self.batch <= 1:
+          raise
+        self.batch = max(1, self.batch // 2)
+
+  def _compute_tile(
+    self, frames: list[np.ndarray], tile: list[int]
+  ) -> dict[int, _FlowPair]:
+    torch = _import_backend()[0]
+    h, w = frames[tile[0]].shape[:2]
+    self._ensure(h, w)
+    n = len(tile)
+    if not self._pinned:
+      dev = f"cuda:{self.device_index}"
+      prev = torch.from_numpy(np.stack([frames[k - 1] for k in tile])).to(dev)
+      cur = torch.from_numpy(np.stack([frames[k] for k in tile])).to(dev)
+      fwd = self._fwd_dis.calc(prev, cur).to("cpu", torch.float32).numpy()
+      bwd = self._bwd_dis.calc(cur, prev).to("cpu", torch.float32).numpy()
+      return {k: (fwd[j].copy(), bwd[j].copy()) for j, k in enumerate(tile)}
+
+    prev_np = self._pin_prev.numpy()
+    cur_np = self._pin_cur.numpy()
+    for j, k in enumerate(tile):
+      prev_np[j, 0] = frames[k - 1]
+      cur_np[j, 0] = frames[k]
+    # Upload once (prev, cur); the forward and backward passes reuse both.
+    self._dev_prev[:n].copy_(self._pin_prev[:n], non_blocking=True)
+    self._dev_cur[:n].copy_(self._pin_cur[:n], non_blocking=True)
+    down = self._pin_down.numpy()  # view over the reused download buffer
+    fwd_out = self._fwd_dis.calc(self._dev_prev[:n], self._dev_cur[:n])
+    self._pin_down[:n].copy_(fwd_out, non_blocking=True)
+    torch.cuda.synchronize(self.device_index)
+    fwd_fields = [down[j].copy() for j in range(n)]
+    bwd_out = self._bwd_dis.calc(self._dev_cur[:n], self._dev_prev[:n])
+    self._pin_down[:n].copy_(bwd_out, non_blocking=True)
+    torch.cuda.synchronize(self.device_index)
+    return {k: (fwd_fields[j], down[j].copy()) for j, k in enumerate(tile)}
+
+  def _release(self) -> None:
+    torch = _import_backend()[0]
+    self._fwd_dis = self._bwd_dis = None
+    self._pin_prev = self._pin_cur = self._pin_down = None
+    self._dev_prev = self._dev_cur = None
+    try:
+      torch.cuda.empty_cache()
+    except Exception:
+      pass
+
+
+class _Engine:
+  """One lens stream bound to one GPU: a single worker and the batched dispatch
+  over it."""
+
+  def __init__(self, fwd_vr: int, bwd_vr: int):
+    self.device_index, batch = _claim_device()
+    self._worker = _Worker(self.device_index, batch, fwd_vr, bwd_vr)
+
+  @property
+  def batch(self) -> int:
+    return self._worker.batch
+
+  def prime(self, frames: list[np.ndarray]) -> None:
+    """Warm the worker's kernels against ``frames``' shape (warmup pair k=1).
+    Raises when the GPU cannot run so the caller can fall back to cv2."""
+    error: list[Exception] = []
+    done = threading.Event()
+    self._worker.submit((frames, [1], {}, error, done))
+    done.wait()
+    if error or not self._worker.ready:
+      raise RuntimeError(
+        f"GPU {self.device_index} failed to warm the flow backend: {error[0]!r}"
+        if error
+        else f"GPU {self.device_index} failed to warm the flow backend"
+      )
+
+  def iter_flows(
+    self, frames: list[np.ndarray], ks: range
+  ) -> Iterator[tuple[int, _FlowPair]]:
+    pair_ks = list(ks)
+    worker = self._worker
+    windows = [
+      pair_ks[s : s + worker.batch] for s in range(0, len(pair_ks), worker.batch)
+    ]
+
+    def submit(
+      chunk: list[int],
+    ) -> tuple[list[int], dict[int, _FlowPair], list[Exception], threading.Event]:
+      result: dict[int, _FlowPair] = {}
+      error: list[Exception] = []
+      done = threading.Event()
+      worker.submit((frames, chunk, result, error, done))
+      return chunk, result, error, done
+
+    # Keep one window in flight: the worker computes the next while the caller
+    # consumes this one.
+    inflight = submit(windows[0]) if windows else None
+    for i in range(len(windows)):
+      assert inflight is not None  # windows[i] was submitted on the prior iteration
+      chunk, result, error, done = inflight
+      inflight = submit(windows[i + 1]) if i + 1 < len(windows) else None
+      done.wait()
+      if error:
+        raise error[0]
+      for k in chunk:  # ascending, matching the cv2 stream order
+        yield k, result[k]
+
+  def shutdown(self) -> None:
+    self._worker.submit(None)
+    self._worker.join(timeout=30.0)
+
+
+def prime(frames: list[np.ndarray], fwd_vr: int, bwd_vr: int) -> _Engine:
+  """Claim a GPU for this lens stream and warm its kernels for ``frames``'
+  shape. A GPU that fails to warm (a transient shared-box context error) is
+  marked bad and the next-most-free GPU is tried; raises only when no GPU can
+  run, so the caller can fall back to cv2."""
+  torch = _import_backend()[0]
+  tries = torch.cuda.device_count() if torch.cuda.is_available() else 1
+  last_exc: Exception | None = None
+  for _ in range(max(1, tries)):
+    engine = _Engine(fwd_vr, bwd_vr)  # raises when no GPU is claimable
+    try:
+      engine.prime(frames)
+    except Exception as exc:
+      last_exc = exc
+      _drop_claim(engine.device_index)
+      engine.shutdown()
+      continue
+    with _claim_lock:
+      _engines.append(engine)
+    return engine
+  raise last_exc or RuntimeError("no GPU could warm the flow backend")
+
+
+def iter_flows(
+  engine: _Engine, frames: list[np.ndarray], ks: range
+) -> Iterator[tuple[int, _FlowPair]]:
+  """Yield ``(k, (forward, backward))`` for the consecutive pairs ``ks`` in
+  order, matching ``features._iter_dis_flows``. ``engine`` comes from ``prime``."""
+  yield from engine.iter_flows(frames, ks)
+
+
+def shutdown() -> None:
+  """Release every stream's worker (frees GPU memory) and clear the per-process
+  GPU claims. A no-op when no stream ever primed."""
+  global _engines, _claimed, _bad
+  with _claim_lock:
+    engines = _engines
+    _engines = []
+    _claimed = {}
+    _bad = set()
+  for engine in engines:
+    engine.shutdown()

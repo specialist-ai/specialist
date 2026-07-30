@@ -14,6 +14,9 @@ import numpy as np
 @dataclass
 class FrontendCfg:
   orb_n_features: int = 1000
+  # Compute the DIS optical flow on the GPU; falls back loudly to the cv2 path
+  # when torch/CUDA is unavailable.
+  gpu_flow: bool = True
   ransac_threshold: float = 4.5
   min_track_length: int = 3
   max_half_angle: float = float(np.deg2rad(70.0))
