@@ -2,12 +2,14 @@
 
 Audio-syncs N ``.insv`` captures via clap detection (no-op for N=1),
 runs the per-tracker prep (decode → frontend → anchor PnP → VI
-alignment), aligns every tracker into the first one's anchor world,
-allocates collision-free GTSAM keys via ``TrackerKeys``, builds
-one VI subgraph per tracker, then adds:
+alignment), aligns every tracker into the reference anchor's world
+(through any co-sighted anchor), allocates collision-free GTSAM keys via
+``TrackerKeys``, builds one VI subgraph per tracker, then adds:
 
-- Anchor obs: every tracker sees the wall AprilTag; reprojecting its four
-  metric corners pins the trajectory's absolute scale.
+- Anchor obs: reprojecting the reference anchor tag's four metric corners
+  pins the trajectory's absolute scale; each additional static anchor is
+  corner-reprojected from every sighting at a world pose seeded from the
+  prep and re-estimated after the solve as a consistency check.
 - Base + finger tags: each tracker's base and finger tags reproject through one
   shared base-tag pose variable, recovering the finger joint angles.
 - Cross-tracker obs (N ≥ 2): when tracker O sees tracker W's base tag,
@@ -19,6 +21,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import itertools
 import json
 import pickle
 import time
@@ -45,8 +48,8 @@ from specialist.vi_ba.build import (
   add_mei_base_tag_factor,
   add_mei_cross_finger_factor,
   add_mei_cross_tag_factor,
-  add_mei_factor,
   add_mei_finger_factor,
+  add_mei_world_point_factor,
   build_vi_graph,
   huber_pixel_noise,
 )
@@ -71,6 +74,11 @@ from specialist.vi_ba.single_tracker import (
 from specialist.vi_ba.viz import TrackerVizData, log_multi_ba_run
 
 Float64Array = npt.NDArray[np.float64]
+
+# Within-take consistency thresholds: the post-solve anchor re-estimate should
+# agree with the pinned seed; larger motion flags weak sighting geometry.
+_ANCHOR_CONSISTENCY_TRANS = 5e-3
+_ANCHOR_CONSISTENCY_ROT = float(np.radians(0.2))
 
 
 def _lens_bearing(det: TagDetection, lens: LensSetup) -> Float64Array:
@@ -137,6 +145,31 @@ def _derive_names(
   return tuple(f"tracker_{i}" for i in range(len(input_insvs)))
 
 
+def _validate_tag_id_disjointness(args: Args) -> None:
+  """Anchor, base, and nonzero finger tag ids must be pairwise disjoint: a
+  shared id would let one physical tag enter the graph as two different
+  factor kinds."""
+  groups = (
+    ("--anchor.tag-ids", set(args.anchor.enabled_tag_ids)),
+    ("--base-tag-ids", {int(i) for i in args.base_tag_ids}),
+    (
+      "--left/right-finger-tag-ids",
+      {
+        int(i)
+        for i in (*args.left_finger_tag_ids, *args.right_finger_tag_ids)
+        if int(i) > 0
+      },
+    ),
+  )
+  for (name_a, ids_a), (name_b, ids_b) in itertools.combinations(groups, 2):
+    overlap = ids_a & ids_b
+    if overlap:
+      raise ValueError(
+        f"tag ids {sorted(overlap)} appear in both {name_a} and "
+        f"{name_b}; anchor, base, and finger tags must be disjoint"
+      )
+
+
 def _audio_align_starts(
   input_insvs: tuple[Path, ...], master_start: float
 ) -> tuple[list[float], list[float]]:
@@ -165,27 +198,70 @@ def _audio_align_starts(
   return starts, offsets
 
 
-def _align_to_shared_world(trackers: list[PreparedTracker]) -> gtsam.Pose3:
-  """Transform every tracker's body poses, velocities, and landmarks so all
-  trackers' anchor obs reproduce the first anchor-observing tracker's
-  anchor world. Returns that shared anchor pose."""
+def _bfs_world_alignments(
+  anchor_locals_by_tracker: dict[str, dict[int, gtsam.Pose3]],
+  anchor_tag_ids: tuple[int, ...],
+) -> tuple[dict[str, gtsam.Pose3], dict[int, gtsam.Pose3]]:
+  """Per-tracker world-alignment transforms via BFS over the tracker-anchor
+  co-visibility graph, rooted at the reference anchor (first id). Returns
+  ``({tracker: align}, {tag_id: world_T_anchor})``; raises when a tracker
+  cannot reach the shared world."""
+  ref_tag_id = anchor_tag_ids[0]
   ref = next(
-    (t.anchor_local for t in trackers if t.anchor_local is not None),
+    (
+      locals_[ref_tag_id]
+      for locals_ in anchor_locals_by_tracker.values()
+      if ref_tag_id in locals_
+    ),
     None,
   )
   if ref is None:
-    raise RuntimeError("no tracker observes the anchor; cannot share a world")
+    raise RuntimeError("no tracker observes the reference anchor; cannot share a world")
+  world_T_anchor: dict[int, gtsam.Pose3] = {ref_tag_id: ref}
+  aligns: dict[str, gtsam.Pose3] = {}
+  pending = list(anchor_locals_by_tracker)
+  while pending:
+    aligned_now: list[str] = []
+    for name in pending:
+      locals_ = anchor_locals_by_tracker[name]
+      via = next(
+        (a for a in anchor_tag_ids if a in world_T_anchor and a in locals_), None
+      )
+      if via is None:
+        continue
+      align = world_T_anchor[via].compose(locals_[via].inverse())
+      aligns[name] = align
+      for tag_id, local in locals_.items():
+        if tag_id not in world_T_anchor:
+          world_T_anchor[tag_id] = align.compose(local)
+      aligned_now.append(name)
+    if not aligned_now:
+      raise RuntimeError(
+        f"trackers {pending} sight no anchor with an established world pose "
+        f"(established anchors: {sorted(world_T_anchor)}); the tracker-anchor "
+        f"co-visibility graph is disconnected"
+      )
+    pending = [n for n in pending if n not in aligned_now]
+  return aligns, world_T_anchor
+
+
+def _align_to_shared_world(
+  trackers: list[PreparedTracker], anchor_tag_ids: tuple[int, ...]
+) -> gtsam.Pose3:
+  """Transform every tracker's body poses, velocities, and landmarks into the
+  shared world rooted at the reference anchor, connecting trackers through any
+  co-sighted anchor. Returns the reference anchor's shared-world pose."""
+  locals_by_tracker = {t.name: t.anchor_locals_by_tag for t in trackers}
+  aligns, world_T_anchor = _bfs_world_alignments(locals_by_tracker, anchor_tag_ids)
   for t in trackers:
-    if t.anchor_local is None:
-      continue
-    align = ref.compose(t.anchor_local.inverse())
+    align = aligns[t.name]
     align_R = align.rotation().matrix()
     align_t = np.asarray(align.translation(), dtype=np.float64)
     t.body_poses = [align.compose(p) for p in t.body_poses]
     t.velocities = [align_R @ v for v in t.velocities]
     t.front_points = {tid: align_R @ p + align_t for tid, p in t.front_points.items()}
     t.rear_points = {tid: align_R @ p + align_t for tid, p in t.rear_points.items()}
-  return ref
+  return world_T_anchor[anchor_tag_ids[0]]
 
 
 @dataclass(frozen=True)
@@ -324,33 +400,125 @@ def _anchor_sightings(
   return out
 
 
+def _sighting_bearing(
+  obs: dict[int, dict[str, gtsam.Pose3]],
+  kf: int,
+  side: str,
+  det: TagDetection,
+  lens: LensSetup,
+) -> Float64Array:
+  """Cheirality bearing: the PnP tag position when present, else the
+  detection-center ray."""
+  cam_T_tag = obs.get(kf, {}).get(side)
+  if cam_T_tag is None:
+    return _lens_bearing(det, lens)
+  return np.asarray(cam_T_tag.translation(), dtype=np.float64)
+
+
+def _anchored_keyframes(tracker: PreparedTracker) -> set[int]:
+  """Keyframes with a PnP sighting of any configured anchor; the smoothness
+  priors treat these as anchored."""
+  return set().union(*tracker.anchor_obs_by_tag.values())
+
+
+def _median_pose(poses: list[gtsam.Pose3]) -> gtsam.Pose3:
+  """Median of a list of poses: component-wise median of translations +
+  median log-rotation about the first sample. Robust to the occasional flipped
+  or degenerate PnP sighting among many agreeing ones."""
+  ref_rot = poses[0].rotation()
+  translations = np.stack(
+    [np.asarray(p.translation(), dtype=np.float64) for p in poses]
+  )
+  logs = np.stack([gtsam.Rot3.Logmap(ref_rot.between(p.rotation())) for p in poses])
+  delta = gtsam.Rot3.Expmap(np.median(logs, axis=0))
+  return gtsam.Pose3(
+    ref_rot.compose(delta), gtsam.Point3(*np.median(translations, axis=0))
+  )
+
+
+def _secondary_anchor_seed(
+  trackers: list[PreparedTracker],
+  tag_id: int,
+  body_poses_by_tracker: dict[str, list[gtsam.Pose3]] | None = None,
+) -> gtsam.Pose3 | None:
+  """Median of ``world_T_body(kf) ∘ body_T_lens ∘ cam_T_tag`` over every PnP
+  sighting, both lenses (solved poses when ``body_poses_by_tracker`` is
+  given). Seeding from sightings keeps the pose in front of its observers,
+  so the behind-camera guard stays inactive. ``None`` when unsighted."""
+  candidates: list[gtsam.Pose3] = []
+  for t in trackers:
+    poses = (
+      t.body_poses if body_poses_by_tracker is None else body_poses_by_tracker[t.name]
+    )
+    obs = t.anchor_obs_by_tag.get(tag_id, {})
+    for kf in sorted(obs):
+      sides = obs[kf]
+      for side, lens in (("front", t.front_lens), ("rear", t.rear_lens)):
+        cam_T_tag = sides.get(side)
+        if cam_T_tag is None:
+          continue
+        candidates.append(poses[kf].compose(lens.extrinsic).compose(cam_T_tag))
+  if not candidates:
+    return None
+  return _median_pose(candidates)
+
+
+def _add_anchor_corner_factors(
+  graph: gtsam.NonlinearFactorGraph,
+  trackers: list[PreparedTracker],
+  keys: TrackerKeys,
+  corner_noise: gtsam.noiseModel.Base,
+  tag_id: int,
+  corners_world: Float64Array,
+  pnp_bearings: bool,
+) -> int:
+  """Unary corner-reprojection factors for one anchor, every sighting by any
+  tracker and lens. ``pnp_bearings`` uses the PnP tag position as the
+  cheirality bearing (the reference anchor), else the detection-center ray.
+  Returns the sighting count."""
+  n_sightings = 0
+  for t in trackers:
+    obs = t.anchor_obs_by_tag.get(tag_id, {}) if pnp_bearings else {}
+    for lens, kf, det in _anchor_sightings(t, tag_id):
+      n_sightings += 1
+      pose_key = keys.pose_key(t.name, kf)
+      side = "front" if lens is t.front_lens else "rear"
+      bearing = _sighting_bearing(obs, kf, side, det, lens)
+      for corner_xyz, pixel in zip(corners_world, det.corners, strict=True):
+        add_mei_world_point_factor(
+          graph, pose_key, pixel, corner_noise, lens, corner_xyz, bearing
+        )
+  return n_sightings
+
+
 def _factor_observation_lines(
   observer: PreparedTracker,
   observer_poses: list[gtsam.Pose3],
   cross_obs_for_observer: list[_CrossSighting],
-  anchor_sightings: list[tuple[LensSetup, int, TagDetection]],
-  anchor_corners_world: Float64Array,
+  anchor_corners_by_tag: dict[int, Float64Array],
   base_tag_corners_world: dict[str, list[Float64Array]],
 ) -> tuple[list[Float64Array], list[Float64Array]]:
   """Per-keyframe ``(n, 2, 3)`` line endpoints for every factor that fires at
   the observer's keyframe. The anchor lines run from the observing lens centre
-  to each of the tag's four metric corner landmarks (the corner reprojection
-  factors). The cross-tracker lines run from the observing lens centre to each of
-  the four base-tag corners on the owner tracker (the cross-reprojection factors),
+  to each sighted anchor's four metric corner landmarks (the corner
+  reprojection factors), covering every configured anchor id. The
+  cross-tracker lines run from the observing lens centre to each of the four
+  base-tag corners on the owner tracker (the cross-reprojection factors),
   mirroring the anchor rays."""
-  lenses_by_kf: dict[int, list[LensSetup]] = {}
-  for lens, kf, _det in anchor_sightings:
-    lenses_by_kf.setdefault(kf, []).append(lens)
+  lenses_by_kf: dict[int, list[tuple[LensSetup, Float64Array]]] = {}
+  for tag_id, corners_world in anchor_corners_by_tag.items():
+    for lens, kf, _det in _anchor_sightings(observer, tag_id):
+      lenses_by_kf.setdefault(kf, []).append((lens, corners_world))
   anchor_lines: list[Float64Array] = []
   cross_lines: list[Float64Array] = []
   for kf in range(observer.n_keyframes):
     body_pose = observer_poses[kf]
     anchor_strips: list[Float64Array] = []
-    for lens in lenses_by_kf.get(kf, ()):
+    for lens, corners_world in lenses_by_kf.get(kf, ()):
       lens_xyz = np.asarray(
         body_pose.compose(lens.extrinsic).translation(), dtype=np.float64
       )
-      for corner_xyz in anchor_corners_world:
+      for corner_xyz in corners_world:
         anchor_strips.append(np.stack([lens_xyz, corner_xyz]))
     anchor_lines.append(
       np.stack(anchor_strips) if anchor_strips else np.empty((0, 2, 3))
@@ -562,13 +730,11 @@ def _assemble_joint_graph(
   args: Args,
   cross_obs: list[_CrossSighting],
   anchor_corners_world: Float64Array,
+  secondary_anchor_world: dict[int, gtsam.Pose3],
 ) -> tuple[gtsam.NonlinearFactorGraph, gtsam.Values]:
-  """Build the joint factor graph: one VI subgraph per tracker; the anchor tag's
-  four metric-corner reprojection factors; the shared body_T_base_tag pose
-  variable with a loose prior; base-tag self-reprojection; finger joint-angle
-  reprojection with the equal-and-opposite symmetry prior; base- and finger-tag
-  cross-tracker reprojection; and pose / velocity smoothness priors over each
-  tracker's unanchored tail."""
+  """Build the joint factor graph: per-tracker VI subgraphs, anchor corner
+  reprojection (reference + pinned secondaries), gripper base/finger factors,
+  cross-tracker reprojection, and smoothness priors on unanchored tails."""
   graph = gtsam.NonlinearFactorGraph()
   values = gtsam.Values()
 
@@ -582,36 +748,28 @@ def _assemble_joint_graph(
       **keys.vi_graph_kwargs(t.name),
     )
 
-  # Reproject the anchor tag's four metric corners through the MEI distortion
-  # model, which stays valid even at the lens edge.
-  corner_keys = [keys.anchor_corner_key(j) for j in range(4)]
-  corner_prior = gtsam.noiseModel.Isotropic.Sigma(3, 1.0e-4)
   corner_noise = huber_pixel_noise(args.anchor.corner_reproj_sigma)
-  for corner_key, corner_xyz in zip(corner_keys, anchor_corners_world, strict=True):
-    point = gtsam.Point3(*corner_xyz)
-    values.insert(corner_key, point)
-    graph.add(gtsam.PriorFactorPoint3(corner_key, point, corner_prior))
-
-  n_anchor_sightings = 0
-  for t in trackers:
-    for lens, kf, anchor_det in _anchor_sightings(t, int(args.anchor.tag_id)):
-      n_anchor_sightings += 1
-      pose_key = keys.pose_key(t.name, kf)
-      # The detected tag direction in the lens frame disambiguates the omni
-      # depth-sign: the corner reprojection deactivates for poses that flip the
-      # frontally-observed tag to the opposite side of the camera.
-      side = "front" if lens is t.front_lens else "rear"
-      cam_T_tag = t.anchor_obs_per_kf.get(kf, {}).get(side)
-      obs_bearing = (
-        None
-        if cam_T_tag is None
-        else np.asarray(cam_T_tag.translation(), dtype=np.float64)
-      )
-      for corner_key, pixel in zip(corner_keys, anchor_det.corners, strict=True):
-        add_mei_factor(
-          graph, pose_key, corner_key, pixel, corner_noise, lens, obs_bearing
-        )
-  print(f"anchor corner reprojection: {n_anchor_sightings} anchor sightings")
+  n_ref = _add_anchor_corner_factors(
+    graph,
+    trackers,
+    keys,
+    corner_noise,
+    int(args.anchor.tag_ids[0]),
+    anchor_corners_world,
+    pnp_bearings=True,
+  )
+  print(f"anchor corner reprojection: {n_ref} anchor sightings")
+  for tag_id, world_T_tag in secondary_anchor_world.items():
+    n_sec = _add_anchor_corner_factors(
+      graph,
+      trackers,
+      keys,
+      corner_noise,
+      tag_id,
+      _tag_corners_world(world_T_tag, args.anchor.tag_size),
+      pnp_bearings=False,
+    )
+    print(f"secondary anchor {tag_id} corner reprojection: {n_sec} sightings")
 
   # Base + finger tag factors. The base tag and both finger tags ride one rigid
   # chain on the gripper, all imaged by the rear lens, so the base-tag pose in the
@@ -781,11 +939,12 @@ def _assemble_joint_graph(
   vel_smooth_count = 0
   zero_t = gtsam.Point3(0.0, 0.0, 0.0)
   for t in trackers:
+    anchored_kfs = _anchored_keyframes(t)
     for k in range(1, t.n_keyframes):
       # Both endpoints must be unanchored — boundary cases (k-1 anchored,
       # k unanchored) over-constrain the LM by pulling k's pose toward
       # the anchor-pinned k-1, which fights visual factors at k.
-      if (k - 1) in t.anchor_obs_per_kf or k in t.anchor_obs_per_kf:
+      if (k - 1) in anchored_kfs or k in anchored_kfs:
         continue
       # Identity rotation mean would penalise actual handheld rotation
       # between consecutive un-anchored kfs; use the prep-stage relative
@@ -898,6 +1057,76 @@ def _solve_with_cull_reoptimize(
   return result, landmark_keep
 
 
+def _seed_secondary_anchors(
+  trackers: list[PreparedTracker], args: Args
+) -> dict[int, gtsam.Pose3]:
+  """Initial world pose per sighted non-global anchor, from the BFS-aligned
+  prep poses."""
+  world: dict[int, gtsam.Pose3] = {}
+  for tag_id in args.anchor.enabled_tag_ids[1:]:
+    seed = _secondary_anchor_seed(trackers, tag_id)
+    if seed is None:
+      print(f"secondary anchor {tag_id}: no PnP sighting; skipped")
+      continue
+    world[tag_id] = seed
+  return world
+
+
+def _solve_joint_graph(
+  trackers: list[PreparedTracker],
+  keys: TrackerKeys,
+  args: Args,
+  cross_obs: list[_CrossSighting],
+  anchor_corners_world: Float64Array,
+) -> tuple[
+  OptimizeResult,
+  dict[str, tuple[dict[int, dict[int, Float64Array]], ...]],
+  dict[int, gtsam.Pose3],
+  dict[str, list[gtsam.Pose3]],
+]:
+  """Solve once with secondary anchors pinned at their seeds; afterwards
+  re-estimate each from the solved poses (consistency check) and return the
+  re-estimate."""
+  secondary_world = _seed_secondary_anchors(trackers, args)
+  graph, values = _assemble_joint_graph(
+    trackers, keys, args, cross_obs, anchor_corners_world, secondary_world
+  )
+  result, landmark_keep = _solve_with_cull_reoptimize(
+    graph, values, trackers, keys, args.solver.max_iterations
+  )
+  solved_poses = {
+    t.name: [
+      result.values.atPose3(keys.pose_key(t.name, i)) for i in range(t.n_keyframes)
+    ]
+    for t in trackers
+  }
+  for tag_id in secondary_world:
+    estimate = _secondary_anchor_seed(
+      trackers, tag_id, body_poses_by_tracker=solved_poses
+    )
+    assert estimate is not None  # seeding required a sighting; obs never shrink
+    pinned = secondary_world[tag_id]
+    dt = float(
+      np.linalg.norm(
+        np.asarray(estimate.translation()) - np.asarray(pinned.translation())
+      )
+    )
+    dr = float(
+      np.linalg.norm(gtsam.Rot3.Logmap(pinned.rotation().between(estimate.rotation())))
+    )
+    note = (
+      "  WARNING: weak sighting geometry this take"
+      if (dt > _ANCHOR_CONSISTENCY_TRANS or dr > _ANCHOR_CONSISTENCY_ROT)
+      else ""
+    )
+    print(
+      f"  secondary anchor {tag_id}: post-solve re-estimate moved "
+      f"{dt * 1000:.1f}mm / {np.degrees(dr):.2f}deg{note}"
+    )
+    secondary_world[tag_id] = estimate
+  return result, landmark_keep, secondary_world, solved_poses
+
+
 def _lens_side_dict(lens: LensSetup, decoded_width: int) -> dict[str, object]:
   """One lens's extrinsic, intrinsics, and decoded frame shape for the export."""
   return {
@@ -937,7 +1166,7 @@ def _build_raw_export(
   trackers: list[PreparedTracker],
   optimized_body_poses: dict[str, list[gtsam.Pose3]],
   culled_points: dict[str, tuple[dict[int, Float64Array], dict[int, Float64Array]]],
-  ref_anchor: gtsam.Pose3,
+  anchor_poses_world: dict[int, gtsam.Pose3],
   audio_offset_by_name: dict[str, float],
   args: Args,
 ) -> dict[str, object]:
@@ -950,7 +1179,12 @@ def _build_raw_export(
   raw["body_poses_by_tracker"] = {
     t.name: [_pose_to_dict(p) for p in optimized_body_poses[t.name]] for t in trackers
   }
-  raw["ref_anchor_pose_world"] = _pose_to_dict(ref_anchor)
+  raw["ref_anchor_pose_world"] = _pose_to_dict(
+    anchor_poses_world[int(args.anchor.tag_ids[0])]
+  )
+  raw["anchor_poses_world"] = {
+    str(tag_id): _pose_to_dict(p) for tag_id, p in anchor_poses_world.items()
+  }
   raw["lens_by_tracker"] = {
     t.name: {
       "front": _lens_side_dict(t.front_lens, t.decoded_width),
@@ -960,9 +1194,10 @@ def _build_raw_export(
   }
   raw["anchor_obs_by_tracker"] = {
     t.name: [
-      {"kf": int(kf), "side": side, "cam_T_tag": _pose_to_dict(cam_T_tag)}
-      for kf, sides in t.anchor_obs_per_kf.items()
-      for side, cam_T_tag in sides.items()
+      {"tag_id": tag_id, "kf": int(kf), "side": side, "cam_T_tag": _pose_to_dict(p)}
+      for tag_id, obs in t.anchor_obs_by_tag.items()
+      for kf, sides in obs.items()
+      for side, p in sides.items()
     ]
     for t in trackers
   }
@@ -1002,7 +1237,7 @@ def _build_raw_export(
   raw["joint_angles_by_tracker"] = {
     t.name: t.joint_angles for t in trackers if t.joint_angles
   }
-  raw["anchor_tag_id"] = int(args.anchor.tag_id)
+  raw["anchor_tag_id"] = int(args.anchor.tag_ids[0])
   raw["anchor_tag_size"] = float(args.anchor.tag_size)
   raw["gripper_keypoint_offset"] = [float(x) for x in args.gripper.keypoint_offset]
   return raw
@@ -1019,7 +1254,7 @@ def _build_tracker_viz_data(
   args: Args,
   tag_size_by_id: dict[int, float],
   cross_obs_for_t: list[_CrossSighting],
-  anchor_corners_world: Float64Array,
+  anchor_corners_by_tag: dict[int, Float64Array],
   base_tag_corners_world: dict[str, list[Float64Array]],
   audio_offset: float,
 ) -> tuple[
@@ -1068,7 +1303,7 @@ def _build_tracker_viz_data(
   per_tracker_result: dict[str, object] = {
     "name": t.name,
     "n_keyframes": t.n_keyframes,
-    "anchor_obs": len(t.anchor_obs_per_kf),
+    "anchor_obs": len(_anchored_keyframes(t)),
     "bounding_box_diagonal": bbox_diagonal,
     "path_length": _path_length(poses),
   }
@@ -1125,8 +1360,7 @@ def _build_tracker_viz_data(
     t,
     poses,
     cross_obs_for_t,
-    _anchor_sightings(t, int(args.anchor.tag_id)),
-    anchor_corners_world,
+    anchor_corners_by_tag,
     base_tag_corners_world,
   )
   viz_data = TrackerVizData(
@@ -1235,6 +1469,13 @@ def main(args: Args) -> None:
       f"--base-tag-ids must be distinct per tracker for cross-tracker "
       f"disambiguation, got {list(args.base_tag_ids)}"
     )
+  if not args.anchor.tag_ids:
+    raise ValueError("--anchor.tag-ids must name at least the reference anchor id")
+  if len(set(args.anchor.tag_ids)) != len(args.anchor.tag_ids):
+    raise ValueError(
+      f"--anchor.tag-ids must be distinct, got {list(args.anchor.tag_ids)}"
+    )
+  _validate_tag_id_disjointness(args)
   mark = _stage_timer()
 
   starts, offsets = _audio_align_starts(args.input_insvs, args.window.master_start)
@@ -1293,7 +1534,7 @@ def main(args: Args) -> None:
       args.prep_cache,
     )
     print(
-      f"  kf={tracker.n_keyframes}  anchor_obs={len(tracker.anchor_obs_per_kf)}  "
+      f"  kf={tracker.n_keyframes}  anchor_obs={len(_anchored_keyframes(tracker))}  "
       f"front_pts={len(tracker.front_points)}  rear_pts={len(tracker.rear_points)}  "
       f"body_T_base_tag={'yes' if tracker.body_T_base_tag else 'no'}"
     )
@@ -1311,7 +1552,7 @@ def main(args: Args) -> None:
       trackers = list(prep_pool.map(_prep_one, specs))
   mark("trackers prepared")
 
-  ref_anchor = _align_to_shared_world(trackers)
+  ref_anchor = _align_to_shared_world(trackers, args.anchor.tag_ids)
   print(f"\nshared world: anchor t={np.asarray(ref_anchor.translation())}")
 
   cross_obs = _cross_tracker_observations(
@@ -1325,14 +1566,10 @@ def main(args: Args) -> None:
   mark("cross-tracker obs assembled")
 
   keys = TrackerKeys(list(names))
-  anchor_tag_id = int(args.anchor.tag_id)
+  anchor_tag_id = int(args.anchor.tag_ids[0])
   anchor_corners_world = _tag_corners_world(ref_anchor, args.anchor.tag_size)
-  graph, values = _assemble_joint_graph(
-    trackers, keys, args, cross_obs, anchor_corners_world
-  )
-
-  result, landmark_keep = _solve_with_cull_reoptimize(
-    graph, values, trackers, keys, args.solver.max_iterations
+  result, landmark_keep, secondary_anchor_world, optimized_body_poses = (
+    _solve_joint_graph(trackers, keys, args, cross_obs, anchor_corners_world)
   )
   mark("joint LM (cull-reoptimize)")
 
@@ -1342,7 +1579,7 @@ def main(args: Args) -> None:
   rrd_path = args.output_dir / f"track_{stamp}.rrd"
 
   tag_size_by_id: dict[int, float] = {
-    anchor_tag_id: float(args.anchor.tag_size),
+    **{tid: float(args.anchor.tag_size) for tid in args.anchor.enabled_tag_ids},
     **{int(tid): float(args.gripper.tag_size) for tid in args.base_tag_ids},
     **{
       int(tid): float(args.gripper.tag_size)
@@ -1351,11 +1588,13 @@ def main(args: Args) -> None:
     },
   }
 
-  optimized_body_poses: dict[str, list[gtsam.Pose3]] = {
-    t.name: [
-      result.values.atPose3(keys.pose_key(t.name, i)) for i in range(t.n_keyframes)
-    ]
-    for t in trackers
+  # Every anchor's world pose: the reference pins the gauge (its shared-world
+  # pose is fixed), each secondary is the re-estimated pose that pinned the
+  # solve.
+  anchor_poses_world = {anchor_tag_id: ref_anchor, **secondary_anchor_world}
+  anchor_corners_by_tag = {anchor_tag_id: anchor_corners_world} | {
+    tag_id: _tag_corners_world(pose, args.anchor.tag_size)
+    for tag_id, pose in secondary_anchor_world.items()
   }
 
   # Each tracker's base-tag four metric corners in the world per keyframe
@@ -1393,7 +1632,7 @@ def main(args: Args) -> None:
       args,
       tag_size_by_id,
       cross_obs_by_observer[t.name],
-      anchor_corners_world,
+      anchor_corners_by_tag,
       base_tag_corners_world,
       audio_offset_by_name[t.name],
     )
@@ -1410,7 +1649,7 @@ def main(args: Args) -> None:
     tracker_names=names,
     audio_offsets=tuple(offsets),
     per_tracker_keyframes=tuple(t.n_keyframes for t in trackers),
-    anchor_obs_per_tracker=tuple(len(t.anchor_obs_per_kf) for t in trackers),
+    anchor_obs_per_tracker=tuple(len(_anchored_keyframes(t)) for t in trackers),
     cross_tracker_obs=len(cross_obs),
     initial_graph_error=result.initial_error,
     final_graph_error=result.final_error,
@@ -1424,7 +1663,7 @@ def main(args: Args) -> None:
     trackers,
     optimized_body_poses,
     culled_points,
-    ref_anchor,
+    anchor_poses_world,
     audio_offset_by_name,
     args,
   )
@@ -1443,9 +1682,9 @@ def main(args: Args) -> None:
     log_multi_ba_run(
       rrd_path=rrd_path,
       trackers=viz_trackers,
-      world_T_anchor=ref_anchor,
+      anchor_poses_world=anchor_poses_world,
+      reference_tag_id=anchor_tag_id,
       anchor_tag_size=args.anchor.tag_size,
-      anchor_tag_id=args.anchor.tag_id,
       mask_pad_px=args.frontend.mask_tag_pad,
       urdf_path=urdf_path,
       open_viewer=args.open_viewer,

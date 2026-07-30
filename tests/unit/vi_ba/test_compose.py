@@ -17,18 +17,6 @@ def test_tracker_keys_no_collision_across_trackers() -> None:
   assert keys.pose_key("alice", 0) != keys.bias_key("alice", 0)
   assert keys.front_landmark_key("alice", 0) != keys.rear_landmark_key("alice", 0)
   assert keys.front_landmark_key("alice", 0) != keys.front_landmark_key("bob", 0)
-  # Anchor corner landmarks distinct from everything (and from each other).
-  corners = {keys.anchor_corner_key(j) for j in range(4)}
-  assert len(corners) == 4
-  assert corners.isdisjoint(
-    {
-      ka_pose0,
-      kb_pose0,
-      keys.velocity_key("alice", 0),
-      keys.bias_key("alice", 0),
-      keys.front_landmark_key("alice", 0),
-    }
-  )
 
 
 def test_tracker_keys_unknown_tracker_raises() -> None:

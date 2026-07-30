@@ -26,6 +26,7 @@ try:
     make_mei_cross_tag_factor_cpp,
     make_mei_factor_cpp,
     make_mei_finger_factor_cpp,
+    make_mei_world_point_factor_cpp,
   )
 except ImportError as _exc:  # pragma: no cover - extension is built by uv sync
   raise ImportError(
@@ -36,6 +37,12 @@ except ImportError as _exc:  # pragma: no cover - extension is built by uv sync
 
 Float64Array = npt.NDArray[np.float64]
 
+# Prior on the first bias state, in gtsam's (accel, gyro) tangent order. A
+# belief about the starting bias, distinct from ImuCfg's white-noise densities
+# and from the per-step init sigma the preintegration params carry.
+_BIAS_PRIOR_SIGMA_ACCEL = 1.0e-2
+_BIAS_PRIOR_SIGMA_GYRO = 1.0e-3
+
 _REAR_LANDMARK_OFFSET = 1_000_000
 
 __all__ = [
@@ -43,8 +50,8 @@ __all__ = [
   "add_mei_base_tag_factor",
   "add_mei_cross_finger_factor",
   "add_mei_cross_tag_factor",
-  "add_mei_factor",
   "add_mei_finger_factor",
+  "add_mei_world_point_factor",
   "build_vi_graph",
   "front_landmark_key",
   "huber_pixel_noise",
@@ -136,6 +143,32 @@ def add_mei_factor(
       lens.extrinsic,
       *_mei_intrinsics(lens.params),
       bearing,
+    )
+  )
+
+
+def add_mei_world_point_factor(
+  graph: gtsam.NonlinearFactorGraph,
+  pose_key: int,
+  pixel: Float64Array,
+  noise: gtsam.noiseModel.Base,
+  lens: LensSetup,
+  p_world: Float64Array,
+  obs_bearing: Float64Array,
+) -> None:
+  """Push one native MEI reprojection factor, unary on the observing pose: the
+  world point ``p_world`` is a constant (an anchor tag corner), so it
+  reprojects as ``pose⁻¹ · p_world`` through ``lens`` onto ``pixel``.
+  ``obs_bearing`` is the lens-frame tag direction for the cheirality guard."""
+  graph.push_back(
+    make_mei_world_point_factor_cpp(
+      pose_key,
+      _as_pixel(pixel),
+      noise,
+      lens.extrinsic,
+      _as_point3(p_world),
+      *_mei_intrinsics(lens.params),
+      _as_vec3(obs_bearing),
     )
   )
 
@@ -364,7 +397,10 @@ def build_vi_graph(
     bias_key = bias_key_fn or (lambda i: int(B(i)))
     vel_noise = gtsam.noiseModel.Isotropic.Sigma(3, velocity_prior_sigma)
     bias_noise = gtsam.noiseModel.Diagonal.Sigmas(
-      np.asarray([1.0e-2] * 3 + [1.0e-3] * 3, dtype=np.float64)
+      np.asarray(
+        [_BIAS_PRIOR_SIGMA_ACCEL] * 3 + [_BIAS_PRIOR_SIGMA_GYRO] * 3,
+        dtype=np.float64,
+      )
     )
     for i in range(n):
       values.insert(pose_key(i), body_poses[i])
