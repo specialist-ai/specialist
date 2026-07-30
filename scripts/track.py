@@ -1451,6 +1451,10 @@ def main(args: Args) -> None:
   else:
     with ThreadPoolExecutor(max_workers=len(specs)) as prep_pool:
       trackers = list(prep_pool.map(_prep_one, specs))
+  # Free the GPU flow workers' device memory for the joint bundle adjustment.
+  from specialist.vi_ba import gpu_flow
+
+  gpu_flow.shutdown()
   mark("trackers prepared")
 
   ref_anchor = _align_to_shared_world(trackers, args.anchor.tag_ids)
