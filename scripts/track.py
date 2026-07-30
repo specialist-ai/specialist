@@ -28,7 +28,7 @@ import time
 from collections import Counter
 from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
 import gtsam
@@ -990,6 +990,11 @@ def _points_from_values(
   }
 
 
+# The first solve only ranks residuals for the cull; eight iterations lands
+# within ~2% of converged error, and the rest belongs in the post-cull polish.
+_PRECULL_MAX_ITERATIONS = 8
+
+
 def _solve_with_cull_reoptimize(
   graph: gtsam.NonlinearFactorGraph,
   values: gtsam.Values,
@@ -1007,7 +1012,9 @@ def _solve_with_cull_reoptimize(
     f"\njoint graph: {graph.size()} factors, {values.size()} variables, "
     f"initial error={initial_error:.1f}"
   )
-  result = optimize_graph(graph, values, max_iterations=max_iterations)
+  result = optimize_graph(
+    graph, values, max_iterations=min(max_iterations, _PRECULL_MAX_ITERATIONS)
+  )
   print(
     f"  solve 1: error {result.initial_error:.1f} → {result.final_error:.1f} "
     f"({result.iterations} iters)"
@@ -1040,6 +1047,12 @@ def _solve_with_cull_reoptimize(
       for tid in t.rear_points
       if tid not in rear_keep
     )
+  first = result
+  if not outlier_keys and result.iterations >= _PRECULL_MAX_ITERATIONS:
+    # Nothing to cull, but the ranking solve stopped at its own short budget
+    # rather than converging; finish on the full budget so the export never
+    # carries a deliberately under-iterated result.
+    result = optimize_graph(graph, result.values, max_iterations=max_iterations)
   if outlier_keys:
     pruned = gtsam.NonlinearFactorGraph()
     for i in range(graph.size()):
@@ -1050,6 +1063,11 @@ def _solve_with_cull_reoptimize(
     for key in outlier_keys:
       kept_values.erase(key)
     result = optimize_graph(pruned, kept_values, max_iterations=max_iterations)
+    result = replace(
+      result,
+      initial_error=first.initial_error,
+      iterations=first.iterations + result.iterations,
+    )
     print(
       f"  cull-reoptimize: dropped {len(outlier_keys)} outlier landmarks, "
       f"error → {result.final_error:.1f} ({result.iterations} iters)"
