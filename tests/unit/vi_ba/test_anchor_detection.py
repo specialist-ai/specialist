@@ -205,3 +205,62 @@ def test_anchor_chain_propagates_prior_through_kf_rotations() -> None:
   )
   assert set(out) == {0, 2}
   assert _rot_geodesic(out[2], cam2_T_tag) < 0.05
+
+
+def test_tag_detection_never_runs_concurrently() -> None:
+  """The whole process shares one detect slot; two threads inside the native
+  detect at once segfaults."""
+  import threading
+  import time
+
+  from specialist.vi_ba import anchor_detection
+
+  peak = 0
+  live = 0
+  guard = threading.Lock()
+
+  def hold() -> None:
+    nonlocal peak, live
+    with anchor_detection._detect_slot():
+      with guard:
+        live += 1
+        peak = max(peak, live)
+      time.sleep(0.005)
+      with guard:
+        live -= 1
+
+  threads = [threading.Thread(target=hold) for _ in range(16)]
+  for thread in threads:
+    thread.start()
+  for thread in threads:
+    thread.join()
+  assert peak == 1
+
+
+def test_the_detector_is_built_once_and_never_dropped() -> None:
+  """One detector serves every call for the life of the process; its native
+  teardown corrupts the heap beside another detector."""
+  from specialist.vi_ba import anchor_detection
+
+  assert anchor_detection._shared_detector() is anchor_detection._shared_detector()
+
+
+def test_detector_teardown_reclaims_its_memory() -> None:
+  """Building and dropping a detector gives its memory back."""
+  import gc
+  import resource
+
+  from specialist.vi_ba import anchor_detection
+
+  def rss_mb() -> float:
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return peak / (1024 * 1024) if peak > 10**7 else peak / 1024
+
+  anchor_detection._shared_detector()  # warm any one-off allocation
+  gc.collect()
+  before = rss_mb()
+  for _ in range(3):
+    detector = anchor_detection._OrderedTeardownDetector(families="tagStandard41h12")
+    del detector
+    gc.collect()
+  assert rss_mb() - before < 200.0
