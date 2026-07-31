@@ -3,7 +3,9 @@ decoding, per-lens visual frontend, and multi-view triangulation."""
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -108,6 +110,21 @@ def resolve_keyframe_every(keyframe_every: int, fps: float) -> int:
 _DECODE_MAX_SEGMENTS = 8
 _DECODE_MIN_KEYFRAMES_PER_SEGMENT = 32
 
+# Captures are budgeted per process, not per call: both trackers prep at once,
+# and the FFmpeg backend corrupts its heap when too many seek concurrently.
+_DECODE_MAX_CONCURRENT_CAPTURES = _DECODE_MAX_SEGMENTS * 2
+_decode_capture_slots = threading.BoundedSemaphore(_DECODE_MAX_CONCURRENT_CAPTURES)
+
+
+@contextmanager
+def _decode_slot() -> Iterator[None]:
+  """Hold one capture slot for the life of a decode."""
+  _decode_capture_slots.acquire()
+  try:
+    yield
+  finally:
+    _decode_capture_slots.release()
+
 
 def _video_props(path: Path, *props: int) -> list[float]:
   """Container properties read via one short-lived ``VideoCapture``."""
@@ -191,27 +208,28 @@ def decode_dual_keyframes(
     span: tuple[Path, int, int],
   ) -> tuple[list[np.ndarray], list[bytes]]:
     path, begin, end = span
-    cap = cv2.VideoCapture(str(path))
-    if start_frame + begin > 0:
-      cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame + begin)
     gray_frames: list[np.ndarray] = []
     color_frames: list[bytes] = []
-    for i in range(begin, end):
-      # Non-keyframes still need decoding (inter-frame references) but not the
-      # YUV->BGR convert/copy, so grab() them and only retrieve() the keyframes.
-      if i % keyframe_every != 0:
-        if not cap.grab():
+    with _decode_slot():
+      cap = cv2.VideoCapture(str(path))
+      if start_frame + begin > 0:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame + begin)
+      for i in range(begin, end):
+        # Non-keyframes still need decoding (inter-frame references) but not the
+        # YUV->BGR convert/copy, so grab() them and only retrieve() the keyframes.
+        if i % keyframe_every != 0:
+          if not cap.grab():
+            break
+          continue
+        ok, frame = cap.read()
+        if not ok:
           break
-        continue
-      ok, frame = cap.read()
-      if not ok:
-        break
-      gray_frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
-      if keep_color:
-        color_frames.append(
-          cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 75])[1].tobytes()
-        )
-    cap.release()
+        gray_frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
+        if keep_color:
+          color_frames.append(
+            cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 75])[1].tobytes()
+          )
+      cap.release()
     return gray_frames, color_frames
 
   n_segments = min(

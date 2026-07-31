@@ -237,3 +237,35 @@ def test_decode_lens_pair_reads_both_files_aligned(tmp_path: Path) -> None:
   first = cv2.imdecode(np.frombuffer(front_color[0], np.uint8), cv2.IMREAD_COLOR)
   assert isinstance(front_color[0], bytes) and first.shape == (half, half, 3)
   assert isinstance(rear_color[0], bytes)
+
+
+def test_decode_captures_are_bounded_across_the_whole_process() -> None:
+  """Each span opens its own FFmpeg demux and decode context, and a dual-tracker
+  run preps both trackers at once, so a per-tracker limit silently doubles the
+  captures in flight. The budget is process-wide or it is not a budget."""
+  import threading
+  import time
+
+  from specialist.vi_ba import pipeline
+
+  peak = 0
+  live = 0
+  guard = threading.Lock()
+
+  def hold() -> None:
+    nonlocal peak, live
+    with pipeline._decode_slot():
+      with guard:
+        live += 1
+        peak = max(peak, live)
+      time.sleep(0.005)
+      with guard:
+        live -= 1
+
+  threads = [threading.Thread(target=hold) for _ in range(64)]
+  for thread in threads:
+    thread.start()
+  for thread in threads:
+    thread.join()
+  assert peak <= pipeline._DECODE_MAX_CONCURRENT_CAPTURES
+  assert peak > 0
