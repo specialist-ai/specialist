@@ -21,6 +21,7 @@ from specialist.vi_ba.build import LensSetup
 from specialist.vi_ba.extrinsics import Extrinsics, LensOffset
 from specialist.vi_ba.features import (
   Frame,
+  Rect,
   chain_tracks,
   dis_flow_track,
   essential_ransac_inliers,
@@ -314,11 +315,11 @@ def run_lens_frontend(
   frames: list[np.ndarray],
   params: MeiParams,
   cfg: LensFrontendConfig,
-  masks: list[np.ndarray] | None = None,
+  masks: list[list[Rect]] | None = None,
 ) -> tuple[list[Frame], dict[int, dict[int, Float64Array]]]:
   """DIS flow → essential-RANSAC → chain for one lens. ``masks[k]`` (optional,
-  ``uint8`` 255=keep / 0=ignore) suppresses new detections and filters
-  tracked points that drift into masked regions."""
+  the blocked rectangles for that keyframe) suppresses new detections and
+  filters tracked points that drift into them."""
   if masks is not None and len(masks) != len(frames):
     raise ValueError(f"masks length {len(masks)} != frames length {len(frames)}")
   feature_frames, matches_between = dis_flow_track(
