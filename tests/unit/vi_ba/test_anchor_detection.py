@@ -244,3 +244,15 @@ def test_detector_teardown_reclaims_its_memory() -> None:
     del detector
     gc.collect()
   assert rss_mb() - before < 200.0
+
+
+def test_detector_pool_never_exceeds_the_cores_the_process_has(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  """The pool is the smaller of ``_DETECT_THREADS`` and the process's core budget."""
+  from specialist.vi_ba import anchor_detection
+
+  monkeypatch.setattr(anchor_detection, "cpu_budget", lambda: 4)
+  assert anchor_detection._detect_threads() == 4
+  monkeypatch.setattr(anchor_detection, "cpu_budget", lambda: 384)
+  assert anchor_detection._detect_threads() == anchor_detection._DETECT_THREADS
