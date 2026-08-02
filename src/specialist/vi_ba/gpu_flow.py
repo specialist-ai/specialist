@@ -52,6 +52,8 @@ _backend: tuple[Any, Any] | None = None
 _claimed: dict[int, int] = {}  # device_index -> streams assigned in this process
 _bad: set[int] = set()  # GPUs that failed to warm (shared-box context errors)
 _engines: list["_Engine"] = []
+# The stream a prep thread has already warmed, reused across its capture's lenses.
+_stream = threading.local()
 
 
 def _import_backend() -> tuple[Any, Any]:
@@ -345,10 +347,15 @@ class _Engine:
 
 
 def prime(frames: Sequence[np.ndarray], fwd_vr: int, bwd_vr: int) -> _Engine:
-  """Claim a GPU for this lens stream and warm its kernels for ``frames``'
-  shape. A GPU that fails to warm (a transient shared-box context error) is
-  marked bad and the next-most-free GPU is tried; raises only when no GPU can
-  run, so the caller can fall back to cv2."""
+  """Claim a GPU for this capture and warm its kernels for ``frames``' shape. A
+  GPU that fails to warm is marked bad and the next-most-free GPU is tried;
+  raises only when no GPU can run.
+
+  The stream this thread already warmed for this shape is reused."""
+  key = (tuple(frames[0].shape[:2]), fwd_vr, bwd_vr)
+  warm: _Engine | None = getattr(_stream, "engine", None)
+  if warm is not None and getattr(_stream, "key", None) == key and warm in _engines:
+    return warm
   torch = _import_backend()[0]
   tries = torch.cuda.device_count() if torch.cuda.is_available() else 1
   last_exc: Exception | None = None
@@ -363,6 +370,7 @@ def prime(frames: Sequence[np.ndarray], fwd_vr: int, bwd_vr: int) -> _Engine:
       continue
     with _claim_lock:
       _engines.append(engine)
+    _stream.engine, _stream.key = engine, key
     return engine
   raise last_exc or RuntimeError("no GPU could warm the flow backend")
 
