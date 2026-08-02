@@ -16,6 +16,8 @@ from specialist.vi_ba.anchor_detection import TagDetection
 from specialist.vi_ba.build import LensSetup
 from specialist.vi_ba.compose import CulledPoints
 from specialist.vi_ba.configs import Args
+from specialist.vi_ba.finger_kinematics import pin_angles_to_keyframes
+from specialist.vi_ba.highrate import propagate_highrate
 from specialist.vi_ba.single_tracker import PreparedTracker
 
 Float64Array = npt.NDArray[np.float64]
@@ -51,6 +53,44 @@ class _PoseDict(TypedDict):
 
   R: list[list[float]]
   t: list[float]
+
+
+def _highrate_dict(
+  tracker: PreparedTracker, poses: list[gtsam.Pose3]
+) -> dict[str, list[object]] | None:
+  """The IMU-propagated trajectory at IMU sample times, or ``None`` without IMU."""
+  if tracker.imu is None or not tracker.biases:
+    return None
+  times, positions, quats, vels = propagate_highrate(
+    poses, tracker.keyframe_times, tracker.velocities, tracker.biases, tracker.imu
+  )
+  return {
+    "t": [float(x) for x in times],
+    "position": [[float(x) for x in p] for p in positions],
+    "quat_xyzw": [[float(x) for x in q] for q in quats],
+    "velocity": [[float(x) for x in v] for v in vels],
+  }
+
+
+def _pinned_finger_angles(
+  tracker: PreparedTracker,
+) -> dict[str, dict[str, list[float]]]:
+  """Each finger's frame-rate angles, pinned through the solved keyframe angles."""
+  assert tracker.finger_frame_angles is not None
+  kf_times = np.asarray(tracker.keyframe_times, dtype=np.float64)
+  out: dict[str, dict[str, list[float]]] = {}
+  for joint, (times, angles) in tracker.finger_frame_angles.items():
+    solved = np.asarray(
+      tracker.joint_angles.get(joint, [float("nan")] * len(kf_times)),
+      dtype=np.float64,
+    )
+    n = min(len(kf_times), len(solved))
+    pinned = pin_angles_to_keyframes(times, angles, kf_times[:n], solved[:n])
+    out[joint] = {
+      "t": [float(x) for x in times],
+      "angle": [float(x) for x in pinned],
+    }
+  return out
 
 
 def _pose_to_dict(p: gtsam.Pose3) -> _PoseDict:
@@ -160,6 +200,27 @@ def build_raw_export(
   }
   raw["kf_times_by_tracker"] = {
     t.name: [float(x) for x in t.keyframe_times] for t in trackers
+  }
+  raw["velocities_by_tracker"] = {
+    t.name: [[float(x) for x in v] for v in t.velocities] for t in trackers
+  }
+  raw["highrate_by_tracker"] = {
+    t.name: hr
+    for t in trackers
+    if (hr := _highrate_dict(t, optimized_body_poses[t.name])) is not None
+  }
+  raw["joint_angles_highrate_by_tracker"] = {
+    t.name: _pinned_finger_angles(t) for t in trackers if t.finger_frame_angles
+  }
+  raw["imu_bias_by_tracker"] = {
+    t.name: [
+      {
+        "gyro": [float(x) for x in b.gyroscope()],
+        "accel": [float(x) for x in b.accelerometer()],
+      }
+      for b in t.biases
+    ]
+    for t in trackers
   }
   raw["audio_offset_by_tracker"] = audio_offset_by_name
   raw["body_T_base_tag_by_tracker"] = {

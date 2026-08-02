@@ -105,3 +105,56 @@ def build_finger_reproj(
     corners_in_pivot=corners_in_pivot,
     observations=observations,
   )
+
+
+def pin_angles_to_keyframes(
+  frame_times: Float64Array,
+  frame_angles: Float64Array,
+  keyframe_times: Float64Array,
+  keyframe_angles: Float64Array,
+) -> Float64Array:
+  """Frame angles bent linearly onto keyframe angles; NaN-ended intervals stay raw."""
+  pinned = np.asarray(frame_angles, dtype=np.float64).copy()
+  raw_at_kf = np.interp(keyframe_times, frame_times, frame_angles)
+  offsets = keyframe_angles - raw_at_kf
+  for k in range(len(keyframe_times) - 1):
+    left, right = offsets[k], offsets[k + 1]
+    if not (np.isfinite(left) and np.isfinite(right)):
+      continue
+    span = keyframe_times[k + 1] - keyframe_times[k]
+    inside = (frame_times >= keyframe_times[k]) & (frame_times <= keyframe_times[k + 1])
+    fraction = (frame_times[inside] - keyframe_times[k]) / span
+    pinned[inside] = frame_angles[inside] + (1 - fraction) * left + fraction * right
+  return pinned
+
+
+def frame_finger_angles(
+  joint: RevoluteJoint,
+  tags_per_frame: list[list[TagDetection]],
+  lens: LensSetup,
+  finger_tag_id: int,
+  body_T_base_tag: gtsam.Pose3,
+  tag_size: float,
+) -> tuple[npt.NDArray[np.int64], Float64Array]:
+  """``(frame indices, angles)`` from detections alone, per frame that sees the tag."""
+  assert joint.joint_T_tag0 is not None
+  body_T_joint = body_T_base_tag.compose(joint.base_T_joint)
+  corners_in_pivot = tag_corners_in_frame(joint.joint_T_tag0, tag_size)
+  frames: list[int] = []
+  angles: list[float] = []
+  for i, dets in enumerate(tags_per_frame):
+    det = next((d for d in dets if d.tag_id == finger_tag_id), None)
+    if det is None:
+      continue
+    frames.append(i)
+    angles.append(
+      _seed_theta(
+        np.asarray(det.corners, dtype=np.float64),
+        corners_in_pivot,
+        body_T_joint,
+        lens,
+        joint.lower,
+        joint.upper,
+      )
+    )
+  return np.asarray(frames, dtype=np.int64), np.asarray(angles, dtype=np.float64)
