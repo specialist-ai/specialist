@@ -58,15 +58,6 @@ class FrontendCfg:
 
 @dataclass
 class ImuCfg:
-  # Noise sigmas at ~5-10x the measured noise floor (Allan deviation on a
-  # stationary capture: gyro ~0.0025 rad/s/sqrtHz, accel ~0.001 m/s2/sqrtHz).
-  # Held a few x above physical so the accelerometer's residual systematic error
-  # (timing / extrinsic) is not over-weighted, which would distort the metric
-  # scale it provides.
-  gyro_noise_sigma: float = 0.0125
-  accel_noise_sigma: float = 0.01
-  gyro_random_walk: float = 1.0e-7
-  accel_random_walk: float = 1.0e-7
   imu_to_body: tuple[tuple[float, float, float], ...] = (
     (0.0, 0.0, -1.0),
     (1.0, 0.0, 0.0),

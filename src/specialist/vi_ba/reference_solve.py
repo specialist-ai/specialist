@@ -324,3 +324,16 @@ def adopt_ba_refined_estimates(
     bt_key = keys.base_tag_key(t.name)
     if result.values.exists(bt_key):
       t.body_T_base_tag = result.values.atPose3(bt_key)
+  # The prep-time velocities and biases predate the joint solve; the export
+  # hands them to IMU propagation, so carry the optimized ones.
+  for t in trackers:
+    if not result.values.exists(keys.velocity_key(t.name, 0)):
+      continue
+    t.velocities = [
+      np.asarray(result.values.atVector(keys.velocity_key(t.name, i)))
+      for i in range(t.n_keyframes)
+    ]
+    t.biases = [
+      result.values.atConstantBias(keys.bias_key(t.name, i))
+      for i in range(t.n_keyframes)
+    ]

@@ -41,8 +41,14 @@ from specialist.vi_ba.features import (
   match_pair,
   parallel_map,
 )
-from specialist.vi_ba.finger_kinematics import FingerReproj, build_finger_reproj
+from specialist.vi_ba.finger_kinematics import (
+  FingerReproj,
+  build_finger_reproj,
+  frame_finger_angles,
+)
 from specialist.vi_ba.imu import (
+  GRAVITY,
+  GRAVITY_WORLD,
   ImuSamples,
   factory_imu_bias,
   find_stationary_windows,
@@ -199,6 +205,11 @@ class PreparedTracker:
   finger_reproj: dict[str, FingerReproj]
   left_finger_tag_id: int
   right_finger_tag_id: int
+  # Body-frame, rescaled IMU samples, for IMU-rate propagation between keyframes.
+  imu: ImuSamples | None = None
+  # Per-joint detection-only finger angles at the frame rate, as (times, angles);
+  # raw, pinned to the solved keyframe angles at export time.
+  finger_frame_angles: dict[str, tuple[Float64Array, Float64Array]] | None = None
 
   @property
   def n_keyframes(self) -> int:
@@ -787,13 +798,13 @@ def _imu_and_initial_gravity(
       axis=0
     )
     stationary_mag = float(np.linalg.norm(stationary_mean))
-    if 8.0 < stationary_mag < 11.0 and abs(stationary_mag - 9.81) > 0.05:
-      accel_scale = 9.81 / stationary_mag
+    if 8.0 < stationary_mag < 11.0 and abs(stationary_mag - GRAVITY) > 0.05:
+      accel_scale = GRAVITY / stationary_mag
       imu = ImuSamples(
         t=imu.t, gyro=imu.gyro, accel=(imu.accel * accel_scale).astype(np.float64)
       )
       stationary_mean = stationary_mean * accel_scale
-    gravity_body = -stationary_mean / float(np.linalg.norm(stationary_mean)) * 9.81
+    gravity_body = -stationary_mean / float(np.linalg.norm(stationary_mean)) * GRAVITY
     t_stationary_mid = 0.5 * (imu.t[first_start] + imu.t[first_end - 1])
     kf_for_g = int(np.argmin(np.abs(keyframe_times - t_stationary_mid)))
     gravity_world_initial = (
@@ -808,7 +819,14 @@ def _recover_gripper_tags(
   rear_lens: LensSetup,
   n_keyframes: int,
   kf_rotations: list[Float64Array],
-) -> tuple[gtsam.Pose3 | None, dict[str, list[float]], dict[str, FingerReproj]]:
+  rear_tags_per_frame: list[list[TagDetection]] | None = None,
+  frame_times: Float64Array | None = None,
+) -> tuple[
+  gtsam.Pose3 | None,
+  dict[str, list[float]],
+  dict[str, FingerReproj],
+  dict[str, tuple[Float64Array, Float64Array]],
+]:
   """Base-tag body pose, per-finger joint angles, and finger reprojection inputs.
 
   ``body_T_base_tag`` is the mean of the base tag's body-frame pose
@@ -817,6 +835,8 @@ def _recover_gripper_tags(
   revolute-joint angle from PnP (the viz seed and the bundle's per-keyframe
   fallback). ``finger_reproj`` carries the corner-reprojection inputs the joint
   bundle refines the angles from, built from the URDF when one is given.
+  ``frame_angles`` holds the same joints' per-frame PnP angles on the finger
+  detection stride, for the finger transform streams.
   """
   base_tag_obs = anchor_pose_from_tags(
     rear_tags_per_kf,
@@ -889,7 +909,29 @@ def _recover_gripper_tags(
         )
       else:
         finger_reproj[joint_name] = reproj
-  return body_T_base_tag, joint_angles, finger_reproj
+  frame_angles: dict[str, tuple[Float64Array, Float64Array]] = {}
+  if (
+    rear_tags_per_frame is not None
+    and frame_times is not None
+    and args.urdf_path is not None
+    and body_T_base_tag is not None
+  ):
+    joints = read_revolute_joints(args.urdf_path)
+    for joint_name, finger_id in finger_joint_tags:
+      joint = joints.get(joint_name)
+      if finger_id <= 0 or joint is None or joint.joint_T_tag0 is None:
+        continue
+      indices, angles = frame_finger_angles(
+        joint,
+        rear_tags_per_frame,
+        rear_lens,
+        finger_tag_id=finger_id,
+        body_T_base_tag=body_T_base_tag,
+        tag_size=args.gripper.tag_size,
+      )
+      if len(indices):
+        frame_angles[joint_name] = (frame_times[indices], angles)
+  return body_T_base_tag, joint_angles, finger_reproj, frame_angles
 
 
 @dataclass
@@ -955,9 +997,62 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
     _, rear_color = decode_lens_keyframes(
       rear_path, bound, fps, args.start, args.duration, keyframe_every, True
     )
-  front_tags_per_kf = per_band(detect_all_tags, lens_frames(args.insv_path))
+  # Front: tags and loop-closure ORB share one banded walk; both are stateless
+  # per frame and a second walk would decode the lens again.
+  orb_exclude = set(args.anchor.tag_ids)
+
+  def front_band(
+    band: list[np.ndarray],
+  ) -> list[tuple[list[TagDetection], Frame | None]]:
+    tags = detect_all_tags(band)
+    if not args.frontend.loop_closure:
+      return [(t, None) for t in tags]
+    rects = _build_non_anchor_tag_masks(
+      band[0].shape[:2], tags, orb_exclude, args.frontend.mask_tag_pad
+    )
+    orb = parallel_map(
+      lambda f, m: detect_orb(
+        f, args.frontend.orb_n_features, 20, mask_plane(f.shape[:2], m)
+      ),
+      band,
+      rects,
+    )
+    return list(zip(tags, orb, strict=True))
+
+  front_fused = per_band(front_band, lens_frames(args.insv_path))
+  front_tags_per_kf = [tags for tags, _ in front_fused]
+  front_orb = [orb for _, orb in front_fused]
   release_freed_memory()
-  rear_tags_per_kf = per_band(detect_all_tags, lens_frames(rear_path))
+  # Rear: with fingers configured, detect at every frame in one dense walk; the
+  # keyframe subset feeds the existing machinery and the full series carries the
+  # finger angles. Without fingers the dense detections would be pure waste.
+  wants_fingers = args.urdf_path is not None and (
+    args.left_finger_tag_id > 0 or args.right_finger_tag_id > 0
+  )
+  rear_tags_per_frame: list[list[TagDetection]] | None = None
+  rear_frame_times: Float64Array | None = None
+  if wants_fingers:
+    # The finger series targets ~30 Hz; detecting every native frame at higher
+    # capture rates is the same work for angles nothing consumes. The stride
+    # must divide the keyframe interval so the keyframe subset stays exact.
+    finger_stride = max(
+      (
+        d
+        for d in range(1, keyframe_every + 1)
+        if keyframe_every % d == 0 and d <= fps / 30.0
+      ),
+      default=1,
+    )
+    rear_all = BandedKeyframes(
+      rear_path, bound, fps, args.start, args.duration, finger_stride
+    )
+    rear_tags_per_frame = per_band(detect_all_tags, rear_all)
+    rear_frame_times = (
+      args.start + np.arange(len(rear_tags_per_frame)) * finger_stride / fps
+    )
+    rear_tags_per_kf = rear_tags_per_frame[:: keyframe_every // finger_stride]
+  else:
+    rear_tags_per_kf = per_band(detect_all_tags, lens_frames(rear_path))
   n_keyframes = min(len(front_tags_per_kf), len(rear_tags_per_kf))
   release_freed_memory()
   if n_keyframes < 3:
@@ -1027,19 +1122,7 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
       ch.gray, ch.setup.params, cfg, masks=ch.masks
     )
     if ch is front and args.frontend.loop_closure:
-      orb: list[Frame] = []
-      for begin in range(0, n_keyframes, _PREP_BAND):
-        end = min(begin + _PREP_BAND, n_keyframes)
-        orb.extend(
-          parallel_map(
-            lambda f, m: detect_orb(
-              f, args.frontend.orb_n_features, 20, mask_plane(f.shape[:2], m)
-            ),
-            [ch.gray[i] for i in range(begin, end)],
-            ch.masks[begin:end],
-          )
-        )
-      ch.orb = orb
+      ch.orb = [f for f in front_orb[:n_keyframes] if f is not None]
     ch.gray = []
     ch.masks = []
     release_freed_memory()
@@ -1132,38 +1215,27 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
       max_landmark_depth=1000.0,
     )
 
-  # Without a stationary window the LSQ-fit gravity is the only signal we
-  # have; preintegration uses a placeholder vertical gravity, then the
-  # alignment runs against the same data and the LSQ-fit value sticks.
-  pim_gravity: tuple[float, float, float] = (0.0, 0.0, -9.81)
-  if gravity_world_initial is not None:
-    gx, gy, gz = gravity_world_initial
-    pim_gravity = (float(gx), float(gy), float(gz))
-
   def _pim_params(
     gravity: tuple[float, float, float],
   ) -> gtsam.PreintegrationCombinedParams:
-    return make_preintegration_params(
-      gyro_noise_sigma=args.imu.gyro_noise_sigma,
-      accel_noise_sigma=args.imu.accel_noise_sigma,
-      gyro_walk=args.imu.gyro_random_walk,
-      accel_walk=args.imu.accel_random_walk,
-      gravity_world=gravity,
-    )
+    return make_preintegration_params(gravity_world=gravity)
 
-  params_initial = _pim_params(pim_gravity)
   # An anchor seed is already metric, so its scale is 1.0; otherwise take the
   # scale from a visible anchor, and float it on the IMU only with no anchor.
   anchor_scale = _anchor_metric_scale(
     body_poses_prealign, anchor_obs_per_kf, front_lens.extrinsic, rear_lens.extrinsic
   )
   fixed_scale = 1.0 if anchor_seed_used else anchor_scale
-  pim_init = preintegrate_between_keyframes(params_initial, imu, keyframe_times, bias0)
+  # Gravity enters prediction and the factor, never the preintegrated deltas,
+  # so one preintegration serves both the alignment and the export.
+  pim = preintegrate_between_keyframes(
+    _pim_params(GRAVITY_WORLD), imu, keyframe_times, bias0
+  )
 
   def _align(poses: list[gtsam.Pose3]) -> Alignment:
     return visual_inertial_align(
       poses,
-      pim_init,
+      pim,
       fixed_gravity=gravity_world_initial,
       fixed_scale=fixed_scale,
     )
@@ -1192,8 +1264,6 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
   body_poses, world_rotation = apply_alignment_to_poses(body_poses_prealign, alignment)
   world_rot_mat = world_rotation.matrix()
   velocities = [world_rot_mat @ v for v in alignment.velocities]
-  params_aligned = _pim_params((0.0, 0.0, -9.81))
-  pim = preintegrate_between_keyframes(params_aligned, imu, keyframe_times, bias0)
 
   use_anchor = bool(anchor_obs_per_kf)
   # Each sighted anchor's pose in this tracker's local world, for the
@@ -1259,8 +1329,16 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
   print(f"  [{name}] VIO LSQ |v|max={v_max:.2f} m/s")
   biases = [bias0 for _ in range(n_keyframes)]
 
-  body_T_base_tag, joint_angles, finger_reproj = _recover_gripper_tags(
-    args, rear_tags_per_kf, rear_lens, n_keyframes, rear_kf_rotations
+  body_T_base_tag, joint_angles, finger_reproj, finger_frame_angles = (
+    _recover_gripper_tags(
+      args,
+      rear_tags_per_kf,
+      rear_lens,
+      n_keyframes,
+      rear_kf_rotations,
+      rear_tags_per_frame,
+      rear_frame_times,
+    )
   )
 
   return PreparedTracker(
@@ -1293,4 +1371,6 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
     finger_reproj=finger_reproj,
     left_finger_tag_id=args.left_finger_tag_id,
     right_finger_tag_id=args.right_finger_tag_id,
+    imu=imu,
+    finger_frame_angles=finger_frame_angles or None,
   )
