@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -56,6 +56,7 @@ from specialist.vi_ba.init import (
   visual_inertial_align,
 )
 from specialist.vi_ba.pipeline import (
+  BandedKeyframes,
   LensFrontendConfig,
   decode_lens_keyframes,
   filter_tracks_by_parallax,
@@ -85,6 +86,9 @@ _LOOP_MIN_INLIERS = 20  # geometrically-verified matches required per pair
 
 # Visual-odometry pose-spike rejection (``_reject_vo_pose_outliers``).
 _VO_REJECT_FACTOR = 8.0  # residual/median-step ratio marking a PnP teleport
+
+# Keyframes read at once from a banded lens.
+_PREP_BAND = 256
 
 
 __all__ = [
@@ -205,7 +209,7 @@ class PreparedTracker:
 
 
 def _build_non_anchor_tag_masks(
-  frames: list[np.ndarray],
+  frames: Sequence[np.ndarray],
   tags_per_kf: list[list[TagDetection]],
   exclude_tag_ids: set[int],
   pad_px: int,
@@ -801,7 +805,7 @@ class _LensChannel:
   """One lens's prep state: grays and tag detections in, tracks and landmarks out."""
 
   setup: LensSetup
-  gray: list[np.ndarray]
+  gray: Sequence[np.ndarray]
   tags: list[list[TagDetection]]
   masks: list[list[Rect]] = field(default_factory=list)
   orb: list[Frame] = field(default_factory=list)
@@ -825,20 +829,37 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
   # One lens at a time: a lens's keyframes are the largest thing prep holds.
   bound = shared_keyframe_bound(args.insv_path, rear_path)
 
-  def decode_lens(path: Path) -> tuple[list[np.ndarray], list[bytes]]:
-    return decode_lens_keyframes(
-      path, bound, fps, args.start, args.duration, keyframe_every, args.keep_frames
-    )
+  def lens_frames(path: Path) -> Sequence[np.ndarray]:
+    """This lens's keyframes, banded unless the Rerun overlay needs colour frames."""
+    if args.keep_frames:
+      return decode_lens_keyframes(
+        path, bound, fps, args.start, args.duration, keyframe_every, True
+      )[0]
+    return BandedKeyframes(path, bound, fps, args.start, args.duration, keyframe_every)
 
-  front_gray, front_color = decode_lens(args.insv_path)
-  front_tags_per_kf = detect_all_tags(front_gray)
-  n_front = len(front_gray)
-  front_gray = []
+  def per_band(
+    fn: Callable[[list[np.ndarray]], list[_A]], frames: Sequence[np.ndarray]
+  ) -> list[_A]:
+    """Map over the frames a band at a time so a banded sequence reads in order."""
+    out: list[_A] = []
+    for begin in range(0, len(frames), _PREP_BAND):
+      end = min(begin + _PREP_BAND, len(frames))
+      out.extend(fn([frames[i] for i in range(begin, end)]))
+    return out
+
+  front_color: list[bytes] = []
+  rear_color: list[bytes] = []
+  if args.keep_frames:
+    _, front_color = decode_lens_keyframes(
+      args.insv_path, bound, fps, args.start, args.duration, keyframe_every, True
+    )
+    _, rear_color = decode_lens_keyframes(
+      rear_path, bound, fps, args.start, args.duration, keyframe_every, True
+    )
+  front_tags_per_kf = per_band(detect_all_tags, lens_frames(args.insv_path))
   release_freed_memory()
-  rear_gray, rear_color = decode_lens(rear_path)
-  rear_tags_per_kf = detect_all_tags(rear_gray)
-  n_keyframes = min(n_front, len(rear_gray))
-  rear_gray = []
+  rear_tags_per_kf = per_band(detect_all_tags, lens_frames(rear_path))
+  n_keyframes = min(len(front_tags_per_kf), len(rear_tags_per_kf))
   release_freed_memory()
   if n_keyframes < 3:
     raise RuntimeError(f"only {n_keyframes} keyframes decoded — window too short")
@@ -895,7 +916,7 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
 
   def run_lens(ch: _LensChannel, path: Path) -> None:
     """Decode this lens, take what downstream needs from its pixels, then drop them."""
-    ch.gray = decode_lens(path)[0][:n_keyframes]
+    ch.gray = lens_frames(path)
     ch.masks = _build_non_anchor_tag_masks(
       ch.gray, ch.tags, anchor_tag_ids, args.frontend.mask_tag_pad
     )
@@ -905,13 +926,19 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
       ch.gray, ch.setup.params, cfg, masks=ch.masks
     )
     if ch is front and args.frontend.loop_closure:
-      ch.orb = parallel_map(
-        lambda f, m: detect_orb(
-          f, args.frontend.orb_n_features, 20, mask_plane(f.shape[:2], m)
-        ),
-        ch.gray,
-        ch.masks,
-      )
+      orb: list[Frame] = []
+      for begin in range(0, n_keyframes, _PREP_BAND):
+        end = min(begin + _PREP_BAND, n_keyframes)
+        orb.extend(
+          parallel_map(
+            lambda f, m: detect_orb(
+              f, args.frontend.orb_n_features, 20, mask_plane(f.shape[:2], m)
+            ),
+            [ch.gray[i] for i in range(begin, end)],
+            ch.masks[begin:end],
+          )
+        )
+      ch.orb = orb
     ch.gray = []
     ch.masks = []
     release_freed_memory()

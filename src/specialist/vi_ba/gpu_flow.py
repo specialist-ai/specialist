@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import queue
 import threading
+from collections.abc import Sequence
 from typing import Any, Iterator
 
 import numpy as np
@@ -206,7 +207,7 @@ class _Worker(threading.Thread):
         self.batch = max(1, self.batch // 2)
 
   def _compute_tile(
-    self, frames: list[np.ndarray], tile: list[int]
+    self, frames: Sequence[np.ndarray], tile: list[int]
   ) -> dict[int, _FlowPair]:
     torch = _import_backend()[0]
     h, w = frames[tile[0]].shape[:2]
@@ -260,7 +261,7 @@ class _Engine:
   def batch(self) -> int:
     return self._worker.batch
 
-  def prime(self, frames: list[np.ndarray]) -> None:
+  def prime(self, frames: Sequence[np.ndarray]) -> None:
     """Warm the worker on ``frames``' shape; raises RuntimeError if the GPU fails."""
     error: list[Exception] = []
     done = threading.Event()
@@ -274,7 +275,7 @@ class _Engine:
       )
 
   def iter_flows(
-    self, frames: list[np.ndarray], ks: range
+    self, frames: Sequence[np.ndarray], ks: range
   ) -> Iterator[tuple[int, _FlowPair]]:
     pair_ks = list(ks)
     worker = self._worker
@@ -308,7 +309,7 @@ class _Engine:
     self._worker.join(timeout=30.0)
 
 
-def prime(frames: list[np.ndarray], fwd_vr: int, bwd_vr: int) -> _Engine:
+def prime(frames: Sequence[np.ndarray], fwd_vr: int, bwd_vr: int) -> _Engine:
   """A warm engine for ``frames``' shape on any GPU that warms; raises if none does."""
   torch = _import_backend()[0]
   tries = torch.cuda.device_count() if torch.cuda.is_available() else 1
@@ -329,7 +330,7 @@ def prime(frames: list[np.ndarray], fwd_vr: int, bwd_vr: int) -> _Engine:
 
 
 def iter_flows(
-  engine: _Engine, frames: list[np.ndarray], ks: range
+  engine: _Engine, frames: Sequence[np.ndarray], ks: range
 ) -> Iterator[tuple[int, _FlowPair]]:
   """``features._iter_dis_flows``'s ``(k, (forward, backward))`` stream, on the GPU."""
   yield from engine.iter_flows(frames, ks)
