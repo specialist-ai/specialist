@@ -140,14 +140,14 @@ def test_unproject_tracks_normalize_returns_unit_rows() -> None:
 def _write_video(path: Path, n_frames: int, width: int, height: int) -> None:
   """Write ``n_frames`` where frame ``i`` fills the left/top half with
   brightness ``i * 16`` and the other half with ``i * 16 + 8`` — bright
-  enough steps to survive lossy encoding."""
+  enough steps to survive lossy encoding, wrapping every 16 frames."""
   writer = cv2.VideoWriter(
     str(path), cv2.VideoWriter_fourcc(*"mp4v"), 30.0, (width, height)
   )
   assert writer.isOpened()
   for i in range(n_frames):
-    frame = np.full((height, width, 3), i * 16, dtype=np.uint8)
-    frame[:, width // 2 :] = i * 16 + 8
+    frame = np.full((height, width, 3), (i * 16) % 256, dtype=np.uint8)
+    frame[:, width // 2 :] = (i * 16 + 8) % 256
     writer.write(frame)
   writer.release()
 
@@ -343,3 +343,118 @@ def test_early_stop_names_eof_apart_from_a_failed_decode(
   _report_early_stop(cap, video, 3, container_frames=6)
   assert "decode failed" in capsys.readouterr().out
   cap.release()
+
+
+def test_banded_keyframes_match_the_eager_decode(tmp_path: Path) -> None:
+  """Banding is only safe if a band-at-a-time read returns exactly the frames
+  the all-at-once decode returns, in the same order."""
+  from specialist.vi_ba.pipeline import (
+    BandedKeyframes,
+    decode_lens_keyframes,
+    shared_keyframe_bound,
+  )
+
+  front = tmp_path / "VID_x_00_001.mp4"
+  rear = tmp_path / "VID_x_10_001.mp4"
+  _write_video(front, n_frames=15, width=64, height=64)
+  _write_video(rear, n_frames=15, width=64, height=64)
+
+  bound = shared_keyframe_bound(front, rear)
+  eager, _ = decode_lens_keyframes(
+    front, bound, 30.0, start=0.0, duration=None, keyframe_every=2, keep_color=False
+  )
+  banded = BandedKeyframes(front, bound, 30.0, 0.0, None, keyframe_every=2, band=3)
+
+  assert len(banded) == len(eager)
+  for i, expected in enumerate(eager):
+    assert np.array_equal(banded[i], expected), f"frame {i} differs"
+  # re-reading an earlier band must reload it rather than return stale pixels
+  assert np.array_equal(banded[0], eager[0])
+
+
+def test_a_transient_short_read_is_retried_and_recovers(
+  tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+  """The backend intermittently reports the stream ended mid-segment. The retry
+  exists so one bad read costs a re-decode of that span, not the run."""
+  import threading
+
+  from specialist.vi_ba import pipeline
+
+  video = tmp_path / "VID_x_00_001.mp4"
+  _write_video(video, n_frames=220, width=64, height=64)
+  clean, _ = pipeline.decode_lens_keyframes(
+    video, 220, 30.0, start=0.0, duration=None, keyframe_every=3, keep_color=False
+  )
+
+  real_capture = cv2.VideoCapture
+  lock = threading.Lock()
+  fired: list[bool] = []
+
+  class OneShortRead:
+    """Fails once inside the span starting at frame 0, which is the only span
+    that never seeks, so the failure cannot land in the final segment where
+    running out is legitimate."""
+
+    def __init__(self, path: str) -> None:
+      self._cap = real_capture(path)
+      self._seeked = False
+
+    def _fails_now(self) -> bool:
+      with lock:
+        if self._seeked or fired:
+          return False
+        fired.append(True)
+        return True
+
+    def set(self, prop: int, value: float) -> bool:
+      self._seeked = True
+      return bool(self._cap.set(prop, value))
+
+    def get(self, prop: int) -> float:
+      return float(self._cap.get(prop))
+
+    def grab(self) -> bool:
+      return False if self._fails_now() else bool(self._cap.grab())
+
+    def read(self) -> tuple[bool, np.ndarray | None]:
+      if self._fails_now():
+        return False, None
+      ok, frame = self._cap.read()
+      return bool(ok), frame
+
+    def release(self) -> None:
+      self._cap.release()
+
+  monkeypatch.setattr(pipeline.cv2, "VideoCapture", OneShortRead)
+  recovered, _ = pipeline.decode_lens_keyframes(
+    video, 220, 30.0, start=0.0, duration=None, keyframe_every=3, keep_color=False
+  )
+
+  assert fired, "the injected short read never fired, so nothing was retried"
+  assert len(recovered) == len(clean)
+  for a, b in zip(recovered, clean, strict=True):
+    assert np.array_equal(a, b)
+
+
+def test_a_band_that_comes_up_short_is_named(
+  tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+  """A band's own last segment sits mid-file, where the decode guard forgives a
+  short read because it cannot tell that band from the end of the lens. Without
+  a count check the shortfall surfaces far away as an index error."""
+  from specialist.vi_ba import pipeline
+
+  video = tmp_path / "VID_x_00_001.mp4"
+  _write_video(video, n_frames=60, width=64, height=64)
+  frames = pipeline.BandedKeyframes(
+    video, 60, 30.0, start=0.0, duration=None, keyframe_every=3, band=4
+  )
+  real = pipeline.decode_lens_keyframes
+  monkeypatch.setattr(
+    pipeline,
+    "decode_lens_keyframes",
+    lambda *a, **k: (real(*a, **k)[0][:-1], []),
+  )
+  with pytest.raises(RuntimeError, match="band"):
+    frames[0]
