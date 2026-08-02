@@ -3,6 +3,7 @@ RANSAC, and track chaining, all on synthetic frames."""
 
 from __future__ import annotations
 
+import os
 from collections.abc import Sequence
 
 import numpy as np
@@ -247,6 +248,17 @@ def test_flow_chunk_is_capped_regardless_of_memory() -> None:
 
   frames = [np.zeros((2880, 2880), dtype=np.uint8) for _ in range(4000)]
   assert features._flow_chunk_size(frames) <= features._FLOW_CHUNK_MAX_PAIRS
+
+
+def test_cpu_budget_follows_the_cores_the_process_may_run_on() -> None:
+  """``os.cpu_count`` reports the machine, not the share this process was given,
+  so pinned or containerised runs sized their pools for cores they never get."""
+  from specialist.vi_ba import features
+
+  budget = features.cpu_budget()
+  assert 0 < budget <= (os.cpu_count() or budget)
+  if (affinity := getattr(os, "sched_getaffinity", None)) is not None:
+    assert budget == len(affinity(0))
 
 
 class _CountingFrames(Sequence[np.ndarray]):
