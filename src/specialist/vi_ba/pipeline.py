@@ -170,6 +170,19 @@ def capture_duration(video_path: Path) -> float:
   return _shared_frame_count(video_path, rear_path) / fps
 
 
+def _report_early_stop(
+  cap: cv2.VideoCapture, path: Path, frame_index: int, container_frames: int
+) -> None:
+  """Name why a span stopped: a failed decode or the end of the stream."""
+  landed = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+  reason = "end of stream" if landed >= container_frames else "decode failed"
+  print(
+    f"  [decode] {path.name}: stopped at frame {frame_index} "
+    f"(position {landed} of {container_frames}) — {reason}",
+    flush=True,
+  )
+
+
 def release_freed_memory() -> None:
   """Hand freed heap back to the OS; a no-op without glibc's ``malloc_trim``."""
   try:
@@ -215,10 +228,12 @@ def decode_lens_keyframes(
         # Only keyframes pay the YUV->BGR retrieve(); the rest only grab().
         if i % keyframe_every != 0:
           if not cap.grab():
+            _report_early_stop(cap, path, i, container_frames)
             break
           continue
         ok, frame = cap.read()
         if not ok:
+          _report_early_stop(cap, path, i, container_frames)
           break
         gray_frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
         if keep_color:
@@ -301,10 +316,12 @@ def decode_dual_keyframes(
         # Only keyframes pay the YUV->BGR retrieve(); the rest only grab().
         if i % keyframe_every != 0:
           if not cap.grab():
+            _report_early_stop(cap, path, i, container_frames)
             break
           continue
         ok, frame = cap.read()
         if not ok:
+          _report_early_stop(cap, path, i, container_frames)
           break
         gray_frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
         if keep_color:
