@@ -221,16 +221,17 @@ class PreparedTracker:
 
 
 def _build_non_anchor_tag_masks(
-  frames: Sequence[np.ndarray],
+  shape: tuple[int, int],
   tags_per_kf: list[list[TagDetection]],
   exclude_tag_ids: set[int],
   pad_px: int,
 ) -> list[list[Rect]]:
   """Per keyframe, the padded boxes of every non-anchor tag. Rectangles rather
-  than planes: a full-length dual capture would hold tens of GB of masks."""
+  than planes: a full-length dual capture would hold tens of GB of masks. Only
+  the frame shape is needed, so this never walks the lens's pixels."""
+  h, w = shape
   blocked: list[list[Rect]] = []
-  for frame, tags in zip(frames, tags_per_kf, strict=True):
-    h, w = frame.shape[:2]
+  for tags in tags_per_kf:
     rects: list[Rect] = []
     for tag in tags:
       if int(tag.tag_id) in exclude_tag_ids:
@@ -1016,11 +1017,12 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
     """Decode this lens, take everything downstream needs from its pixels, and
     drop them again before the other lens is touched."""
     ch.gray = lens_frames(path)
+    shape = ch.gray[0].shape[:2]
     ch.masks = _build_non_anchor_tag_masks(
-      ch.gray, ch.tags, anchor_tag_ids, args.frontend.mask_tag_pad
+      shape, ch.tags, anchor_tag_ids, args.frontend.mask_tag_pad
     )
     if ch is rear:
-      _apply_static_mask_rects(ch.masks, static_rects, ch.gray[0].shape[:2])
+      _apply_static_mask_rects(ch.masks, static_rects, shape)
     ch.feature_frames, ch.tracks = run_lens_frontend(
       ch.gray, ch.setup.params, cfg, masks=ch.masks
     )
