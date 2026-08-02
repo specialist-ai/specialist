@@ -21,8 +21,12 @@ from specialist.vi_ba.compose import (
 )
 from specialist.vi_ba.configs import Args, validate
 from specialist.vi_ba.export import Summary, build_raw_export, write_run_json
-from specialist.vi_ba.features import set_precompute_concurrency
-from specialist.vi_ba.pipeline import capture_duration
+from specialist.vi_ba.features import available_ram, set_precompute_concurrency
+from specialist.vi_ba.pipeline import (
+  capture_duration,
+  probe_capture,
+  resolve_keyframe_every,
+)
 from specialist.vi_ba.reference_solve import (
   adopt_ba_refined_estimates,
   solve_joint,
@@ -88,6 +92,22 @@ def _resolve_urdf_path(explicit: Path | None) -> Path | None:
     return None
 
 
+def _captures_that_fit(
+  specs: list[tuple[str, Path, float, int, int, int]], args: Args
+) -> int:
+  """How many captures can prep at once before their keyframes exceed memory."""
+  if len(specs) <= 1:
+    return len(specs)
+  _, insv_path, _, _, _, _ = specs[0]
+  _, fps, width = probe_capture(insv_path)
+  duration = args.window.duration or capture_duration(insv_path)
+  stride = resolve_keyframe_every(args.window.keyframe_every, fps)
+  keyframes = max(1, int(duration * fps / stride))
+  per_capture = keyframes * 2 * width * width  # two lenses, one uint8 plane each
+  affordable = int(available_ram() * _PREP_MEMORY_SHARE / max(1, per_capture))
+  return max(1, min(len(specs), affordable))
+
+
 def _stage_timer() -> Callable[[str], None]:
   last = time.perf_counter()
 
@@ -116,6 +136,10 @@ def _print_capture_diagnostics(
     speed = np.linalg.norm(np.diff(pts, axis=0), axis=1) / np.where(dt > 0, dt, 1.0)
     i = int(np.argmax(speed))
     print(f"  [{t.name}] max={speed[i]:.2f} m/s at kf {i}→{i + 1} (t={kf_t[i]:.2f}s)")
+
+
+# Share of free memory the concurrent decodes may claim between them.
+_PREP_MEMORY_SHARE = 0.35
 
 
 def main(args: Args) -> None:
@@ -182,12 +206,13 @@ def main(args: Args) -> None:
     )
     return tracker
 
-  # The flow precompute shrinks its per-lens pool to fit the shared cv2 thread pool.
-  set_precompute_concurrency(len(specs))
-  if len(specs) == 1:
-    trackers: list[PreparedTracker] = [_prep_one(specs[0])]
+  # Captures prep concurrently as far as their decoded keyframes fit in memory.
+  concurrent = _captures_that_fit(specs, args)
+  set_precompute_concurrency(concurrent)
+  if concurrent == 1:
+    trackers: list[PreparedTracker] = [_prep_one(spec) for spec in specs]
   else:
-    with ThreadPoolExecutor(max_workers=len(specs)) as prep_pool:
+    with ThreadPoolExecutor(max_workers=concurrent) as prep_pool:
       trackers = list(prep_pool.map(_prep_one, specs))
   # Free the GPU flow workers' device memory for the joint bundle adjustment.
   from specialist.vi_ba import gpu_flow
