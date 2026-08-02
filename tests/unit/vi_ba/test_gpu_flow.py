@@ -56,3 +56,59 @@ def test_a_stream_already_shut_down_is_not_handed_out_again() -> None:
   gpu_flow._engines.clear()
   with pytest.raises(Exception):  # noqa: B017 - no GPU here; it must not reuse
     gpu_flow.prime(_frames(), 10, 2)
+
+
+def _fake_torch(free_gb: float, total_gb: float) -> Any:
+  class _Cuda:
+    @staticmethod
+    def is_available() -> bool:
+      return True
+
+    @staticmethod
+    def device_count() -> int:
+      return 1
+
+    @staticmethod
+    def mem_get_info(i: int) -> tuple[int, int]:
+      return int(free_gb * 2**30), int(total_gb * 2**30)
+
+  class _Torch:
+    cuda = _Cuda()
+
+  return _Torch()
+
+
+def test_claimed_batch_is_sized_from_total_memory(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  """A busy card still gets the batch its hardware affords: the size comes
+  from total memory, not the free snapshot."""
+  fake = _fake_torch(free_gb=9.0, total_gb=24.0)
+  monkeypatch.setattr(gpu_flow, "_import_backend", lambda: (fake, None))
+  idx, batch = gpu_flow._claim_device()
+  assert (idx, batch) == (
+    0,
+    int((24.0 - gpu_flow._RESERVE_GB) / gpu_flow._GB_PER_PAIR),
+  )
+
+
+def test_claim_requires_the_minimum_free_memory(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  """A nearly-full card is not claimable even though its total could host a
+  batch."""
+  fake = _fake_torch(free_gb=gpu_flow._MIN_FREE_GB - 0.5, total_gb=24.0)
+  monkeypatch.setattr(gpu_flow, "_import_backend", lambda: (fake, None))
+  with pytest.raises(RuntimeError, match="enough free memory"):
+    gpu_flow._claim_device()
+
+
+def test_device_batch_floors_at_zero_below_the_reserve() -> None:
+  """A card smaller than the reserve hosts nothing."""
+  assert gpu_flow._device_batch(total_gb=gpu_flow._RESERVE_GB) == 0
+  assert gpu_flow._device_batch(total_gb=0.0) == 0
+
+
+def test_device_batch_caps_at_the_maximum() -> None:
+  """The per-stream batch is bounded regardless of card size."""
+  assert gpu_flow._device_batch(total_gb=1024.0) == gpu_flow._MAX_BATCH

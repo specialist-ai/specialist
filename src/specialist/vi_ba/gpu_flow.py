@@ -27,18 +27,15 @@ _FlowPair = tuple[npt.NDArray[np.float32], npt.NDArray[np.float32]]
 
 __all__ = ["unavailable_reason", "prime", "iter_flows", "shutdown"]
 
-# Per-stream batch. Each batch of B pairs holds the fast wavefront's transient
-# working set at the native 2880x2880 lens resolution; the forward (vr=10) and
-# backward (vr=2) passes run in turn, so the peak is a single pass, budgeted at
-# ~1.15 GB/pair. The batch is sized from mem_get_info free memory: _GB_PER_PAIR is
-# the budgeted per-pair transient, _RESERVE_GB is headroom for the fixed CUDA
-# context plus upload/download staging, and a GPU under _MIN_FREE_GB is skipped. A
-# stream that OOMs while warming halves its batch and retries. expandable_segments
-# keeps the transient allocations from fragmenting.
+# Per-stream batch, sized from the card's total memory. _GB_PER_PAIR is the
+# per-pair transient working set at _REFERENCE_PIXELS and scales with the frame
+# area, _RESERVE_GB is headroom for the CUDA context plus staging, and a GPU
+# under _MIN_FREE_GB is skipped.
 _MAX_BATCH = 24
 _MIN_FREE_GB = 8.0
 _RESERVE_GB = 3.0
 _GB_PER_PAIR = 1.15
+_REFERENCE_PIXELS = 2880 * 2880
 
 # Distinct GPUs one process will claim; past the cap, extra streams double up
 # on the most-free GPU.
@@ -80,14 +77,19 @@ def _import_backend() -> tuple[Any, Any]:
   return _backend
 
 
-def _device_batch(free_gb: float) -> int:
-  """Largest per-stream batch that fits ``free_gb`` of free memory, capped."""
-  batch = int((free_gb - _RESERVE_GB) / _GB_PER_PAIR)
+def _device_batch(total_gb: float, pair_gb: float = _GB_PER_PAIR) -> int:
+  """Per-stream batch for a card with ``total_gb`` of memory at ``pair_gb``
+  per pair, capped; the warmup's OOM-halving covers a busy card."""
+  batch = int((total_gb - _RESERVE_GB) / pair_gb)
   return max(0, min(_MAX_BATCH, batch))
 
 
 def _free_gb(torch: Any, i: int) -> float:
   return float(torch.cuda.mem_get_info(i)[0]) / 2**30
+
+
+def _total_gb(torch: Any, i: int) -> float:
+  return float(torch.cuda.mem_get_info(i)[1]) / 2**30
 
 
 def unavailable_reason() -> str | None:
@@ -103,14 +105,14 @@ def unavailable_reason() -> str | None:
       return "torch reports no CUDA device"
     for i in range(torch.cuda.device_count()):
       free = _free_gb(torch, i)
-      if free >= _MIN_FREE_GB and _device_batch(free) >= 1:
+      if free >= _MIN_FREE_GB and _device_batch(_total_gb(torch, i)) >= 1:
         return None
     return "no GPU has enough free memory"
   except Exception as exc:
     return f"CUDA probe failed: {exc!r}"
 
 
-def _claim_device() -> tuple[int, int]:
+def _claim_device(pair_gb: float = _GB_PER_PAIR) -> tuple[int, int]:
   """Assign this stream a GPU and its batch: the most-free GPU not yet claimed in
   this process, or (all claimed / capped) the most-free GPU overall, doubling up.
   Raises when no GPU can host even one pair."""
@@ -121,18 +123,15 @@ def _claim_device() -> tuple[int, int]:
     free = {
       i: _free_gb(torch, i) for i in range(torch.cuda.device_count()) if i not in _bad
     }
-    unclaimed = [
-      i
-      for i in free
-      if i not in _claimed and free[i] >= _MIN_FREE_GB and _device_batch(free[i]) >= 1
-    ]
-    shareable = [i for i in free if _device_batch(free[i]) >= 1]
+    batch = {i: _device_batch(_total_gb(torch, i), pair_gb) for i in free}
+    shareable = [i for i in free if free[i] >= _MIN_FREE_GB and batch[i] >= 1]
     if not shareable:
       raise RuntimeError("no GPU has enough free memory for the flow backend")
+    unclaimed = [i for i in shareable if i not in _claimed]
     pool = unclaimed if unclaimed and len(_claimed) < _MAX_GPUS else shareable
     idx = max(pool, key=lambda i: free[i])
     _claimed[idx] = _claimed.get(idx, 0) + 1
-    return idx, _device_batch(free[idx])
+    return idx, batch[idx]
 
 
 def _drop_claim(idx: int) -> None:
@@ -288,8 +287,8 @@ class _Engine:
   """One lens stream bound to one GPU: a single worker and the batched dispatch
   over it."""
 
-  def __init__(self, fwd_vr: int, bwd_vr: int):
-    self.device_index, batch = _claim_device()
+  def __init__(self, fwd_vr: int, bwd_vr: int, pair_gb: float = _GB_PER_PAIR):
+    self.device_index, batch = _claim_device(pair_gb)
     self._worker = _Worker(self.device_index, batch, fwd_vr, bwd_vr)
 
   @property
@@ -360,7 +359,9 @@ def prime(frames: Sequence[np.ndarray], fwd_vr: int, bwd_vr: int) -> _Engine:
   tries = torch.cuda.device_count() if torch.cuda.is_available() else 1
   last_exc: Exception | None = None
   for _ in range(tries):
-    engine = _Engine(fwd_vr, bwd_vr)  # raises when no GPU is claimable
+    h, w = frames[0].shape[:2]
+    pair_gb = _GB_PER_PAIR * (h * w) / _REFERENCE_PIXELS
+    engine = _Engine(fwd_vr, bwd_vr, pair_gb)  # raises when no GPU is claimable
     try:
       engine.prime(frames)
     except Exception as exc:
