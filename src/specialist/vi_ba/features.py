@@ -104,21 +104,30 @@ def _cv2_thread_budget() -> int:
   return max(n_cpu // 8, min(n_cpu, 32))
 
 
+_FLOW_CHUNK_MAX_PAIRS = 24  # one gpu_flow._MAX_BATCH: all the consumer can be ahead
+
+
+def available_ram() -> int:
+  """Bytes still free for the flow cache, falling back to the machine total
+  where the platform cannot report availability."""
+  page = os.sysconf("SC_PAGE_SIZE")
+  try:
+    return page * os.sysconf("SC_AVPHYS_PAGES")
+  except (ValueError, OSError):
+    return page * os.sysconf("SC_PHYS_PAGES")
+
+
 def _flow_chunk_size(frames: list[np.ndarray]) -> int:
   """How many consecutive flow pairs to precompute and hold at once, bounded so
-  the cached fields fit a fraction of RAM. Each pair holds forward+backward
-  ``(H, W, 2)`` float32 fields, and the two lenses (times any concurrent trackers)
-  share memory. On a big-RAM host this is the whole sequence in one chunk; on a
-  small host it caps peak memory so the precompute does not exhaust RAM."""
+  the cached fields fit a fraction of the available memory."""
   n = len(frames)
   if n < 2:
     return 1
   h, w = frames[0].shape[:2]
   per_pair_bytes = h * w * 2 * 4 * 2  # (H, W, 2) float32, forward + backward
-  total_ram = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
   lanes = 2 * _PRECOMPUTE_CONCURRENCY  # two lenses run concurrently per tracker
-  chunk = int(total_ram * 0.25 / (per_pair_bytes * lanes))
-  return max(1, min(n - 1, chunk))
+  chunk = int(available_ram() * 0.25 / (per_pair_bytes * lanes))
+  return max(1, min(n - 1, chunk, _FLOW_CHUNK_MAX_PAIRS))
 
 
 def _iter_dis_flows(

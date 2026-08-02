@@ -461,11 +461,9 @@ def _cap_landmarks(
 
 
 def _loop_closure_tracks(
-  frames: list[np.ndarray],
-  masks: list[list[Rect]],
+  orb: list[Frame],
   body_poses: list[gtsam.Pose3],
   lens: LensSetup,
-  n_features: int,
   base_track_id: int,
   max_center_dist: float,
   min_kf_gap: int,
@@ -480,13 +478,8 @@ def _loop_closure_tracks(
   into multi-view tracks spanning the lifts. Triangulated against the (drifted)
   poses these become wide-baseline landmarks whose reprojection inconsistency
   drives the bundle to pull the revisits back together, cancelling the drift."""
-  orb = parallel_map(
-    lambda f, m: detect_orb(f, n_features, 20, mask_plane(f.shape[:2], m)),
-    frames,
-    masks,
-  )
   centers = np.asarray([_translation(p.compose(lens.extrinsic)) for p in body_poses])
-  n = len(frames)
+  n = len(orb)
   parent: dict[tuple[int, int], tuple[int, int]] = {}
 
   def find(x: tuple[int, int]) -> tuple[int, int]:
@@ -901,6 +894,7 @@ class _LensChannel:
   gray: list[np.ndarray]
   tags: list[list[TagDetection]]
   masks: list[list[Rect]] = field(default_factory=list)
+  orb: list[Frame] = field(default_factory=list)
   feature_frames: list[Frame] = field(default_factory=list)
   tracks: dict[int, dict[int, Float64Array]] = field(default_factory=dict)
   kept: dict[int, dict[int, Float64Array]] = field(default_factory=dict)
@@ -975,6 +969,9 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
 
   front = _LensChannel(setup=front_lens, gray=front_gray, tags=front_tags_per_kf)
   rear = _LensChannel(setup=rear_lens, gray=rear_gray, tags=rear_tags_per_kf)
+  # The channels own the keyframes from here; a second reference would keep
+  # every decoded plane alive for the rest of prep.
+  front_gray, rear_gray = [], []
   anchor_tag_ids = set(obs_by_tag)
   for ch in (front, rear):
     ch.masks = _build_non_anchor_tag_masks(
@@ -1005,6 +1002,19 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
       ),
     )
   )
+  # Loop closure needs ORB over the front keyframes; detecting it here lets the
+  # decoded pixels go, and they are by far the largest thing prep holds.
+  if args.frontend.loop_closure:
+    front.orb = parallel_map(
+      lambda f, m: detect_orb(
+        f, args.frontend.orb_n_features, 20, mask_plane(f.shape[:2], m)
+      ),
+      front.gray,
+      front.masks,
+    )
+  for ch in (front, rear):
+    ch.gray = []
+    ch.masks = []
   for ch in (front, rear):
     ch.kept = {
       t: o for t, o in ch.tracks.items() if len(o) >= args.frontend.min_track_length
@@ -1167,11 +1177,9 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
     loop_tracks: dict[int, dict[int, Float64Array]] = {}
     if args.frontend.loop_closure:
       loop_tracks = _loop_closure_tracks(
-        front.gray,
-        front.masks,
+        front.orb,
         body_poses,
         front_lens,
-        args.frontend.orb_n_features,
         max(front.kept, default=0),
         args.frontend.loop_closure_max_dist,
         args.frontend.loop_closure_min_kf_gap,
