@@ -62,13 +62,15 @@ from specialist.vi_ba.init import (
 )
 from specialist.vi_ba.pipeline import (
   LensFrontendConfig,
-  decode_dual_keyframes,
+  decode_lens_keyframes,
   filter_tracks_by_parallax,
   keyframe_timestamps,
   lens_setups,
   probe_capture,
+  release_freed_memory,
   resolve_keyframe_every,
   run_lens_frontend,
+  shared_keyframe_bound,
   triangulate_lens,
   unproject_tracks,
 )
@@ -915,24 +917,32 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
   front_lens, rear_lens = lens_setups(extrinsics, decoded_width)
 
   keyframe_every = resolve_keyframe_every(args.keyframe_every, fps)
-  front_gray, rear_gray, front_color, rear_color = decode_dual_keyframes(
-    args.insv_path,
-    rear_path,
-    fps,
-    args.start,
-    args.duration,
-    keyframe_every,
-    keep_color=args.keep_frames,
-  )
-  n_keyframes = len(front_gray)
+  # One lens at a time: a lens's keyframes are the largest thing prep holds, and
+  # tag detection is the only stage that needs both lenses before the frontend.
+  bound = shared_keyframe_bound(args.insv_path, rear_path)
+
+  def decode_lens(path: Path) -> tuple[list[np.ndarray], list[bytes]]:
+    return decode_lens_keyframes(
+      path, bound, fps, args.start, args.duration, keyframe_every, args.keep_frames
+    )
+
+  front_gray, front_color = decode_lens(args.insv_path)
+  front_tags_per_kf = detect_all_tags(front_gray)
+  n_front = len(front_gray)
+  front_gray = []
+  release_freed_memory()
+  rear_gray, rear_color = decode_lens(rear_path)
+  rear_tags_per_kf = detect_all_tags(rear_gray)
+  n_keyframes = min(n_front, len(rear_gray))
+  rear_gray = []
+  release_freed_memory()
   if n_keyframes < 3:
     raise RuntimeError(f"only {n_keyframes} keyframes decoded — window too short")
+  front_tags_per_kf = front_tags_per_kf[:n_keyframes]
+  rear_tags_per_kf = rear_tags_per_kf[:n_keyframes]
+  front_color = front_color[:n_keyframes]
+  rear_color = rear_color[:n_keyframes]
   keyframe_times = keyframe_timestamps(args.start, fps, keyframe_every, n_keyframes)
-
-  front_tags_per_kf, rear_tags_per_kf = run_two_concurrently(
-    lambda: detect_all_tags(front_gray),
-    lambda: detect_all_tags(rear_gray),
-  )
 
   imu_to_body = np.asarray(args.imu.imu_to_body, dtype=np.float64)
   imu = _body_imu_samples(data, imu_to_body)
@@ -967,18 +977,10 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
   for tag_id, obs in obs_by_tag.items():
     _print_anchor_geometry(name, tag_id, lens_sides, obs)
 
-  front = _LensChannel(setup=front_lens, gray=front_gray, tags=front_tags_per_kf)
-  rear = _LensChannel(setup=rear_lens, gray=rear_gray, tags=rear_tags_per_kf)
-  # The channels own the keyframes from here; a second reference would keep
-  # every decoded plane alive for the rest of prep.
-  front_gray, rear_gray = [], []
+  front = _LensChannel(setup=front_lens, gray=[], tags=front_tags_per_kf)
+  rear = _LensChannel(setup=rear_lens, gray=[], tags=rear_tags_per_kf)
   anchor_tag_ids = set(obs_by_tag)
-  for ch in (front, rear):
-    ch.masks = _build_non_anchor_tag_masks(
-      ch.gray, ch.tags, anchor_tag_ids, args.frontend.mask_tag_pad
-    )
   static_rects = list(args.frontend.mask_rear_rects)
-  _apply_static_mask_rects(rear.masks, static_rects, rear.gray[0].shape[:2])
 
   cfg = LensFrontendConfig(
     n_features=args.frontend.orb_n_features,
@@ -986,35 +988,33 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
     max_half_angle=args.frontend.max_half_angle,
     gpu_flow=args.frontend.gpu_flow,
   )
-  (front.feature_frames, front.tracks), (rear.feature_frames, rear.tracks) = (
-    run_two_concurrently(
-      lambda: run_lens_frontend(
-        front.gray,
-        front.setup.params,
-        cfg,
-        masks=front.masks,
-      ),
-      lambda: run_lens_frontend(
-        rear.gray,
-        rear.setup.params,
-        cfg,
-        masks=rear.masks,
-      ),
+
+  def run_lens(ch: _LensChannel, path: Path) -> None:
+    """Decode this lens, take everything downstream needs from its pixels, and
+    drop them again before the other lens is touched."""
+    ch.gray = decode_lens(path)[0][:n_keyframes]
+    ch.masks = _build_non_anchor_tag_masks(
+      ch.gray, ch.tags, anchor_tag_ids, args.frontend.mask_tag_pad
     )
-  )
-  # Loop closure needs ORB over the front keyframes; detecting it here lets the
-  # decoded pixels go, and they are by far the largest thing prep holds.
-  if args.frontend.loop_closure:
-    front.orb = parallel_map(
-      lambda f, m: detect_orb(
-        f, args.frontend.orb_n_features, 20, mask_plane(f.shape[:2], m)
-      ),
-      front.gray,
-      front.masks,
+    if ch is rear:
+      _apply_static_mask_rects(ch.masks, static_rects, ch.gray[0].shape[:2])
+    ch.feature_frames, ch.tracks = run_lens_frontend(
+      ch.gray, ch.setup.params, cfg, masks=ch.masks
     )
-  for ch in (front, rear):
+    if ch is front and args.frontend.loop_closure:
+      ch.orb = parallel_map(
+        lambda f, m: detect_orb(
+          f, args.frontend.orb_n_features, 20, mask_plane(f.shape[:2], m)
+        ),
+        ch.gray,
+        ch.masks,
+      )
     ch.gray = []
     ch.masks = []
+    release_freed_memory()
+
+  run_lens(front, args.insv_path)
+  run_lens(rear, rear_path)
   for ch in (front, rear):
     ch.kept = {
       t: o for t, o in ch.tracks.items() if len(o) >= args.frontend.min_track_length
