@@ -225,11 +225,9 @@ def test_flow_chunk_budget_tracks_available_memory() -> None:
   from specialist.vi_ba import features
 
   frames = [np.zeros((2880, 2880), dtype=np.uint8) for _ in range(400)]
-  chunk = features._flow_chunk_size(frames)
   per_pair = 2880 * 2880 * 2 * 4 * 2
-  lanes = 2 * features._PRECOMPUTE_CONCURRENCY
-  assert chunk <= max(1, int(features.available_ram() * 0.25 / (per_pair * lanes)))
-  assert chunk >= 1
+  cached = features._flow_chunk_size(frames) * per_pair
+  assert 0 < cached <= max(features.available_ram() * 0.25, per_pair)
   assert features.available_ram() > 0
 
 

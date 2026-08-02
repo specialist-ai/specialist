@@ -115,7 +115,7 @@ def _flow_chunk_size(frames: list[np.ndarray]) -> int:
     return 1
   h, w = frames[0].shape[:2]
   per_pair_bytes = h * w * 2 * 4 * 2  # (H, W, 2) float32, forward + backward
-  lanes = 2 * _PRECOMPUTE_CONCURRENCY  # two lenses run concurrently per tracker
+  lanes = _PRECOMPUTE_CONCURRENCY  # one lens at a time, one lane per capture
   chunk = int(available_ram() * 0.25 / (per_pair_bytes * lanes))
   return max(1, min(n - 1, chunk, _FLOW_CHUNK_MAX_PAIRS))
 
