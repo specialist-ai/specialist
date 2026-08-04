@@ -114,8 +114,9 @@ def add_mei_factor(
   pixel: Float64Array,
   noise: gtsam.noiseModel.Base,
   lens: LensSetup,
+  obs_bearing: Float64Array | None = None,
 ) -> None:
-  """Push one MEI reprojection factor tying ``pose_key`` to ``point_key``."""
+  """Push one MEI reprojection factor; ``obs_bearing`` arms the cheirality guard."""
   graph.push_back(
     make_mei_factor_cpp(
       pose_key,
@@ -124,7 +125,7 @@ def add_mei_factor(
       noise,
       lens.extrinsic,
       *_mei_intrinsics(lens.params),
-      np.zeros(3),
+      np.zeros(3) if obs_bearing is None else _as_vec3(obs_bearing),
     )
   )
 
