@@ -283,7 +283,9 @@ def _detect_anchor_obs(
   tag_size: float,
   lens_sides: tuple[_LensSide, ...],
 ) -> dict[int, dict[str, gtsam.Pose3]]:
-  """``{kf: {side: cam_T_tag}}`` for one anchor id across both lens sides."""
+  """``{kf: {side: cam_T_tag}}`` for one anchor id across both lens sides.
+  Ungated: the prep grounding and the secondary-anchor seeds need edge
+  sightings where nothing better is visible; the corner factors gate."""
   obs: dict[int, dict[str, gtsam.Pose3]] = {}
   for side, lens, tags, rotations in lens_sides:
     for kf, pose in anchor_pose_from_tags(
@@ -1093,7 +1095,7 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
   cfg = LensFrontendConfig(
     n_features=args.frontend.orb_n_features,
     ransac_threshold=args.frontend.ransac_threshold,
-    max_half_angle=args.frontend.max_half_angle,
+    max_half_angle=args.frontend.feature_max_half_angle,
     gpu_flow=args.frontend.gpu_flow,
     flow_scale=args.frontend.flow_scale,
   )

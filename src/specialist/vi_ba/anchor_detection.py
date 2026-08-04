@@ -30,6 +30,7 @@ _local = threading.local()
 
 __all__ = [
   "TagDetection",
+  "tag_half_angle",
   "anchor_pose_from_tags",
   "detect_all_tags",
   "estimate_camera_to_tag_pose",
@@ -139,6 +140,17 @@ def tag_center_bearing(det: TagDetection, params: MeiParams) -> Float64Array:
     np.asarray(det.center, dtype=np.float64).reshape(1, 2), params
   )[0]
   return np.asarray(bearing, dtype=np.float64)
+
+
+def tag_half_angle(det: TagDetection, params: MeiParams) -> float:
+  """Off-axis angle (rad) of a sighting's corners-mean bearing; ``inf`` when
+  it does not unproject."""
+  corners = np.asarray(det.corners, dtype=np.float64)
+  bearing = mei_unproject(corners.mean(axis=0).reshape(1, 2), params)[0]
+  norm = float(np.linalg.norm(bearing))
+  if not np.isfinite(norm) or norm <= 1e-9:
+    return float("inf")
+  return float(np.arccos(np.clip(bearing[2] / norm, -1.0, 1.0)))
 
 
 def estimate_camera_to_tag_pose(
