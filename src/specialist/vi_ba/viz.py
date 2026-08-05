@@ -99,7 +99,8 @@ def _send_lens_tag_columns(
 ) -> None:
   """Per-keyframe AprilTag overlay: 5-point closed-quad ``LineStrips2D``
   through detected corners + id label. Anchor tag is yellow, other tags
-  are red with their padded feature-detection-mask bbox drawn alongside."""
+  are red; a negative ``mask_pad_px`` means the frontend masks no tag, so no
+  mask bbox is drawn alongside."""
   yellow = np.asarray(_YELLOW, dtype=np.uint8)
   red = np.asarray(_RED, dtype=np.uint8)
   strips: list[np.ndarray] = []
@@ -120,7 +121,7 @@ def _send_lens_tag_columns(
       labels.append(str(tid))
       is_anchor = int(tid) in anchor_tag_ids
       colors.append(yellow if is_anchor else red)
-      if not is_anchor:
+      if not is_anchor and mask_pad_px >= 0:
         mn = corners.min(axis=0) - float(mask_pad_px)
         mx = corners.max(axis=0) + float(mask_pad_px)
         mask_centers.append(((mn + mx) * 0.5).astype(np.float32))
@@ -277,7 +278,7 @@ def _send_lens_columns(
   times: rr.TimeColumn,
   color: tuple[int, int, int],
 ) -> None:
-  if keypoints is None:
+  if not keypoints:
     return
   _send_point_columns(f"{entity_path}/keypoints", keypoints, index, 1.5, color)
   counts = np.asarray([kp.shape[0] for kp in keypoints], dtype=np.float64)

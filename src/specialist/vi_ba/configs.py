@@ -26,34 +26,57 @@ __all__ = [
 
 @dataclass
 class FrontendCfg:
-  orb_n_features: int = 1000
+  orb_n_features: int = 4000
   # Compute the DIS optical flow on the GPU; falls back loudly to the cv2 path
   # when torch/CUDA is unavailable.
   gpu_flow: bool = True
+
   ransac_threshold: float = 4.5
+  # Fraction of the frame the dense flow is computed at.
+  flow_scale: float = 0.25
+
   min_track_length: int = 3
+  loop_n_neighbors: int = 8
+  loop_match_ratio: float = 0.8
+  loop_min_inliers: int = 10
   max_half_angle: float = float(np.deg2rad(70.0))
-  reproj_sigma: float = 2.25
+  reproj_sigma: float = 0.5
+  # Padding (px) around a masked tag's detected box. The track layer records
+  # the extent used, with -1 standing for masking turned off.
   mask_tag_pad: int = 45
+  # Exclude non-anchor tags (the grippers' own plates) from feature detection.
+  # The essential-matrix RANSAC and the parallax filter also reject features
+  # that move with the gripper, so this is belt-and-braces.
+  mask_tags: bool = True
+
   min_parallax: float = float(np.deg2rad(0.5))
   # Max metric depth (m) for kept landmarks in the final (scaled) triangulation.
   max_landmark_depth: float = 5.0
+
   mask_rear_rects: tuple[tuple[int, int, int, int], ...] = ((728, 1425, 2153, 2880),)
-  init_min_shared_tracks: int = 60
+  init_min_shared_tracks: int = 30
+  vo_min_registered_ratio: float = 0.7
+  # Run the rear lens's landmark frontend (flow, features, triangulation). Its
+  # tags are always detected; this only governs the visual landmarks, which the
+  # gripper body and the static mask cover much of.
+  rear_landmarks: bool = False
   # Re-match ORB features between spatially-close, non-adjacent keyframes to
   # recover tracks the intervening motion breaks.
   loop_closure: bool = True
+
   loop_closure_max_dist: float = 0.1
   loop_closure_min_kf_gap: int = 15
   # Triangulate the revisit loop landmarks from the anchor-covisible views alone.
   anchored_loop_closure: bool = True
   # Cap on triangulated landmarks per lens (keeps the longest-track,
   # best-constrained landmarks). The dense far-field front structure is
-  # redundant; capping keeps the joint BA tractable.
-  max_landmarks_per_lens: int = 400
+  # redundant; the cap bounds the joint BA size.
+  max_landmarks_per_lens: int = 4000
   # Cap on reprojection observations per track fed to the joint BA (endpoints +
   # evenly-spaced middle).
   max_obs_per_track: int = 8
+  # Per-thread AprilTag detectors so concurrent tag walks overlap.
+  parallel_tag_detect: bool = True
 
 
 @dataclass
@@ -127,10 +150,7 @@ class Args:
   # recover the URDF revolute-joint angles each keyframe.
   left_finger_tag_ids: tuple[int, ...] = ()
   right_finger_tag_ids: tuple[int, ...] = ()
-  # Lighter frontend feature budget so the joint graph stays cheap; override per run.
-  frontend: FrontendCfg = field(
-    default_factory=lambda: FrontendCfg(orb_n_features=500, init_min_shared_tracks=30)
-  )
+  frontend: FrontendCfg = field(default_factory=FrontendCfg)
   imu: ImuCfg = field(default_factory=ImuCfg)
   gripper: GripperCfg = field(default_factory=GripperCfg)
   solver: SolverCfg = field(default_factory=SolverCfg)

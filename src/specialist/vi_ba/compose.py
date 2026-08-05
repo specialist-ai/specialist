@@ -74,6 +74,9 @@ _FINGER_SYMMETRY_SIGMA = 0.05
 _BASE_TAG_REPROJ_SIGMA = 1.5
 _BASE_TAG_PRIOR_SIGMA_ROT = 0.3
 _BASE_TAG_PRIOR_SIGMA_TRANS = 0.05
+# Cross-tracker sighting σ (px), weighted apart from the per-arm base-tag
+# factors.
+_CROSS_REPROJ_SIGMA = 3.0
 
 _MAX_KEYFRAMES_PER_TRACKER = 100_000
 _MAX_LANDMARKS_PER_TRACKER = 1_000_000
@@ -544,7 +547,7 @@ def _add_cross_tracker_factors(
   tag adds W's joint angle θ (a quaternary factor), so the cross view also
   constrains the angle; that needs W's θ variable at the keyframe (from its own
   observation or the symmetry inference)."""
-  base_tag_noise = huber_pixel_noise(_BASE_TAG_REPROJ_SIGMA)
+  base_tag_noise = huber_pixel_noise(_CROSS_REPROJ_SIGMA)
   base_tag_corners = tag_corners_local(args.gripper.tag_size)
   tracker_by_name = {t.name: t for t in trackers}
   base_count = finger_count = 0

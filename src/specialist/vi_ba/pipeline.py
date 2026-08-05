@@ -55,6 +55,9 @@ class LensFrontendConfig:
   # cv2 flow by default so the frontend primitives stay GPU-free for tests; the
   # tracker opts into the GPU wavefront via ``FrontendCfg.gpu_flow``.
   gpu_flow: bool = False
+  # Resolution the dense flow is computed at, as a fraction of the frame. DIS
+  # cost is quadratic in pixels; tracks are sampled from the lifted field.
+  flow_scale: float = 1.0
 
 
 def _scaled_mei(
@@ -504,6 +507,7 @@ def run_lens_frontend(
     n_features=cfg.n_features,
     masks=masks,
     gpu_flow=cfg.gpu_flow,
+    flow_scale=cfg.flow_scale,
   )
 
   def ransac_pair(k: int) -> npt.NDArray[np.int64]:
