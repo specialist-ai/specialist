@@ -8,29 +8,29 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from specialist.loader.audio_sync import _best_lag, _resolve_ffmpeg
+from specialist.loader.audio_sync import _best_lag, resolve_ffmpeg
 
 
-def test_resolve_ffmpeg_returns_runnable_binary(
+def testresolve_ffmpeg_returns_runnable_binary(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
   """The binary needs no system ffmpeg and no PATH setup."""
   monkeypatch.delenv("FFMPEG", raising=False)
-  _resolve_ffmpeg.cache_clear()
-  path = _resolve_ffmpeg()
+  resolve_ffmpeg.cache_clear()
+  path = resolve_ffmpeg()
   assert Path(path).exists()
   assert os.access(path, os.X_OK)
-  _resolve_ffmpeg.cache_clear()
+  resolve_ffmpeg.cache_clear()
 
 
-def test_resolve_ffmpeg_honors_env_override(
+def testresolve_ffmpeg_honors_env_override(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
   """``$FFMPEG`` takes priority so a specific binary can be forced."""
-  _resolve_ffmpeg.cache_clear()
+  resolve_ffmpeg.cache_clear()
   monkeypatch.setenv("FFMPEG", "/custom/path/ffmpeg")
-  assert _resolve_ffmpeg() == "/custom/path/ffmpeg"
-  _resolve_ffmpeg.cache_clear()
+  assert resolve_ffmpeg() == "/custom/path/ffmpeg"
+  resolve_ffmpeg.cache_clear()
 
 
 def test_best_lag_recovers_known_offset() -> None:

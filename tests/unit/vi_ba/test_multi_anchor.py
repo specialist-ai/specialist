@@ -156,8 +156,6 @@ def _dummy_tracker(
     body_T_base_tag=None,
     joint_angles={},
     keyframe_times=np.zeros(n),
-    front_frames=[],
-    rear_frames=[],
     front_keypoints=[],
     rear_keypoints=[],
     front_tags_per_kf=(
@@ -415,6 +413,7 @@ def test_pinned_solve_reestimates_secondary_pose(
   solve = _solve_joint_graph(trackers, keys, args, [], world_T_ref)
   world = solve.secondary_world
   assert 5 in world
+  assert solve.secondary_moves[5] == solve.worst_secondary_move
   final_err = float(np.linalg.norm(np.asarray(world[5].translation()) - true_t))
   assert final_err < 0.01
   assert final_err < seed_err / 3
@@ -431,6 +430,7 @@ def test_single_anchor_takes_single_solve_branch(
   solve = _solve_joint_graph(trackers, keys, args, [], world_T_ref)
   out = capsys.readouterr().out
   assert solve.secondary_world == {}
+  assert all(np.isnan(v) for v in solve.worst_secondary_move)
   assert out.count("solve 1:") == 1
   _assert_no_corner_point_variables(solve.result.values)
 

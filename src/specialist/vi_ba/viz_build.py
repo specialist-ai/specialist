@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from pathlib import Path
 
 import gtsam
 import numpy as np
@@ -17,9 +18,7 @@ from specialist.vi_ba.anchor_detection import (
 from specialist.vi_ba.build import LensSetup
 from specialist.vi_ba.compose import (
   CrossSighting,
-  CulledPoints,
   LandmarkKeep,
-  LandmarkPoints,
   LandmarkTracks,
   TrackerKeys,
   anchor_sightings,
@@ -27,13 +26,15 @@ from specialist.vi_ba.compose import (
   points_from_values,
 )
 from specialist.vi_ba.configs import Args
-from specialist.vi_ba.export import TrackerSummary
 from specialist.vi_ba.finger_kinematics import pin_angles_to_keyframes
 from specialist.vi_ba.geometry import bounding_box_diagonal, path_length
+from specialist.vi_ba.gripper_opening import opening_from_angles
 from specialist.vi_ba.highrate import propagate_highrate
 from specialist.vi_ba.landmark_cull import cull_and_reproject
 from specialist.vi_ba.optimize import OptimizeResult
 from specialist.vi_ba.single_tracker import PreparedTracker
+from specialist.vi_ba.summary import TrackerSummary
+from specialist.vi_ba.urdf_joints import RevoluteJoint, read_revolute_joints
 from specialist.vi_ba.viz import TrackerVizData
 
 Float64Array = npt.NDArray[np.float64]
@@ -99,6 +100,30 @@ def _rms(values: list[float]) -> float:
   return float(np.sqrt(np.mean(np.square(values)))) if values else float("nan")
 
 
+def _gripper_opening(
+  joint_frame_angles: dict[str, tuple[Float64Array, Float64Array]],
+  urdf_joints: dict[str, RevoluteJoint] | None,
+) -> tuple[Float64Array, Float64Array] | None:
+  """Opening of the two tagged finger joints, or ``None`` unless their counts match."""
+  if not urdf_joints or not joint_frame_angles:
+    return None
+  tagged = [
+    name
+    for name in joint_frame_angles
+    if name in urdf_joints and urdf_joints[name].joint_T_tag0 is not None
+  ]
+  if len(tagged) != 2:
+    return None
+  times_a, angles_a = joint_frame_angles[tagged[0]]
+  _, angles_b = joint_frame_angles[tagged[1]]
+  if len(angles_a) != len(angles_b):
+    return None
+  opening = opening_from_angles(
+    urdf_joints[tagged[0]], urdf_joints[tagged[1]], angles_a, angles_b
+  )
+  return times_a, opening
+
+
 def _aggregate_rmse_for_print(per_kf: list[float]) -> float:
   return _rms([v for v in per_kf if np.isfinite(v)])
 
@@ -154,12 +179,9 @@ def _build_tracker_outputs(
   anchor_corners_by_tag: dict[int, Float64Array],
   base_tag_corners_world: dict[str, list[Float64Array]],
   audio_offset: float,
-) -> tuple[
-  TrackerVizData,
-  TrackerSummary,
-  tuple[LandmarkPoints, LandmarkPoints],
-]:
-  """``TrackerVizData``, ``TrackerSummary`` and culled ``(front, rear)`` landmarks."""
+  urdf_joints: dict[str, RevoluteJoint] | None,
+) -> tuple[TrackerVizData, TrackerSummary]:
+  """One tracker's Rerun payload from the solved values."""
   front_points = points_from_values(
     result.values, keys.front_landmark_key, tracker.name, landmark_keep[0]
   )
@@ -203,32 +225,17 @@ def _build_tracker_outputs(
     result.values.atConstantBias(keys.bias_key(tracker.name, i))
     for i in range(tracker.n_keyframes)
   ]
-  # Tag axes cost one PnP solve per detection; only frame-logging runs show them.
-  front_tag_axes = (
-    _project_tag_axes_per_kf(
-      tracker.front_tags_per_kf, tracker.front_lens, tag_size_by_id
-    )
-    if args.log_frames_in_rrd
-    else None
+  front_tag_axes = _project_tag_axes_per_kf(
+    tracker.front_tags_per_kf, tracker.front_lens, tag_size_by_id
   )
-  rear_tag_axes = (
-    _project_tag_axes_per_kf(
-      tracker.rear_tags_per_kf, tracker.rear_lens, tag_size_by_id
-    )
-    if args.log_frames_in_rrd
-    else None
+  rear_tag_axes = _project_tag_axes_per_kf(
+    tracker.rear_tags_per_kf, tracker.rear_lens, tag_size_by_id
   )
-  front_reproj = front_reproj_per_kf if args.log_frames_in_rrd else None
-  rear_reproj = rear_reproj_per_kf if args.log_frames_in_rrd else None
-  front_rejected_kp = (
-    _per_kf_rejected_keypoints(tracker.front_rejected, tracker.n_keyframes)
-    if args.log_frames_in_rrd
-    else None
+  front_rejected_kp = _per_kf_rejected_keypoints(
+    tracker.front_rejected, tracker.n_keyframes
   )
-  rear_rejected_kp = (
-    _per_kf_rejected_keypoints(tracker.rear_rejected, tracker.n_keyframes)
-    if args.log_frames_in_rrd
-    else None
+  rear_rejected_kp = _per_kf_rejected_keypoints(
+    tracker.rear_rejected, tracker.n_keyframes
   )
   velocities_final = [
     np.asarray(result.values.atVector(keys.velocity_key(tracker.name, i)))
@@ -254,6 +261,7 @@ def _build_tracker_outputs(
       n_j = min(len(kf_t), len(solved))
       pinned = pin_angles_to_keyframes(f_times, f_angles, kf_t[:n_j], solved[:n_j])
       joint_frame_angles[joint] = (f_times - audio_offset, pinned)
+  gripper_opening = _gripper_opening(joint_frame_angles, urdf_joints)
   anchor_lines, cross_lines = _factor_observation_lines(
     tracker,
     poses,
@@ -267,10 +275,8 @@ def _build_tracker_outputs(
     keyframe_times=np.asarray(tracker.keyframe_times, dtype=np.float64) - audio_offset,
     front_points=front_points,
     rear_points=rear_points,
-    front_frames=tracker.front_frames if args.log_frames_in_rrd else None,
-    rear_frames=tracker.rear_frames if args.log_frames_in_rrd else None,
-    front_keypoints=tracker.front_keypoints if args.log_frames_in_rrd else None,
-    rear_keypoints=tracker.rear_keypoints if args.log_frames_in_rrd else None,
+    front_keypoints=tracker.front_keypoints,
+    rear_keypoints=tracker.rear_keypoints,
     front_tag_detections=front_tag_viz,
     rear_tag_detections=rear_tag_viz,
     velocities=velocities_final,
@@ -282,8 +288,8 @@ def _build_tracker_outputs(
     rear_rmse_per_kf=rear_rmse_per_kf,
     front_tag_axes=front_tag_axes,
     rear_tag_axes=rear_tag_axes,
-    front_landmark_reprojections=front_reproj,
-    rear_landmark_reprojections=rear_reproj,
+    front_landmark_reprojections=front_reproj_per_kf,
+    rear_landmark_reprojections=rear_reproj_per_kf,
     front_rejected_keypoints=front_rejected_kp,
     rear_rejected_keypoints=rear_rejected_kp,
     rear_static_mask_rects=tracker.rear_static_mask_rects,
@@ -299,8 +305,12 @@ def _build_tracker_outputs(
     highrate_quats=highrate_quats,
     highrate_vels=highrate_vels,
     joint_frame_angles=joint_frame_angles or None,
+    body_T_base_tag=tracker.body_T_base_tag,
+    gripper_opening=gripper_opening,
+    front_lens_mei={k: float(v) for k, v in asdict(tracker.front_lens.params).items()},
+    rear_lens_mei={k: float(v) for k, v in asdict(tracker.rear_lens.params).items()},
   )
-  return viz_data, summary, (front_points, rear_points)
+  return viz_data, summary
 
 
 def _tag_size_by_id(args: Args) -> dict[int, float]:
@@ -331,11 +341,10 @@ def _base_tag_corners_world(
 
 @dataclass(frozen=True)
 class RunOutputs:
-  """A solved run's per-tracker payloads and summaries, and its JSON export geometry."""
+  """A solved run's per-tracker payloads and summaries, anchors and audio offsets."""
 
   viz_trackers: list[TrackerVizData]
   per_tracker: list[TrackerSummary]
-  culled_points: CulledPoints
   anchor_poses_world: dict[int, gtsam.Pose3]
   audio_offset_by_tracker: dict[str, float]
 
@@ -352,6 +361,7 @@ def build_run_outputs(
   reference_anchor: gtsam.Pose3,
   reference_tag_id: int,
   secondary_anchor_world: dict[int, gtsam.Pose3],
+  urdf_path: Path | None = None,
 ) -> RunOutputs:
   """Each tracker's payload from one solved joint graph."""
   anchor_poses_world = {reference_tag_id: reference_anchor, **secondary_anchor_world}
@@ -367,12 +377,12 @@ def build_run_outputs(
   by_observer: dict[str, list[CrossSighting]] = {t.name: [] for t in trackers}
   for sighting in cross_obs:
     by_observer[sighting.observer].append(sighting)
+  urdf_joints = read_revolute_joints(urdf_path) if urdf_path is not None else None
 
   viz_trackers: list[TrackerVizData] = []
   per_tracker: list[TrackerSummary] = []
-  culled_points: CulledPoints = {}
   for t in trackers:
-    viz_data, summary, culled_pair = _build_tracker_outputs(
+    viz_data, summary = _build_tracker_outputs(
       t,
       poses=optimized_body_poses[t.name],
       result=result,
@@ -384,14 +394,13 @@ def build_run_outputs(
       anchor_corners_by_tag=anchor_corners_by_tag,
       base_tag_corners_world=base_tag_corners,
       audio_offset=audio_offset_by_tracker[t.name],
+      urdf_joints=urdf_joints,
     )
     viz_trackers.append(viz_data)
     per_tracker.append(summary)
-    culled_points[t.name] = culled_pair
   return RunOutputs(
     viz_trackers,
     per_tracker,
-    culled_points,
     anchor_poses_world,
     audio_offset_by_tracker,
   )

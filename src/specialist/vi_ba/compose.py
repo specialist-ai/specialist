@@ -41,7 +41,6 @@ LandmarkKeep = dict[str, tuple[LandmarkTracks, LandmarkTracks]]
 CulledPoints = dict[str, tuple[LandmarkPoints, LandmarkPoints]]
 __all__ = [
   "CrossSighting",
-  "CulledPoints",
   "LandmarkKeep",
   "LandmarkPoints",
   "LandmarkTracks",
