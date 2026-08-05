@@ -22,7 +22,7 @@ from scipy.signal import butter, find_peaks, sosfiltfilt
 
 Float64Array = npt.NDArray[np.float64]
 
-__all__ = ["ClapSyncResult", "sync_two_claps"]
+__all__ = ["ClapSyncResult", "resolve_ffmpeg", "sync_two_claps"]
 
 
 @dataclass(frozen=True)
@@ -42,7 +42,7 @@ class ClapSyncResult:
 
 
 @functools.cache
-def _resolve_ffmpeg() -> str:
+def resolve_ffmpeg() -> str:
   """Locate an ffmpeg binary. Priority: the ``$FFMPEG`` override, then the
   ``imageio-ffmpeg`` wheel-bundled static binary (a declared dependency, so
   present on every platform after ``uv sync`` with no system install), then
@@ -71,7 +71,7 @@ def _decode_mono_pcm(
 ) -> tuple[Float64Array, int]:
   """Demux mono float32 PCM at ``target_rate`` from any container ffmpeg
   reads (``.insv``, ``.mp4``, ``.wav``). Returns ``(samples, rate)``."""
-  ffmpeg = _resolve_ffmpeg()
+  ffmpeg = resolve_ffmpeg()
   src = Path(source)
   if not src.is_file():
     raise FileNotFoundError(f"audio source not found: {src}")

@@ -116,8 +116,10 @@ class Args:
   anchor: AnchorCfg
   output_dir: Path = Path("logs")
   tracker_names: tuple[str, ...] = ()  # auto-derive ("tracker_0", "tracker_1", ...)
+  # Recording id shared with the session's base recording so the track
+  # layer attaches to it in a catalog; a fresh uuid when unset.
+  session_id: str | None = None
   urdf_path: Path | None = None
-  log_frames_in_rrd: bool = False
   open_viewer: bool = True
   # One id per tracker; cross-tracker disambiguation needs distinct ids.
   base_tag_ids: tuple[int, ...] = ()

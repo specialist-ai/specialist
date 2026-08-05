@@ -240,6 +240,18 @@ class ReferenceSolve:
   landmark_keep: LandmarkKeep
   secondary_world: dict[int, gtsam.Pose3]
   body_poses: dict[str, list[gtsam.Pose3]]
+  # Per secondary anchor, how far its post-solve re-estimate moved off its seed
+  # (metres, radians): the sighting-geometry consistency check.
+  secondary_moves: dict[int, tuple[float, float]]
+
+  @property
+  def worst_secondary_move(self) -> tuple[float, float]:
+    """The largest translation and rotation any secondary anchor moved, NaN
+    when the take has no secondary."""
+    if not self.secondary_moves:
+      return float("nan"), float("nan")
+    moves = self.secondary_moves.values()
+    return max(dt for dt, _ in moves), max(dr for _, dr in moves)
 
 
 def _solve_joint_graph(
@@ -254,8 +266,8 @@ def _solve_joint_graph(
 
   Solves once with the secondaries pinned at their prep-composed seeds, then
   re-estimates each from the solved poses. The solve carries the re-estimates,
-  which are what gets exported; how far each moved off its seed is the
-  sighting-geometry consistency check."""
+  which are what gets exported, and how far each moved off its seed, the
+  consistency signal the run summary records."""
   seed = _seed_secondary_anchors(trackers, args)
   graph, values = assemble_joint_graph(
     trackers,
@@ -271,6 +283,7 @@ def _solve_joint_graph(
 
   solved_poses = _solved_body_poses(trackers, keys, result.values)
   resolved: dict[int, gtsam.Pose3] = {}
+  moves: dict[int, tuple[float, float]] = {}
   for tag_id in seed:
     estimate = _secondary_anchor_seed(
       trackers, tag_id, body_poses_by_tracker=solved_poses
@@ -284,6 +297,7 @@ def _solve_joint_graph(
       f"{dt * 1000:.1f}mm / {np.degrees(dr):.2f}deg{note}"
     )
     resolved[tag_id] = estimate
+    moves[tag_id] = (dt, dr)
   return ReferenceSolve(
     ref_tag_id=int(args.anchor.tag_ids[0]),
     ref_anchor=ref_anchor,
@@ -291,6 +305,7 @@ def _solve_joint_graph(
     landmark_keep=landmark_keep,
     secondary_world=resolved,
     body_poses=solved_poses,
+    secondary_moves=moves,
   )
 
 

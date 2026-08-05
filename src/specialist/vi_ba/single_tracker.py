@@ -69,7 +69,6 @@ from specialist.vi_ba.init import (
 from specialist.vi_ba.pipeline import (
   BandedKeyframes,
   LensFrontendConfig,
-  decode_lens_keyframes,
   filter_tracks_by_parallax,
   keyframe_timestamps,
   lens_setups,
@@ -139,8 +138,6 @@ class TrackerArgs:
   start: float
   duration: float | None
   keyframe_every: int  # 0 = auto (round(fps/10)); see WindowCfg.keyframe_every
-  # Retain decoded keyframes (as JPEG) for the Rerun frame overlay.
-  keep_frames: bool
   urdf_path: Path | None  # gripper URDF for finger joint kinematics
   # 0 disables the corresponding URDF revolute joint angle recovery.
   left_finger_tag_id: int
@@ -191,9 +188,6 @@ class PreparedTracker:
   # either tag is missing or PnP fails. Empty when no finger ids configured.
   joint_angles: dict[str, list[float]]
   keyframe_times: Float64Array
-  # JPEG-encoded keyframes for the Rerun overlay (empty unless retained).
-  front_frames: list[bytes]
-  rear_frames: list[bytes]
   front_keypoints: list[Float64Array]
   rear_keypoints: list[Float64Array]
   front_tags_per_kf: list[list[TagDetection]]
@@ -969,12 +963,7 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
   bound = shared_keyframe_bound(args.insv_path, rear_path)
 
   def lens_frames(path: Path) -> Sequence[np.ndarray]:
-    """This lens's keyframes. Banded unless the Rerun overlay wants the colour
-    frames too, which only the eager decode produces."""
-    if args.keep_frames:
-      return decode_lens_keyframes(
-        path, bound, fps, args.start, args.duration, keyframe_every, True
-      )[0]
+    """This lens's keyframes, decoded a band at a time."""
     return BandedKeyframes(path, bound, fps, args.start, args.duration, keyframe_every)
 
   def per_band(
@@ -988,15 +977,6 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
       out.extend(fn([frames[i] for i in range(begin, end)]))
     return out
 
-  front_color: list[bytes] = []
-  rear_color: list[bytes] = []
-  if args.keep_frames:
-    _, front_color = decode_lens_keyframes(
-      args.insv_path, bound, fps, args.start, args.duration, keyframe_every, True
-    )
-    _, rear_color = decode_lens_keyframes(
-      rear_path, bound, fps, args.start, args.duration, keyframe_every, True
-    )
   # Front: tags and loop-closure ORB share one banded walk; both are stateless
   # per frame and a second walk would decode the lens again.
   orb_exclude = set(args.anchor.tag_ids)
@@ -1059,8 +1039,6 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
     raise RuntimeError(f"only {n_keyframes} keyframes decoded — window too short")
   front_tags_per_kf = front_tags_per_kf[:n_keyframes]
   rear_tags_per_kf = rear_tags_per_kf[:n_keyframes]
-  front_color = front_color[:n_keyframes]
-  rear_color = rear_color[:n_keyframes]
   keyframe_times = keyframe_timestamps(args.start, fps, keyframe_every, n_keyframes)
 
   imu_to_body = np.asarray(args.imu.imu_to_body, dtype=np.float64)
@@ -1359,10 +1337,8 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
     body_T_base_tag=body_T_base_tag,
     joint_angles=joint_angles,
     keyframe_times=keyframe_times,
-    front_frames=front_color,
-    rear_frames=rear_color,
-    front_keypoints=[f.keypoints for f in front.feature_frames],
-    rear_keypoints=[f.keypoints for f in rear.feature_frames],
+    front_keypoints=[f.keypoints for f in front.feature_frames][:n_keyframes],
+    rear_keypoints=[f.keypoints for f in rear.feature_frames][:n_keyframes],
     front_tags_per_kf=front_tags_per_kf,
     rear_tags_per_kf=rear_tags_per_kf,
     front_rejected=front.rejected,
