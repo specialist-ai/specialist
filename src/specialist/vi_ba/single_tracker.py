@@ -18,6 +18,7 @@ from specialist.loader.parse_insv import InsvData, load_insv
 from specialist.vi_ba.anchor_detection import (
   TagDetection,
   anchor_pose_from_tags,
+  configure_detector,
   detect_all_tags,
 )
 from specialist.vi_ba.build import LensSetup
@@ -83,11 +84,8 @@ _A = TypeVar("_A")
 _B = TypeVar("_B")
 
 # ORB loop-closure track recovery (``_loop_closure_tracks``).
-_LOOP_N_NEIGHBORS = 4  # spatially-closest non-adjacent revisit kfs to re-match
-_LOOP_MATCH_RATIO = 0.7  # Lowe ratio-test threshold
 _LOOP_RANSAC_PX = 4.5  # homography RANSAC reprojection tolerance
 _LOOP_MIN_VIEWS = 3  # keyframes a union-found track must span to be kept
-_LOOP_MIN_INLIERS = 20  # geometrically-verified matches required per pair
 
 # Visual-odometry pose-spike rejection (``_reject_vo_pose_outliers``).
 _VO_REJECT_FACTOR = 8.0  # residual/median-step ratio marking a PnP teleport
@@ -104,9 +102,11 @@ __all__ = [
 ]
 
 
-def _enough_registered(n_registered: int, n_keyframes: int) -> bool:
-  """A seed needs a quarter of the keyframes, and at least eight."""
-  return n_registered >= max(8, n_keyframes // 4)
+def _enough_registered(
+  n_registered: int, n_keyframes: int, ratio: float = 0.25
+) -> bool:
+  """A seed needs ``ratio`` of the keyframes, and at least eight."""
+  return n_registered >= max(8, int(n_keyframes * ratio))
 
 
 def run_two_concurrently(
@@ -136,6 +136,8 @@ class TrackerArgs:
   frontend: FrontendCfg
   imu: ImuCfg
   gripper: GripperCfg
+  # Set when sibling captures prep at once; it gates per-thread AprilTag detectors.
+  parallel_siblings: bool = False
 
 
 class ViGraphInputs(TypedDict):
@@ -452,6 +454,9 @@ def _loop_closure_tracks(
   base_track_id: int,
   max_center_dist: float,
   min_kf_gap: int,
+  n_neighbors: int,
+  match_ratio: float,
+  min_inliers: int,
 ) -> dict[int, dict[int, Float64Array]]:
   """Recover tracks broken by fast lifts via ORB loop closure."""
   centers = np.asarray([_translation(p.compose(lens.extrinsic)) for p in body_poses])
@@ -476,12 +481,12 @@ def _loop_closure_tracks(
       int(j)
       for j in np.argsort(dist)
       if j > i and (j - i) > min_kf_gap and dist[j] <= max_center_dist
-    ][:_LOOP_N_NEIGHBORS]
+    ][:n_neighbors]
     pairs.extend((i, j) for j in cand)
 
   def verify_pair(i: int, j: int) -> npt.NDArray[np.int64] | None:
-    m = match_pair(orb[i], orb[j], _LOOP_MATCH_RATIO)
-    if len(m) < _LOOP_MIN_INLIERS:
+    m = match_pair(orb[i], orb[j], match_ratio)
+    if len(m) < min_inliers:
       return None
     pa = orb[i].keypoints[m[:, 0]]
     pb = orb[j].keypoints[m[:, 1]]
@@ -491,7 +496,7 @@ def _loop_closure_tracks(
     if mask is None:
       return None
     inl = mask.ravel().astype(bool)
-    if int(inl.sum()) < _LOOP_MIN_INLIERS:
+    if int(inl.sum()) < min_inliers:
       return None
     return np.asarray(m[inl], dtype=np.int64)
 
@@ -853,6 +858,7 @@ class _LensChannel:
 
 def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
   """Every per-tracker stage; body poses land in the tracker's gravity-aligned world."""
+  configure_detector(args.frontend.parallel_tag_detect and args.parallel_siblings)
   data = load_insv(args.insv_path)
   extrinsics = parse_insv_extrinsics(data)
   rear_path, fps, decoded_width = probe_capture(args.insv_path)
@@ -885,8 +891,12 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
     tags = detect_all_tags(band)
     if not args.frontend.loop_closure:
       return [(t, None) for t in tags]
-    rects = _build_non_anchor_tag_masks(
-      band[0].shape[:2], tags, orb_exclude, args.frontend.mask_tag_pad
+    rects = (
+      _build_non_anchor_tag_masks(
+        band[0].shape[:2], tags, orb_exclude, args.frontend.mask_tag_pad
+      )
+      if args.frontend.mask_tags
+      else [[] for _ in band]
     )
     orb = parallel_map(
       lambda f, m: detect_orb(
@@ -978,14 +988,19 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
     ransac_threshold=args.frontend.ransac_threshold,
     max_half_angle=args.frontend.max_half_angle,
     gpu_flow=args.frontend.gpu_flow,
+    flow_scale=args.frontend.flow_scale,
   )
 
   def run_lens(ch: _LensChannel, path: Path) -> None:
     """Decode this lens, take what downstream needs from its pixels, then drop them."""
     ch.gray = lens_frames(path)
     shape = ch.gray[0].shape[:2]
-    ch.masks = _build_non_anchor_tag_masks(
-      shape, ch.tags, anchor_tag_ids, args.frontend.mask_tag_pad
+    ch.masks = (
+      _build_non_anchor_tag_masks(
+        shape, ch.tags, anchor_tag_ids, args.frontend.mask_tag_pad
+      )
+      if args.frontend.mask_tags
+      else [[] for _ in range(len(ch.tags))]
     )
     if ch is rear:
       _apply_static_mask_rects(ch.masks, static_rects, shape)
@@ -999,7 +1014,8 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
     release_freed_memory()
 
   run_lens(front, args.insv_path)
-  run_lens(rear, rear_path)
+  if args.frontend.rear_landmarks:
+    run_lens(rear, rear_path)
   for ch in (front, rear):
     ch.kept = {
       t: o for t, o in ch.tracks.items() if len(o) >= args.frontend.min_track_length
@@ -1042,7 +1058,9 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
   sfm_cams, vo_outliers = _reject_vo_pose_outliers(sfm_cams)
   if vo_outliers:
     print(f"  [{name}] visual-odometry rejected {len(vo_outliers)} rotation-spike kfs")
-  if _enough_registered(len(sfm_cams), n_keyframes):
+  if _enough_registered(
+    len(sfm_cams), n_keyframes, args.frontend.vo_min_registered_ratio
+  ):
     body_poses_prealign = body_poses_from_camera_poses(
       _fill_camera_poses(sfm_cams, n_keyframes), front_lens.extrinsic
     )
@@ -1147,6 +1165,9 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
         max(front.kept, default=0),
         args.frontend.loop_closure_max_dist,
         args.frontend.loop_closure_min_kf_gap,
+        args.frontend.loop_n_neighbors,
+        args.frontend.loop_match_ratio,
+        args.frontend.loop_min_inliers,
       )
     anchor_kfs = set(anchor_obs_per_kf.keys())
     cap = args.frontend.max_landmarks_per_lens

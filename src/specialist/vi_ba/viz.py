@@ -92,7 +92,7 @@ def _send_lens_tag_columns(
   anchor_tag_ids: set[int],
   mask_pad_px: int,
 ) -> None:
-  """Per-keyframe AprilTag quads and ids; anchor yellow, others red with mask boxes."""
+  """AprilTag quads and ids per keyframe; negative ``mask_pad_px`` draws no mask box."""
   yellow = np.asarray(_YELLOW, dtype=np.uint8)
   red = np.asarray(_RED, dtype=np.uint8)
   strips: list[np.ndarray] = []
@@ -113,7 +113,7 @@ def _send_lens_tag_columns(
       labels.append(str(tid))
       is_anchor = int(tid) in anchor_tag_ids
       colors.append(yellow if is_anchor else red)
-      if not is_anchor:
+      if not is_anchor and mask_pad_px >= 0:
         mn = corners.min(axis=0) - float(mask_pad_px)
         mx = corners.max(axis=0) + float(mask_pad_px)
         mask_centers.append(((mn + mx) * 0.5).astype(np.float32))
@@ -268,7 +268,7 @@ def _send_lens_columns(
   times: rr.TimeColumn,
   color: tuple[int, int, int],
 ) -> None:
-  if keypoints is None:
+  if not keypoints:
     return
   _send_point_columns(f"{entity_path}/keypoints", keypoints, index, 1.5, color)
   counts = np.asarray([kp.shape[0] for kp in keypoints], dtype=np.float64)
