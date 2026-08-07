@@ -15,7 +15,7 @@ import gtsam
 import numpy as np
 import scipy.sparse as sp
 
-__all__ = ["SparseSystem", "lm_solve", "same_pattern"]
+__all__ = ["SparseSystem", "assert_backend", "lm_solve", "same_pattern"]
 
 # Mirror gtsam's LevenbergMarquardtParams defaults so both solvers step the
 # same way.
@@ -175,16 +175,23 @@ def _cudss_solver() -> tuple[
   return solve, close
 
 
+def assert_backend() -> None:
+  """Import the CUDA solve stack, raising when any piece is missing."""
+  _solve, close = _cudss_solver()
+  close()
+
+
 def lm_solve(
   graph: gtsam.NonlinearFactorGraph,
   values: gtsam.Values,
   max_iterations: int,
   relative_error_tol: float,
   solver_factory: SolverFactory = _cudss_solver,
+  initial_error: float | None = None,
 ) -> tuple[gtsam.Values, int, float, float]:
   """Run the Schur LM loop and return ``(values, iterations, initial_error,
-  final_error)``. Raises if the solver backend is unavailable; the caller
-  owns the gtsam fallback."""
+  final_error)``. Raises when the solver backend is unavailable. Pass
+  ``initial_error`` when the caller has already evaluated it."""
   system = SparseSystem(graph, values)
   solve, close = solver_factory()
   landmark_cols, state_cols = system.landmark_cols, system.state_cols
@@ -192,7 +199,7 @@ def lm_solve(
   eye3 = np.eye(_LANDMARK_DIM)
   eye_state = sp.identity(len(state_cols), format="csr")
   lam = _LAMBDA_INITIAL
-  err = float(graph.error(values))
+  err = float(graph.error(values)) if initial_error is None else initial_error
   initial_error = err
   iters = 0
 

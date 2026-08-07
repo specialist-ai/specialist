@@ -241,27 +241,44 @@ def main(args: Args) -> None:
   # viz overlay, so resolve it once up front.
   urdf_path = _resolve_urdf_path(args.urdf_path)
 
+  # Independent captures prep concurrently (each capture's two lenses already run
+  # on their own threads), but each one holds its decoded keyframes, so running
+  # them together only pays off where that fits. Tell the flow precompute how
+  # many run at once so it shrinks its per-lens worker pool and does not
+  # oversubscribe the shared cv2 thread pool. It also decides whether the tag
+  # walks ever overlap, which is what per-thread detectors cost their memory for.
+  concurrent = _captures_that_fit(specs, args)
+  set_precompute_concurrency(concurrent)
+
   def _prep_one(spec: tuple[str, Path, float, int, int, int]) -> PreparedTracker:
     name, path, start, base_tag_id, left_id, right_id = spec
     print(f"\n=== prep tracker {name!r} ({path.name}, start={start:.3f}s) ===")
-    tracker = prepare_tracker(
-      name,
-      TrackerArgs(
-        insv_path=path,
-        start=start,
-        duration=duration,
-        keyframe_every=args.window.keyframe_every,
-        base_tag_id=base_tag_id,
-        left_finger_tag_id=int(left_id),
-        right_finger_tag_id=int(right_id),
-        frontend=args.frontend,
-        imu=args.imu,
-        anchor=args.anchor,
-        parallel_siblings=len(args.input_insvs) > 1,
-        gripper=args.gripper,
-        urdf_path=urdf_path,
-      ),
-    )
+    try:
+      tracker = prepare_tracker(
+        name,
+        TrackerArgs(
+          insv_path=path,
+          start=start,
+          duration=duration,
+          keyframe_every=args.window.keyframe_every,
+          base_tag_id=base_tag_id,
+          left_finger_tag_id=int(left_id),
+          right_finger_tag_id=int(right_id),
+          frontend=args.frontend,
+          imu=args.imu,
+          anchor=args.anchor,
+          parallel_siblings=concurrent > 1,
+          gripper=args.gripper,
+          urdf_path=urdf_path,
+        ),
+      )
+    except Exception as exc:
+      # A sibling capture already decoding cannot be interrupted, so the
+      # traceback only lands once it finishes; name the failure when it happens
+      # rather than leave the wait looking like a hang.
+      if concurrent > 1:
+        print(f"\n=== prep tracker {name!r} FAILED: {exc!r} ===", flush=True)
+      raise
     print(
       f"  kf={tracker.n_keyframes}  anchor_obs={len(anchored_keyframes(tracker))}  "
       f"front_pts={len(tracker.front_points)}  rear_pts={len(tracker.rear_points)}  "
@@ -269,24 +286,19 @@ def main(args: Args) -> None:
     )
     return tracker
 
-  # Independent captures prep concurrently (each capture's two lenses already run
-  # on their own threads), but each one holds its decoded keyframes, so running
-  # them together only pays off where that fits. Tell the flow precompute how
-  # many run at once so it shrinks its per-lens worker pool and does not
-  # oversubscribe the shared cv2 thread pool.
-  concurrent = _captures_that_fit(specs, args)
-  set_precompute_concurrency(concurrent)
-  if concurrent == 1:
-    trackers: list[PreparedTracker] = [_prep_one(spec) for spec in specs]
-  else:
-    with ThreadPoolExecutor(max_workers=concurrent) as prep_pool:
-      trackers = list(prep_pool.map(_prep_one, specs))
-  # Flow is finished; release the per-stream GPU workers so the linear solver has
-  # device memory for the joint bundle adjustment. A no-op on the cv2 path (no
-  # stream ever primed).
   from specialist.vi_ba import gpu_flow
 
-  gpu_flow.shutdown()
+  try:
+    if concurrent == 1:
+      trackers: list[PreparedTracker] = [_prep_one(spec) for spec in specs]
+    else:
+      with ThreadPoolExecutor(max_workers=concurrent) as prep_pool:
+        trackers = list(prep_pool.map(_prep_one, specs))
+  finally:
+    # Flow is finished; release the per-stream GPU workers so the linear solver
+    # has device memory for the joint bundle adjustment. A no-op on the cv2 path
+    # (no stream ever primed).
+    gpu_flow.shutdown()
   mark("trackers prepared")
 
   cross_obs = cross_tracker_observations(

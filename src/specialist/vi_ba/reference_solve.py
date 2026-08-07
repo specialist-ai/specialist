@@ -23,7 +23,7 @@ from specialist.vi_ba.compose import (
   assemble_joint_graph,
   points_from_values,
 )
-from specialist.vi_ba.configs import Args
+from specialist.vi_ba.configs import Args, GpuMode
 from specialist.vi_ba.landmark_cull import cull_outlier_landmarks
 from specialist.vi_ba.optimize import OptimizeResult, optimize_graph
 from specialist.vi_ba.single_tracker import PreparedTracker
@@ -86,7 +86,7 @@ def _solve_with_cull_reoptimize(
   trackers: list[PreparedTracker],
   keys: TrackerKeys,
   max_iterations: int,
-  gpu: bool,
+  gpu: GpuMode,
 ) -> tuple[OptimizeResult, LandmarkKeep]:
   """Solve the joint graph, then drop the landmarks the first solve exposes as
   outliers (mismatched / degenerate) and re-solve warm-started, so they bias
