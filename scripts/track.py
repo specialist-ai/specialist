@@ -1,6 +1,6 @@
 """VI-BA driver for any number of trackers (N ≥ 1).
 
-Audio-syncs N ``.insv`` captures via clap detection (no-op for N=1),
+Audio-syncs N ``.insv`` captures by envelope correlation (no-op for N=1),
 runs the per-tracker prep (decode → frontend → anchor PnP → VI
 alignment), aligns every tracker into the reference anchor's world
 (through any co-sighted anchor), allocates collision-free GTSAM keys via
@@ -31,7 +31,7 @@ import numpy as np
 import numpy.typing as npt
 import tyro
 
-from specialist.loader.audio_sync import sync_two_claps
+from specialist.loader.audio_sync import sync_two_clips
 from specialist.record.layer import write_track_layer
 from specialist.vi_ba.compose import (
   TrackerKeys,
@@ -76,7 +76,7 @@ def _audio_align_starts(
   input_insvs: tuple[Path, ...], master_start: float
 ) -> tuple[list[float], list[float]]:
   """Per-clip ``start`` (in its own local clock) so every clip aligns on a
-  shared timeline. The clip whose clap leads begins at ``master_start`` and
+  shared timeline. The leading clip begins at ``master_start`` and
   clips that started later are trimmed to it.
 
   Shifting by the earliest offset keeps every start ``>= master_start`` so none
@@ -87,13 +87,12 @@ def _audio_align_starts(
   """
   offsets = [0.0]
   for path in input_insvs[1:]:
-    sync = sync_two_claps(input_insvs[0], path)
+    sync = sync_two_clips(input_insvs[0], path)
     offsets.append(sync.offset)
     print(
       f"audio sync: {input_insvs[0].name} ↔ {path.name}  "
       f"offset={sync.offset:+.3f}s  "
-      f"matched_pairs={sync.matched_pairs} "
-      f"(claps_a={sync.clap_times_a.size}, claps_b={sync.clap_times_b.size})"
+      f"peak_ratio={sync.peak_ratio:.2f}"
     )
   lead = min(offsets)
   starts = [master_start + off - lead for off in offsets]

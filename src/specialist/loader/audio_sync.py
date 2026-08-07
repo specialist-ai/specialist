@@ -1,10 +1,7 @@
-"""Multi-clap audio synchronisation for paired ``.insv`` captures.
+"""Audio synchronisation for paired ``.insv`` captures.
 
-Demuxes mono PCM via ``ffmpeg``, builds a Butterworth-lowpassed rectified
-envelope, and detects clap onsets with ``scipy.signal.find_peaks`` (a
-``mean + threshold_sigmas·std`` height threshold + minimum spacing). The
-returned offset is the median of the largest cluster of pairwise
-clap-to-clap proposals (see ``_best_lag``).
+Demuxes mono PCM via ``ffmpeg``, builds a rectified and lowpassed envelope of
+each clip, and takes the offset from a cross correlation of the two.
 """
 
 from __future__ import annotations
@@ -18,27 +15,34 @@ from pathlib import Path
 
 import numpy as np
 import numpy.typing as npt
-from scipy.signal import butter, find_peaks, sosfiltfilt
+from scipy.signal import butter, sosfiltfilt
 
 Float64Array = npt.NDArray[np.float64]
 
-__all__ = ["ClapSyncResult", "resolve_ffmpeg", "sync_two_claps"]
+__all__ = ["AudioSyncResult", "correlation_offset", "resolve_ffmpeg", "sync_two_clips"]
+
+_DEMUX_RATE = 16_000
+_ENVELOPE_CUTOFF = 50.0
+# The correlation runs at ``rate / _DECIMATION``.
+_DECIMATION = 16
+# Largest offset considered, in seconds.
+_MAX_OFFSET = 30.0
+# Half-width (s) of the correlation peak's own lobe.
+_LOBE_HALF_WIDTH = 0.25
+# Multiple of that rival the peak must reach before the offset is trusted.
+_MIN_PEAK_RATIO = 1.3
 
 
 @dataclass(frozen=True)
-class ClapSyncResult:
-  """Audio-clap sync between two clips on a common ``t = 0`` clock.
+class AudioSyncResult:
+  """Audio alignment between two clips: ``t_B = t_A + offset``.
 
-  ``offset`` is added to clip-A's local timestamps to align them
-  with clip-B's local clock (i.e. ``t_B = t_A + offset``).
-  ``clap_times_a`` / ``clap_times_b`` are detected onset times in each
-  clip's local clock for inspection / plotting.
+  ``peak_ratio`` is the correlation peak over the tallest rival outside its
+  lobe.
   """
 
   offset: float
-  clap_times_a: Float64Array
-  clap_times_b: Float64Array
-  matched_pairs: int
+  peak_ratio: float
 
 
 @functools.cache
@@ -65,18 +69,14 @@ def resolve_ffmpeg() -> str:
   )
 
 
-def _decode_mono_pcm(
-  source: str | Path,
-  target_rate: int = 16_000,
-) -> tuple[Float64Array, int]:
-  """Demux mono float32 PCM at ``target_rate`` from any container ffmpeg
-  reads (``.insv``, ``.mp4``, ``.wav``). Returns ``(samples, rate)``."""
-  ffmpeg = resolve_ffmpeg()
+def _decode_mono_pcm(source: str | Path) -> Float64Array:
+  """Demux mono float32 PCM at ``_DEMUX_RATE`` from any container ffmpeg reads
+  (``.insv``, ``.mp4``, ``.wav``)."""
   src = Path(source)
   if not src.is_file():
     raise FileNotFoundError(f"audio source not found: {src}")
   cmd = [
-    ffmpeg,
+    resolve_ffmpeg(),
     "-v",
     "error",
     "-i",
@@ -84,7 +84,7 @@ def _decode_mono_pcm(
     "-ac",
     "1",
     "-ar",
-    str(target_rate),
+    str(_DEMUX_RATE),
     "-f",
     "f32le",
     "-",
@@ -92,84 +92,66 @@ def _decode_mono_pcm(
   result = subprocess.run(cmd, capture_output=True, check=False)
   if result.returncode != 0:
     raise RuntimeError(f"ffmpeg failed for {src}:\n{result.stderr.decode()}")
-  pcm = np.frombuffer(result.stdout, dtype=np.float32).astype(np.float64)
-  return pcm, target_rate
+  pcm: Float64Array = np.frombuffer(result.stdout, dtype=np.float32).astype(np.float64)
+  return pcm
 
 
-def _detect_clap_times(
-  samples: Float64Array,
-  rate: int,
-  envelope_cutoff: float = 50.0,
-  threshold_sigmas: float = 4.0,
-  min_separation: float = 0.3,
-) -> Float64Array:
-  """Find clap onset times (seconds) as peaks in a rectified-and-lowpassed
-  envelope. Threshold is ``mean + threshold_sigmas × std``, peaks closer
-  than ``min_separation`` collapse to the highest. Tuned for handheld clap
-  captures (claps ~50 ms wide): a lower cutoff / higher σ suits a longer-attack
-  impulse but smears these sharp transients."""
-  if samples.size == 0:
-    return np.zeros(0)
-  sos = butter(4, envelope_cutoff, btype="low", fs=rate, output="sos")
-  envelope = sosfiltfilt(sos, np.abs(samples))
-  threshold = float(envelope.mean()) + threshold_sigmas * float(envelope.std())
-  min_distance = max(1, int(round(min_separation * rate)))
-  peak_indices, _ = find_peaks(envelope, height=threshold, distance=min_distance)
-  return np.asarray(peak_indices / rate, dtype=np.float64)
+def _envelope(samples: Float64Array, rate: int) -> Float64Array:
+  """Rectified, lowpassed amplitude envelope."""
+  sos = butter(4, _ENVELOPE_CUTOFF, btype="low", fs=rate, output="sos")
+  envelope: Float64Array = sosfiltfilt(sos, np.abs(samples))
+  return envelope
 
 
-def _best_lag(
-  times_a: Float64Array,
-  times_b: Float64Array,
-  *,
-  match_tolerance: float,
-  max_search: float = 30.0,
-) -> tuple[float, int]:
-  """Lag (B − A) that the most clap pairs agree on. Returns
-  ``(lag, agreeing_pair_count)``.
+def correlation_offset(
+  env_a: Float64Array, env_b: Float64Array, rate: int
+) -> tuple[float, float]:
+  """Envelope offset ``(offset, peak_ratio)`` by cross correlation, with
+  ``t_B = t_A + offset``.
 
-  Every ``(a, b)`` pair proposes an offset ``b - a``; the returned lag is the
-  median of the largest cluster of proposals (those within
-  ``match_tolerance``). Maximising the *count* of agreeing claps — rather than a
-  binary-impulse cross-correlation — is robust to spurious claps and, critically,
-  to periodic clap patterns: a cross-correlation's side-lobe one inter-clap
-  spacing away can tie or beat the true peak and shift the lag by a whole clap,
-  whereas the true offset always has the most pairs agreeing.
-  """
-  if times_a.size == 0 or times_b.size == 0:
-    raise ValueError("at least one clap on each side is required")
-  proposals = [
-    float(b - a) for a in times_a for b in times_b if abs(float(b - a)) <= max_search
-  ]
-  if not proposals:
-    raise ValueError("no clap pair within max_search")
-  best_lag, best_count = 0.0, 0
-  for center in proposals:
-    cluster = [p for p in proposals if abs(p - center) <= match_tolerance]
-    if len(cluster) > best_count:
-      best_count, best_lag = len(cluster), float(np.median(cluster))
-  return best_lag, best_count
+  A parabolic fit around the winning bin resolves finer than one bin.
+  ``peak_ratio`` compares the winner against the tallest rival outside its main
+  lobe, so a repeating transient pattern scores near 1."""
+  a = np.asarray(env_a[::_DECIMATION], dtype=np.float64)
+  b = np.asarray(env_b[::_DECIMATION], dtype=np.float64)
+  if a.size < 2 or b.size < 2:
+    raise ValueError("envelopes are too short to correlate")
+  decimated_rate = rate / _DECIMATION
+  a = a - a.mean()
+  b = b - b.mean()
+  # Zero padding biases the winner toward small offsets; clips run tens of
+  # seconds against offsets of a few.
+  size = 1 << int(np.ceil(np.log2(a.size + b.size)))
+  cross = np.fft.rfft(b, size) * np.conj(np.fft.rfft(a, size))
+  correlation = np.fft.fftshift(np.fft.irfft(cross, size))
+  offsets = (np.arange(size) - size // 2) / decimated_rate
+  candidates = np.where(np.abs(offsets) <= _MAX_OFFSET, correlation, -np.inf)
+  peak = int(np.argmax(candidates))
+  height = float(candidates[peak])
+  shift = 0.0
+  if 0 < peak < size - 1:
+    left, right = float(correlation[peak - 1]), float(correlation[peak + 1])
+    denominator = left - 2.0 * height + right
+    if denominator != 0.0:
+      shift = 0.5 * (left - right) / denominator
+  lobe = np.abs(offsets - offsets[peak]) <= _LOBE_HALF_WIDTH
+  best_rival = float(np.where(lobe, -np.inf, candidates).max())
+  ratio = height / best_rival if best_rival > 0.0 else float("inf")
+  return float(offsets[peak] + shift / decimated_rate), ratio
 
 
-def sync_two_claps(
+def sync_two_clips(
   source_a: str | Path,
   source_b: str | Path,
-) -> ClapSyncResult:
-  """End-to-end: demux both files, detect claps, return the lag that
-  aligns clip A onto clip B's clock (``t_B = t_A + offset``)."""
-  pcm_a, rate = _decode_mono_pcm(source_a)
-  pcm_b, _ = _decode_mono_pcm(source_b)
-  claps_a = _detect_clap_times(pcm_a, rate)
-  claps_b = _detect_clap_times(pcm_b, rate)
-  if claps_a.size == 0 or claps_b.size == 0:
+) -> AudioSyncResult:
+  """The offset that aligns clip A onto clip B's clock: ``t_B = t_A + offset``."""
+  env_a = _envelope(_decode_mono_pcm(source_a), _DEMUX_RATE)
+  env_b = _envelope(_decode_mono_pcm(source_b), _DEMUX_RATE)
+  offset, peak_ratio = correlation_offset(env_a, env_b, _DEMUX_RATE)
+  if peak_ratio < _MIN_PEAK_RATIO:
     raise RuntimeError(
-      f"no claps detected (a={claps_a.size}, b={claps_b.size}); "
-      f"lower threshold_sigmas or check audio is present"
+      f"audio alignment is ambiguous: the correlation peak is only "
+      f"{peak_ratio:.2f} times its tallest rival, so the clips may share no "
+      f"audible event; pass the offset explicitly if it is known"
     )
-  offset, matched = _best_lag(claps_a, claps_b, match_tolerance=0.1)
-  return ClapSyncResult(
-    offset=offset,
-    clap_times_a=claps_a,
-    clap_times_b=claps_b,
-    matched_pairs=matched,
-  )
+  return AudioSyncResult(offset=offset, peak_ratio=peak_ratio)

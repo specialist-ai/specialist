@@ -17,8 +17,7 @@ dependencies = [
   "pupil-apriltags>=1.0.4",
   "allantools>=2024.6",
   "robot-descriptions",
-  # Wheel-bundled static ffmpeg so multi-clip audio clap-sync works on every
-  # platform via `uv sync` (no system ffmpeg / sudo, e.g. the headless server).
+  # Wheel-bundled static ffmpeg: audio sync needs no system install.
   "imageio-ffmpeg>=0.5",
 ]
 
