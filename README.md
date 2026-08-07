@@ -55,7 +55,7 @@ need a full `.insv` skip cleanly when no capture is present.
 ## Run
 
 `scripts/track.py` is the pipeline. One `.insv` per tracker; with `N ≥ 2` the
-clips are audio-synced via clap detection. Base tag ids must be distinct per
+clips are audio-synced by envelope correlation. Base tag ids must be distinct per
 tracker (cross-tracker disambiguation).
 
 Single tracker against a wall anchor:

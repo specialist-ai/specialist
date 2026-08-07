@@ -15,7 +15,7 @@ from typing import Any
 import numpy as np
 import tyro
 
-from specialist.loader.audio_sync import sync_two_claps
+from specialist.loader.audio_sync import sync_two_clips
 from specialist.loader.parse_insv import load_insv
 from specialist.record import schema
 from specialist.record.base import (
@@ -42,6 +42,8 @@ class Args:
   output_dir: Path = Path("logs")
   # Staging directory for the remuxed MP4s; needs about the session's video size free.
   tmpdir: Path | None = None
+  # Seconds to add to each capture's clock, for clips that share no audible event.
+  audio_offsets: tuple[float, ...] = ()
   imu: ImuCfg = field(default_factory=ImuCfg)
 
 
@@ -56,14 +58,20 @@ def main(args: Args) -> None:
   if len(names) != len(args.input_insvs):
     raise SystemExit("--tracker-names must match --input-insvs in length")
   rears = [p.with_name(p.name.replace("_00_", "_10_", 1)) for p in args.input_insvs]
-  offsets = [0.0]
-  for later in args.input_insvs[1:]:
-    sync = sync_two_claps(args.input_insvs[0], later)
-    offsets.append(sync.offset)
-    print(
-      f"audio sync: {later.name} offset={sync.offset:+.3f}s "
-      f"matched_pairs={sync.matched_pairs}"
-    )
+  if args.audio_offsets:
+    if len(args.audio_offsets) != len(args.input_insvs):
+      raise SystemExit("--audio-offsets needs one value per --input-insvs")
+    offsets = list(args.audio_offsets)
+    print(f"audio offsets given: {offsets}")
+  else:
+    offsets = [0.0]
+    for later in args.input_insvs[1:]:
+      sync = sync_two_clips(args.input_insvs[0], later)
+      offsets.append(sync.offset)
+      print(
+        f"audio sync: {later.name} offset={sync.offset:+.3f}s "
+        f"peak_ratio={sync.peak_ratio:.2f}"
+      )
 
   # Session window: latest capture start to earliest end, both lenses included.
   durations = [

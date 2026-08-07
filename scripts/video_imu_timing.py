@@ -1,4 +1,4 @@
-"""Video-IMU offset and rolling-shutter probe; needs yaw motion and vertical edges."""
+"""Video-IMU offset and rolling-shutter probe; it needs a capture with yaw motion."""
 
 from __future__ import annotations
 
@@ -16,13 +16,14 @@ import tyro
 if __package__ in (None, ""):  # `python scripts/x.py` puts scripts/ itself first
   sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from scripts._probe import UInt8Array, finalize_probe, read_lens_grays, verdict
+from specialist.loader.audio_sync import correlation_offset
 from specialist.loader.parse_insv import load_insv
+from specialist.vi_ba.features import detect_corners
 
 Float64Array = npt.NDArray[np.float64]
 
-# Offset search grid: half a second at 5 ms brackets any plausible shift.
-_MAX_OFFSET = 0.5
-_OFFSET_STEP = 0.005
+# Ratio the correlation peak must reach over its tallest rival to trust the offset.
+_MIN_PEAK_RATIO = 1.3
 
 
 @dataclass
@@ -42,9 +43,8 @@ class TimingArgs:
 
 @dataclass
 class OffsetResult:
-  best_offset: float
-  peak_correlation: float
-  search_range: float
+  offset: float
+  peak_ratio: float
 
 
 @dataclass
@@ -69,38 +69,31 @@ class TimingSummary:
 def _flow_magnitudes(grays: list[UInt8Array], args: TimingArgs) -> Float64Array:
   """Median Lucas-Kanade flow magnitude per frame transition."""
 
-  def corners(img: np.ndarray) -> np.ndarray | None:
-    return cv2.goodFeaturesToTrack(
+  def corners(img: UInt8Array) -> npt.NDArray[np.float32]:
+    points = detect_corners(
       img,
-      maxCorners=args.flow_max_corners,
-      qualityLevel=args.flow_quality_level,
-      minDistance=args.flow_min_distance_px,
+      None,
+      max_corners=args.flow_max_corners,
+      quality_level=args.flow_quality_level,
+      min_distance=args.flow_min_distance_px,
     )
+    return points.reshape(-1, 1, 2).astype(np.float32)
 
   mags: list[float] = []
-  prev = grays[0]
-  prev_pts = corners(prev)
-  for k in range(1, len(grays)):
-    curr = grays[k]
-    if prev_pts is None or len(prev_pts) < 10:
-      mags.append(0.0)
-      prev_pts = corners(curr)
-      prev = curr
-      continue
-    next_pts, status, _ = cv2.calcOpticalFlowPyrLK(
-      prev, curr, prev_pts, np.empty_like(prev_pts)
-    )
-    if next_pts is None or status is None:
+  prev, prev_points = grays[0], corners(grays[0])
+  for curr in grays[1:]:
+    # A frame down to a handful of points measures noise, not motion.
+    if len(prev_points) < 10:
       mags.append(0.0)
     else:
+      next_points, status, _ = cv2.calcOpticalFlowPyrLK(
+        prev, curr, prev_points, np.empty_like(prev_points)
+      )
       good = status.flatten() == 1
-      if good.any():
-        delta = (next_pts[good] - prev_pts[good]).reshape(-1, 2)
-        mags.append(float(np.median(np.linalg.norm(delta, axis=1))))
-      else:
-        mags.append(0.0)
-    prev_pts = corners(curr)
-    prev = curr
+      delta = (next_points[good] - prev_points[good]).reshape(-1, 2)
+      norms = np.linalg.norm(delta, axis=1)
+      mags.append(float(np.median(norms)) if norms.size else 0.0)
+    prev, prev_points = curr, corners(curr)
   return np.asarray([0.0, *mags], dtype=np.float64)
 
 
@@ -110,20 +103,15 @@ def _estimate_offset(
   imu_t: Float64Array,
   gyro_mag: Float64Array,
 ) -> OffsetResult:
-  flow = (flow_mag - flow_mag.mean()) / (flow_mag.std() + 1e-9)
-
-  best_off, best_corr = 0.0, -np.inf
-  for off in np.arange(-_MAX_OFFSET, _MAX_OFFSET + _OFFSET_STEP, _OFFSET_STEP):
-    shifted = np.interp(video_t, imu_t + off, gyro_mag)
-    z = (shifted - shifted.mean()) / (shifted.std() + 1e-9)
-    corr = float(np.dot(flow, z) / flow.size)
-    if corr > best_corr:
-      best_corr, best_off = corr, float(off)
-  return OffsetResult(
-    best_offset=best_off,
-    peak_correlation=best_corr,
-    search_range=_MAX_OFFSET,
+  """Clock offset (s) to add to the IMU timestamps to land them on the video clock."""
+  rate = 1.0 / float(np.median(np.diff(imu_t)))
+  grid = np.arange(max(video_t[0], imu_t[0]), min(video_t[-1], imu_t[-1]), 1.0 / rate)
+  offset, peak_ratio = correlation_offset(
+    np.interp(grid, imu_t, gyro_mag),
+    np.interp(grid, video_t, flow_mag),
+    int(round(rate)),
   )
+  return OffsetResult(offset=offset, peak_ratio=peak_ratio)
 
 
 def _vertical_line_shear(gray: UInt8Array, threshold: int) -> float | None:
@@ -199,8 +187,12 @@ def _verdict(summary: TimingSummary) -> str:
   parts: list[str] = []
   if summary.offset is None:
     parts.append("offset N/A")
-  elif abs(summary.offset.best_offset) > 0.05:
-    parts.append(f"large video<->IMU offset {summary.offset.best_offset * 1e3:.1f} ms")
+  elif summary.offset.peak_ratio < _MIN_PEAK_RATIO:
+    parts.append(
+      f"offset unreliable: peak {summary.offset.peak_ratio:.2f}x its tallest rival"
+    )
+  elif abs(summary.offset.offset) > 0.05:
+    parts.append(f"large video<->IMU offset {summary.offset.offset * 1e3:.1f} ms")
   if summary.shear is None:
     parts.append("RS shear unmeasured (need yaw motion + vertical edges)")
   elif abs(summary.shear.measured_readout - summary.shear.factory_readout) > 5e-3:
@@ -249,7 +241,7 @@ def main(args: TimingArgs) -> None:
     data.imu_timestamps,
     data.gyro_deg,
     args=args,
-    applied_offset=offset.best_offset,
+    applied_offset=offset.offset,
     factory_readout=data.rolling_shutter_readout,
   )
 
@@ -268,7 +260,7 @@ def main(args: TimingArgs) -> None:
     args.output_dir,
     summary,
     lambda: _log_to_rerun(
-      video_t, flow_mag, data.imu_timestamps, gyro_mag, offset.best_offset
+      video_t, flow_mag, data.imu_timestamps, gyro_mag, offset.offset
     ),
   )
 
