@@ -204,27 +204,37 @@ def main(args: Args) -> None:
   # Resolve the URDF once: the finger joint-angle factors and the viz overlay share it.
   urdf_path = _resolve_urdf_path(args.urdf_path)
 
+  # Captures prep concurrently as far as their decoded keyframes fit in memory.
+  concurrent = _captures_that_fit(specs, args)
+  set_precompute_concurrency(concurrent)
+
   def _prep_one(spec: tuple[str, Path, float, int, int, int]) -> PreparedTracker:
     name, path, start, base_tag_id, left_id, right_id = spec
     print(f"\n=== prep tracker {name!r} ({path.name}, start={start:.3f}s) ===")
-    tracker = prepare_tracker(
-      name,
-      TrackerArgs(
-        insv_path=path,
-        start=start,
-        duration=duration,
-        keyframe_every=args.window.keyframe_every,
-        base_tag_id=base_tag_id,
-        left_finger_tag_id=int(left_id),
-        right_finger_tag_id=int(right_id),
-        frontend=args.frontend,
-        imu=args.imu,
-        anchor=args.anchor,
-        parallel_siblings=len(args.input_insvs) > 1,
-        gripper=args.gripper,
-        urdf_path=urdf_path,
-      ),
-    )
+    try:
+      tracker = prepare_tracker(
+        name,
+        TrackerArgs(
+          insv_path=path,
+          start=start,
+          duration=duration,
+          keyframe_every=args.window.keyframe_every,
+          base_tag_id=base_tag_id,
+          left_finger_tag_id=int(left_id),
+          right_finger_tag_id=int(right_id),
+          frontend=args.frontend,
+          imu=args.imu,
+          anchor=args.anchor,
+          parallel_siblings=concurrent > 1,
+          gripper=args.gripper,
+          urdf_path=urdf_path,
+        ),
+      )
+    except Exception as exc:
+      # Name the failure at once: the traceback waits for sibling decodes to finish.
+      if concurrent > 1:
+        print(f"\n=== prep tracker {name!r} FAILED: {exc!r} ===", flush=True)
+      raise
     print(
       f"  kf={tracker.n_keyframes}  anchor_obs={len(anchored_keyframes(tracker))}  "
       f"front_pts={len(tracker.front_points)}  rear_pts={len(tracker.rear_points)}  "
@@ -232,18 +242,17 @@ def main(args: Args) -> None:
     )
     return tracker
 
-  # Captures prep concurrently as far as their decoded keyframes fit in memory.
-  concurrent = _captures_that_fit(specs, args)
-  set_precompute_concurrency(concurrent)
-  if concurrent == 1:
-    trackers: list[PreparedTracker] = [_prep_one(spec) for spec in specs]
-  else:
-    with ThreadPoolExecutor(max_workers=concurrent) as prep_pool:
-      trackers = list(prep_pool.map(_prep_one, specs))
-  # Free the GPU flow workers' device memory for the joint bundle adjustment.
   from specialist.vi_ba import gpu_flow
 
-  gpu_flow.shutdown()
+  try:
+    if concurrent == 1:
+      trackers: list[PreparedTracker] = [_prep_one(spec) for spec in specs]
+    else:
+      with ThreadPoolExecutor(max_workers=concurrent) as prep_pool:
+        trackers = list(prep_pool.map(_prep_one, specs))
+  finally:
+    # Free the GPU flow workers' device memory for the joint bundle adjustment.
+    gpu_flow.shutdown()
   mark("trackers prepared")
 
   cross_obs = cross_tracker_observations(
