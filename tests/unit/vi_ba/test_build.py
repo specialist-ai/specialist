@@ -163,6 +163,23 @@ def test_optimize_graph_converges_from_small_perturbation() -> None:
   assert result.iterations >= 1
 
 
+def test_optimize_graph_rejects_non_finite_initial_error_before_solving(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  poses = [gtsam.Pose3(), gtsam.Pose3(gtsam.Rot3(), gtsam.Point3(np.nan, 0.0, 0.0))]
+  graph, values = front_only_graph(
+    poses, LensSetup(extrinsic=gtsam.Pose3(), params=pinhole_mei_params()), {}, {}
+  )
+  assert not np.isfinite(graph.error(values))
+
+  def _no_solve(*args: object, **kwargs: object) -> None:
+    raise AssertionError("the optimizer must not run on a non-finite graph")
+
+  monkeypatch.setattr(gtsam, "LevenbergMarquardtOptimizer", _no_solve)
+  with pytest.raises(RuntimeError, match="not finite"):
+    optimize_graph(graph, values, max_iterations=50)
+
+
 def _stationary_pim() -> gtsam.PreintegratedCombinedMeasurements:
   """A 1 s stationary IMU preintegration: zero motion, gravity along −z."""
   n = 1000

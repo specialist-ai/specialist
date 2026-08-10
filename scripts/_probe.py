@@ -14,7 +14,7 @@ import numpy as np
 import numpy.typing as npt
 import rerun as rr
 
-from specialist.vi_ba.pipeline import probe_capture
+from specialist.loader.capture import probe_capture
 
 UInt8Array = npt.NDArray[np.uint8]
 
