@@ -16,6 +16,12 @@ class TrackerSummary:
   anchor_obs: int
   bounding_box_diagonal: float
   path_length: float
+  # Reprojection RMSE in pixels over the whole take, per lens.
+  front_rmse: float = float("nan")
+  rear_rmse: float = float("nan")
+  # The gripper base tag this tracker was solved against. Which arm carries
+  # which tag is a per-take fact, so the track cannot be read without it.
+  base_tag_id: int = -1
 
 
 @dataclass(frozen=True)

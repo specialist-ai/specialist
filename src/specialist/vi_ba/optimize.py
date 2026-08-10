@@ -60,9 +60,8 @@ def optimize_graph(
 ) -> OptimizeResult:
   """Run Levenberg-Marquardt and return values + run stats. ``gpu`` selects
   the Schur/cuDSS path: ``"require"`` raises when the backend cannot load or
-  its solve fails, so an environment problem stops the run instead of
-  silently costing the CPU optimizer's wall time; ``"auto"`` falls back to
-  gtsam with a notice; ``"off"`` never tries the GPU."""
+  its solve fails; ``"auto"`` falls back to gtsam with a notice; ``"off"``
+  never tries the GPU."""
   initial_error = float(graph.error(initial_values))
   if not np.isfinite(initial_error):
     raise RuntimeError(

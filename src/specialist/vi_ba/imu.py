@@ -26,7 +26,6 @@ __all__ = [
   "GRAVITY",
   "GRAVITY_WORLD",
   "ImuSamples",
-  "factory_imu_bias",
   "find_stationary_windows",
   "from_deg_per_s",
   "integrate_samples",
@@ -129,16 +128,6 @@ def make_preintegration_params(
   params.setBiasOmegaCovariance(np.eye(3) * gyro_walk**2)
   params.setBiasAccOmegaInit(np.eye(6) * _INITIAL_BIAS_SIGMA**2)
   return params
-
-
-def factory_imu_bias(
-  gyro_calib_numbers: Float64Array,
-) -> gtsam.imuBias.ConstantBias:
-  """Factory IMU bias from ``gyro_calib.numbers``: ``[gx, gy, gz, ax, ay,
-  az]`` (3 gyro rad/s + 3 accel m/s²). Use this when the capture doesn't
-  start stationary and a window-mean seed would absorb real motion."""
-  arr = np.asarray(gyro_calib_numbers, dtype=np.float64).reshape(6)
-  return gtsam.imuBias.ConstantBias(arr[3:6], arr[:3])
 
 
 def keyframe_delta_rotations(

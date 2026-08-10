@@ -16,6 +16,9 @@ from specialist.record.base import (
 from specialist.vi_ba.configs import ImuCfg
 from specialist.vi_ba.extrinsics import parse_offset_v3
 
+# Wide enough to keep every synthetic IMU sample.
+_WHOLE_SESSION = (-10.0, 10.0)
+
 
 def _synthetic_insv() -> InsvData:
   block = [
@@ -89,7 +92,9 @@ def _column(reader: RrdReader, entity: str, component: str) -> tuple[Any, Any]:
 
 
 def test_imu_chunks_units_and_shift(tmp_path: Path) -> None:
-  reader = _write(tmp_path, imu_chunks("tracker_0", _synthetic_insv(), 0.25))
+  reader = _write(
+    tmp_path, imu_chunks("tracker_0", _synthetic_insv(), 0.25, _WHOLE_SESSION)
+  )
   times, gyro = _column(reader, "/imu/tracker_0/gyro", "Scalars:scalars")
   assert times[0] == round((-0.5 + 0.25) * 1e9)
   np.testing.assert_allclose(gyro[0], [np.pi / 2, 0.0, 0.0])
@@ -133,7 +138,7 @@ def test_calibration_chunks_extrinsics(tmp_path: Path) -> None:
 
 def test_write_base_recording_identity_and_properties(tmp_path: Path) -> None:
   out = tmp_path / "base.rrd"
-  chunks = imu_chunks("tracker_0", _synthetic_insv())
+  chunks = imu_chunks("tracker_0", _synthetic_insv(), 0.0, _WHOLE_SESSION)
   write_base_recording(
     out,
     "ft005",
@@ -149,3 +154,28 @@ def test_write_base_recording_identity_and_properties(tmp_path: Path) -> None:
   # entity_paths() hides internal paths; properties live under /__properties/.
   assert "/__properties/session" in chunk_paths
   assert "/__properties/audio_offset" in chunk_paths
+
+
+def test_write_base_recording_failure_leaves_no_final_file(
+  tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+  out = tmp_path / "base.rrd"
+
+  def explode(*args: Any, **kwargs: Any) -> None:
+    raise RuntimeError("mid-write failure")
+
+  monkeypatch.setattr("specialist.record.base.send_chunks", explode)
+  chunks = imu_chunks("tracker_0", _synthetic_insv(), 0.0, _WHOLE_SESSION)
+  with pytest.raises(RuntimeError, match="mid-write failure"):
+    write_base_recording(out, "s", [LazyChunkStream.from_iter(chunks)], [], {})
+  assert not out.exists()
+
+
+def test_write_base_recording_replaces_a_stale_partial(tmp_path: Path) -> None:
+  out = tmp_path / "base.rrd"
+  stale = tmp_path / "base.rrd.partial"
+  stale.write_bytes(b"leftover from a crashed run")
+  chunks = imu_chunks("tracker_0", _synthetic_insv(), 0.0, _WHOLE_SESSION)
+  write_base_recording(out, "s", [LazyChunkStream.from_iter(chunks)], [], {})
+  assert not stale.exists()
+  assert RrdReader(str(out)).recordings()[0].recording_id == "s"

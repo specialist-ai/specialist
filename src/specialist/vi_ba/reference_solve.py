@@ -2,8 +2,10 @@
 
 ``specialist.vi_ba.compose`` builds the graph for one fixed reference anchor;
 this module owns what sits above that: solving it with a landmark
-cull-reoptimize pass and re-estimating each secondary anchor from the solved
-poses as a consistency check.
+cull-reoptimize pass, re-estimating each secondary anchor from the solved
+poses as a consistency check, and — when more than one anchor is configured —
+retrying that whole solve once per candidate reference so the exported
+geometry does not depend on the configured tag-id order.
 """
 
 from __future__ import annotations
@@ -12,10 +14,10 @@ from dataclasses import dataclass, replace
 
 import gtsam
 import numpy as np
-import numpy.typing as npt
 
 from specialist.vi_ba.anchor_detection import tag_corners_in_frame
 from specialist.vi_ba.compose import (
+  _FINGER_JOINTS,
   CrossSighting,
   LandmarkKeep,
   TrackerKeys,
@@ -27,8 +29,6 @@ from specialist.vi_ba.configs import Args, GpuMode
 from specialist.vi_ba.landmark_cull import cull_outlier_landmarks
 from specialist.vi_ba.optimize import OptimizeResult, optimize_graph
 from specialist.vi_ba.single_tracker import PreparedTracker
-
-Float64Array = npt.NDArray[np.float64]
 
 __all__ = [
   "ReferenceSolve",
@@ -116,10 +116,8 @@ def _solve_with_cull_reoptimize(
     r_pts_1 = points_from_values(
       result.values, keys.rear_landmark_key, t.name, t.rear_points
     )
-    front_keep = cull_outlier_landmarks(
-      f_pts_1, t.front_tracks_tri, poses_1, t.front_lens
-    )
-    rear_keep = cull_outlier_landmarks(r_pts_1, t.rear_tracks_tri, poses_1, t.rear_lens)
+    front_keep = cull_outlier_landmarks(f_pts_1, t.front_tracks, poses_1, t.front_lens)
+    rear_keep = cull_outlier_landmarks(r_pts_1, t.rear_tracks, poses_1, t.rear_lens)
     landmark_keep[t.name] = (front_keep, rear_keep)
   first = result
   outlier_keys = _outlier_landmark_keys(trackers, keys, landmark_keep)
@@ -232,7 +230,8 @@ def _secondary_pose_move(
 
 @dataclass
 class ReferenceSolve:
-  """Everything the export needs from the joint solve."""
+  """Everything the export needs from one reference's joint solve, kept so the
+  selected candidate is reused without re-solving."""
 
   ref_tag_id: int
   ref_anchor: gtsam.Pose3
@@ -266,7 +265,7 @@ def _solve_joint_graph(
 
   Solves once with the secondaries pinned at their prep-composed seeds, then
   re-estimates each from the solved poses. The solve carries the re-estimates,
-  which are what gets exported, and how far each moved off its seed, the
+  which are what gets exported, and how far each moved off its seed — the
   consistency signal the run summary records."""
   seed = _seed_secondary_anchors(trackers, args)
   graph, values = assemble_joint_graph(
@@ -299,7 +298,7 @@ def _solve_joint_graph(
     resolved[tag_id] = estimate
     moves[tag_id] = (dt, dr)
   return ReferenceSolve(
-    ref_tag_id=int(args.anchor.tag_ids[0]),
+    ref_tag_id=int(args.anchor.enabled_tag_ids[0]),
     ref_anchor=ref_anchor,
     result=result,
     landmark_keep=landmark_keep,
@@ -315,9 +314,9 @@ def solve_joint(
   args: Args,
   cross_obs: list[CrossSighting],
 ) -> ReferenceSolve:
-  """Solve the joint graph, with the first configured tag pinning the world,
-  and return the solution to export."""
-  ref_anchor = align_to_shared_world(trackers, args.anchor.tag_ids)
+  """Solve the joint graph, with the first enabled tag pinning the world, and
+  return the solution to export."""
+  ref_anchor = align_to_shared_world(trackers, args.anchor.enabled_tag_ids)
   return _solve_joint_graph(trackers, keys, args, cross_obs, ref_anchor)
 
 
@@ -329,7 +328,7 @@ def adopt_ba_refined_estimates(
   it was seen or inferred from the symmetry prior."""
   for t in trackers:
     if t.finger_reproj:
-      for finger_idx, joint_name in ((0, "left_finger"), (1, "right_finger")):
+      for finger_idx, joint_name in enumerate(_FINGER_JOINTS):
         angles = list(t.joint_angles.get(joint_name, [float("nan")] * t.n_keyframes))
         for kf in range(t.n_keyframes):
           tkey = keys.theta_key(t.name, finger_idx, kf)
@@ -339,16 +338,3 @@ def adopt_ba_refined_estimates(
     bt_key = keys.base_tag_key(t.name)
     if result.values.exists(bt_key):
       t.body_T_base_tag = result.values.atPose3(bt_key)
-  # The prep-time velocities and biases predate the joint solve; the export
-  # hands them to IMU propagation, so carry the optimized ones.
-  for t in trackers:
-    if not result.values.exists(keys.velocity_key(t.name, 0)):
-      continue
-    t.velocities = [
-      np.asarray(result.values.atVector(keys.velocity_key(t.name, i)))
-      for i in range(t.n_keyframes)
-    ]
-    t.biases = [
-      result.values.atConstantBias(keys.bias_key(t.name, i))
-      for i in range(t.n_keyframes)
-    ]

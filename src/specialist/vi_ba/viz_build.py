@@ -2,9 +2,7 @@
 
 ``viz`` owns how a ``TrackerVizData`` is logged; this owns how one is built —
 the post-bundle landmark cull, the per-keyframe reprojections and their RMSE,
-the tag-axis overlay, and the factor-observation lines. The cull also decides
-the landmarks the JSON export carries, so ``build_run_outputs`` returns both
-and the entry point just hands them on.
+the tag-axis overlay, and the factor-observation lines.
 """
 
 from __future__ import annotations
@@ -107,8 +105,9 @@ def _per_kf_rejected_keypoints(
 
 
 def _rms(values: list[float]) -> float:
-  """Root-mean-square of ``values``; NaN when empty."""
-  return float(np.sqrt(np.mean(np.square(values)))) if values else float("nan")
+  """Root-mean-square over the finite entries; NaN when there are none."""
+  finite = [v for v in values if np.isfinite(v)]
+  return float(np.sqrt(np.mean(np.square(finite)))) if finite else float("nan")
 
 
 def _gripper_opening(
@@ -134,10 +133,6 @@ def _gripper_opening(
     urdf_joints[tagged[0]], urdf_joints[tagged[1]], angles_a, angles_b
   )
   return times_a, opening
-
-
-def _aggregate_rmse_for_print(per_kf: list[float]) -> float:
-  return _rms([v for v in per_kf if np.isfinite(v)])
 
 
 def _project_tag_axes_per_kf(
@@ -181,6 +176,7 @@ def _project_tag_axes_per_kf(
 
 def _build_tracker_outputs(
   tracker: PreparedTracker,
+  base_tag_id: int,
   poses: list[gtsam.Pose3],
   result: OptimizeResult,
   keys: TrackerKeys,
@@ -190,28 +186,31 @@ def _build_tracker_outputs(
   cross_obs: list[CrossSighting],
   anchor_corners_by_tag: dict[int, Float64Array],
   base_tag_corners_world: dict[str, list[Float64Array]],
-  audio_offset: float,
   urdf_joints: dict[str, RevoluteJoint] | None,
 ) -> tuple[TrackerVizData, TrackerSummary]:
-  """Assemble one tracker's Rerun viz payload from the solved values:
-  post-bundle landmark cull, per-keyframe reprojection RMSE, tag-axis /
+  """Assemble one tracker's Rerun viz payload and summary line from the solved
+  values: post-bundle landmark cull, per-keyframe reprojection RMSE, tag-axis /
   landmark-reprojection overlays, and factor-observation lines."""
-  front_points = points_from_values(
-    result.values, keys.front_landmark_key, tracker.name, landmark_keep[0]
-  )
-  rear_points = points_from_values(
-    result.values, keys.rear_landmark_key, tracker.name, landmark_keep[1]
-  )
   # Post-bundle map cull. The poses are untouched, so this only cleans the
   # exported map, the RMSE, and the overlay.
   front_points, front_reproj_per_kf, front_rmse_per_kf = cull_and_reproject(
-    front_points, tracker.front_tracks_tri, poses, tracker.front_lens
+    points_from_values(
+      result.values, keys.front_landmark_key, tracker.name, landmark_keep[0]
+    ),
+    tracker.front_tracks,
+    poses,
+    tracker.front_lens,
   )
   rear_points, rear_reproj_per_kf, rear_rmse_per_kf = cull_and_reproject(
-    rear_points, tracker.rear_tracks_tri, poses, tracker.rear_lens
+    points_from_values(
+      result.values, keys.rear_landmark_key, tracker.name, landmark_keep[1]
+    ),
+    tracker.rear_tracks,
+    poses,
+    tracker.rear_lens,
   )
-  front_rmse = _aggregate_rmse_for_print(front_rmse_per_kf)
-  rear_rmse = _aggregate_rmse_for_print(rear_rmse_per_kf)
+  front_rmse = _rms(front_rmse_per_kf)
+  rear_rmse = _rms(rear_rmse_per_kf)
   bbox_diagonal = bounding_box_diagonal(poses)
   summary = TrackerSummary(
     name=tracker.name,
@@ -219,6 +218,9 @@ def _build_tracker_outputs(
     anchor_obs=len(anchored_keyframes(tracker)),
     bounding_box_diagonal=bbox_diagonal,
     path_length=path_length(poses),
+    front_rmse=front_rmse,
+    rear_rmse=rear_rmse,
+    base_tag_id=base_tag_id,
   )
   rear_note = f" rear_rmse={rear_rmse:.2f}px" if np.isfinite(rear_rmse) else ""
   print(
@@ -258,10 +260,11 @@ def _build_tracker_outputs(
   ]
   highrate_times = highrate_positions = highrate_quats = highrate_vels = None
   if tracker.imu is not None and biases_final:
+    # Stored at the IMU's own sample times, never resampled to a uniform rate.
     hr_t, hr_p, hr_q, hr_v = propagate_highrate(
       poses, tracker.keyframe_times, velocities_final, biases_final, tracker.imu
     )
-    highrate_times = hr_t - audio_offset
+    highrate_times = hr_t
     highrate_positions = hr_p
     highrate_quats = hr_q
     highrate_vels = hr_v
@@ -275,7 +278,7 @@ def _build_tracker_outputs(
       )
       n_j = min(len(kf_t), len(solved))
       pinned = pin_angles_to_keyframes(f_times, f_angles, kf_t[:n_j], solved[:n_j])
-      joint_frame_angles[joint] = (f_times - audio_offset, pinned)
+      joint_frame_angles[joint] = (f_times, pinned)
   gripper_opening = _gripper_opening(joint_frame_angles, urdf_joints)
   anchor_lines, cross_lines = _factor_observation_lines(
     tracker,
@@ -288,7 +291,8 @@ def _build_tracker_outputs(
   viz_data = TrackerVizData(
     name=tracker.name,
     body_poses=poses,
-    keyframe_times=np.asarray(tracker.keyframe_times, dtype=np.float64) - audio_offset,
+    keyframe_times=np.asarray(tracker.keyframe_times, dtype=np.float64),
+    keyframe_rows=np.asarray(tracker.keyframe_rows, dtype=np.int64),
     front_points=front_points,
     rear_points=rear_points,
     front_keypoints=tracker.front_keypoints,
@@ -357,13 +361,12 @@ def _base_tag_corners_world(
 
 @dataclass(frozen=True)
 class RunOutputs:
-  """Everything one solved run hands to its consumers: the Rerun payload and
-  summary per tracker, the solved anchors, and the audio offsets."""
+  """Everything one solved run hands to its consumers: the Rerun payload per
+  tracker, the per-tracker summary lines, and the solved anchor poses."""
 
   viz_trackers: list[TrackerVizData]
   per_tracker: list[TrackerSummary]
   anchor_poses_world: dict[int, gtsam.Pose3]
-  audio_offset_by_tracker: dict[str, float]
 
 
 def build_run_outputs(
@@ -374,7 +377,6 @@ def build_run_outputs(
   landmark_keep: LandmarkKeep,
   args: Args,
   cross_obs: list[CrossSighting],
-  audio_offsets: list[float],
   reference_anchor: gtsam.Pose3,
   reference_tag_id: int,
   secondary_anchor_world: dict[int, gtsam.Pose3],
@@ -382,7 +384,8 @@ def build_run_outputs(
 ) -> RunOutputs:
   """Build every per-tracker payload from one solved joint graph. The
   reference anchor pins the world gauge; each secondary carries the re-estimate
-  that pinned the solve."""
+  that pinned the solve. Every timestamp stays on the session clock the base
+  recording defines."""
   anchor_poses_world = {reference_tag_id: reference_anchor, **secondary_anchor_world}
   anchor_corners_by_tag = {
     tag_id: tag_corners_in_frame(pose, args.anchor.tag_size)
@@ -392,7 +395,6 @@ def build_run_outputs(
     trackers, optimized_body_poses, args.gripper.tag_size
   )
   tag_sizes = _tag_size_by_id(args)
-  audio_offset_by_tracker = {t.name: audio_offsets[i] for i, t in enumerate(trackers)}
   by_observer: dict[str, list[CrossSighting]] = {t.name: [] for t in trackers}
   for sighting in cross_obs:
     by_observer[sighting.observer].append(sighting)
@@ -400,9 +402,10 @@ def build_run_outputs(
 
   viz_trackers: list[TrackerVizData] = []
   per_tracker: list[TrackerSummary] = []
-  for t in trackers:
+  for t, base_tag_id in zip(trackers, args.base_tag_ids, strict=True):
     viz_data, summary = _build_tracker_outputs(
       t,
+      base_tag_id=base_tag_id,
       poses=optimized_body_poses[t.name],
       result=result,
       keys=keys,
@@ -412,14 +415,8 @@ def build_run_outputs(
       cross_obs=by_observer[t.name],
       anchor_corners_by_tag=anchor_corners_by_tag,
       base_tag_corners_world=base_tag_corners,
-      audio_offset=audio_offset_by_tracker[t.name],
       urdf_joints=urdf_joints,
     )
     viz_trackers.append(viz_data)
     per_tracker.append(summary)
-  return RunOutputs(
-    viz_trackers,
-    per_tracker,
-    anchor_poses_world,
-    audio_offset_by_tracker,
-  )
+  return RunOutputs(viz_trackers, per_tracker, anchor_poses_world)
