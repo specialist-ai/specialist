@@ -14,8 +14,18 @@ joint angles.
 ## Install
 
 ```
-uv sync --extra dev
+uv sync
 ```
+
+That is the whole environment story: the `dev` and `gpu` dependency groups are
+defaults, so a plain `uv sync` (or any `uv run`) converges every box to the
+full declared environment — the CUDA solve stack lands wherever its linux
+markers apply, and nothing is ever installed into the venv by hand. Solves
+default to `--solver.gpu require`, which aborts at the first solve when that stack
+stack cannot load; `--solver.gpu auto` falls back to the CPU optimizer with a
+notice. Reserve
+`uv run --no-sync` for timed benchmark legs, where a run must not spend its
+wall clock on dependency resolution.
 
 Pulls `gtsam>=4.3a0` (the alpha is the only release with cp312 wheels), `numpy`,
 `scipy`, `rerun-sdk`, `tyro`, `telemetry-parser`, `opencv-python`,
