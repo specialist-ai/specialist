@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Sequence
+from pathlib import Path
 
 import numpy as np
 import numpy.typing as npt
@@ -239,6 +240,45 @@ def test_flow_chunk_budget_tracks_available_memory() -> None:
   per_pair = 2880 * 2880 * 2 * 4 * 2
   cached = features._flow_chunk_size(frames) * per_pair
   assert 0 < cached <= max(features.available_ram() * 0.25, per_pair)
+  assert features.available_ram() > 0
+
+
+def test_available_ram_counts_reclaimable_page_cache(
+  tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+  """A warm page cache leaves little memory free but plenty available, and the
+  budget follows the available figure."""
+  from specialist.vi_ba import features
+
+  meminfo = tmp_path / "meminfo"
+  meminfo.write_text(
+    "MemTotal:       263773316 kB\nMemFree:         3145728 kB\n"
+    "Buffers:          524288 kB\nCached:        226492416 kB\n"
+    "MemAvailable:   229638144 kB\n"
+  )
+  monkeypatch.setattr(features, "_MEMINFO", meminfo)
+  assert features.available_ram() == 229638144 * 1024
+
+
+def test_available_ram_falls_back_without_meminfo(
+  tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+  """No meminfo file (macOS) falls back to the sysconf pages."""
+  from specialist.vi_ba import features
+
+  monkeypatch.setattr(features, "_MEMINFO", tmp_path / "absent")
+  assert features.available_ram() > 0
+
+
+def test_available_ram_falls_back_without_memavailable(
+  tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+  """A meminfo lacking MemAvailable (old kernels) falls back too."""
+  from specialist.vi_ba import features
+
+  meminfo = tmp_path / "meminfo"
+  meminfo.write_text("MemTotal:       263773316 kB\nMemFree:         3145728 kB\n")
+  monkeypatch.setattr(features, "_MEMINFO", meminfo)
   assert features.available_ram() > 0
 
 
