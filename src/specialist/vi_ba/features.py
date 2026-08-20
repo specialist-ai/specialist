@@ -233,7 +233,9 @@ class _ScaledFrames(Sequence[np.ndarray]):
     return small
 
 
-def _select_flow_iter(frames: Sequence[np.ndarray], gpu: bool) -> _FlowIter:
+def _select_flow_iter(
+  frames: Sequence[np.ndarray], gpu: bool, label: str | None
+) -> _FlowIter:
   """Pick the flow backend once per lens: the GPU wavefront when requested and
   runnable, else the cv2 path. Both yield the identical
   ``(k, (forward, backward))`` stream."""
@@ -250,10 +252,9 @@ def _select_flow_iter(frames: Sequence[np.ndarray], gpu: bool) -> _FlowIter:
       frames, _DIS_VARIATIONAL_ITERS, _DIS_BACKWARD_VARIATIONAL_ITERS
     )
     print(
-      f"  [flow] GPU DIS backend: cuda:{engine.device_index}, "
+      f"  [{_flow_scope(label)}] GPU DIS backend: cuda:{engine.device_index}, "
       f"{engine.batch} pairs/window, ready in "
-      f"{time.perf_counter() - begin:.1f}s",
-      flush=True,
+      f"{time.perf_counter() - begin:.1f}s"
     )
 
     # The GPU path never runs ``_iter_dis_flows``, which is where the cv2 path
@@ -261,12 +262,20 @@ def _select_flow_iter(frames: Sequence[np.ndarray], gpu: bool) -> _FlowIter:
     cv2.setNumThreads(_cv2_thread_budget())
     return functools.partial(gpu_flow.iter_flows, engine)
   except Exception as exc:
-    print(f"  [flow] GPU DIS unavailable ({exc}); using cv2 DIS", flush=True)
+    print(f"  [warn] [{_flow_scope(label)}] GPU DIS unavailable ({exc}); using cv2 DIS")
     return _iter_dis_flows
 
 
+def _flow_scope(label: str | None) -> str:
+  """The scope tag for a flow line: which tracker and lens, when known."""
+  return f"{label}/flow" if label else "flow"
+
+
 def _flow_pairs(
-  flow_iter: _FlowIter, frames: Sequence[np.ndarray], chunk: int
+  flow_iter: _FlowIter,
+  frames: Sequence[np.ndarray],
+  chunk: int,
+  label: str | None,
 ) -> Iterator[tuple[_FlowPair, str]]:
   """``((forward, backward), backend)`` per consecutive pair, requested one
   RAM-bounded chunk at a time and lazily. A chunk that fails on the GPU restarts
@@ -284,7 +293,7 @@ def _flow_pairs(
       except Exception as exc:
         if flow_iter is _iter_dis_flows:
           raise
-        print(f"  [flow] GPU DIS lost ({exc}); using cv2 DIS", flush=True)
+        print(f"  [warn] [{_flow_scope(label)}] GPU DIS lost ({exc}); using cv2 DIS")
         flow_iter, backend = _iter_dis_flows, "cv2"
         stream = flow_iter(frames, range(k, chunk_end))
         flow_k, pair = next(stream)
@@ -358,6 +367,8 @@ def dis_flow_track(
   masks: list[list[Rect]] | None = None,
   gpu_flow: bool = False,
   flow_scale: float = 1.0,
+  *,
+  label: str | None = None,
 ) -> tuple[list[Float64Array], list[npt.NDArray[np.int64]]]:
   """Sparse-track propagation via DIS dense optical flow: Shi-Tomasi seeding
   with redetect, and a per-pair propagation step that samples the dense flow
@@ -374,11 +385,11 @@ def dis_flow_track(
   # The backend is primed on the same (optionally downscaled) view it will be
   # fed, and priming also sets the cv2 thread budget for the ops below.
   flow_frames = frames if flow_scale == 1.0 else _ScaledFrames(frames, flow_scale)
-  flow_iter = _select_flow_iter(flow_frames, gpu_flow)
+  flow_iter = _select_flow_iter(flow_frames, gpu_flow, label)
   scale_note = "" if flow_scale == 1.0 else f" @{flow_scale:g}x"
   backend = "cv2" if flow_iter is _iter_dis_flows else "gpu"
   flow_begin = time.perf_counter()
-  pairs = _flow_pairs(flow_iter, flow_frames, _flow_chunk_size(flow_frames))
+  pairs = _flow_pairs(flow_iter, flow_frames, _flow_chunk_size(flow_frames), label)
   # Sized by ``len(frames)``: iterating a banded reader decodes the whole lens.
   per_frame_pts: list[Float64Array] = [np.empty((0, 2)) for _ in range(len(frames))]
   matches_between: list[npt.NDArray[np.int64]] = []
@@ -442,9 +453,8 @@ def dis_flow_track(
         per_frame_pts[k] = np.vstack([per_frame_pts[k], new_corners])
 
   print(
-    f"  [flow] {backend}{scale_note} DIS tracked {len(frames)} frames in "
-    f"{time.perf_counter() - flow_begin:.1f}s",
-    flush=True,
+    f"  [{_flow_scope(label)}] {backend}{scale_note} DIS tracked "
+    f"{len(frames)} frames in {time.perf_counter() - flow_begin:.1f}s"
   )
   return per_frame_pts, matches_between
 

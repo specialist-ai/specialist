@@ -449,7 +449,7 @@ def _add_all_anchor_corner_factors(
     max_half_angle=args.anchor.max_half_angle,
     graph=graph,
   )
-  print(f"anchor corner reprojection: {n_ref} anchor sightings")
+  print(f"[graph] anchor corner reprojection: {n_ref} sightings")
   sec_prior = gtsam.noiseModel.Isotropic.Sigma(
     3, args.anchor.secondary_corner_prior_sigma
   )
@@ -474,7 +474,7 @@ def _add_all_anchor_corner_factors(
       max_half_angle=args.anchor.max_half_angle,
       graph=graph,
     )
-    print(f"secondary anchor {tag_id} corner reprojection: {n_sec} sightings")
+    print(f"[graph] secondary anchor {tag_id} corner reprojection: {n_sec} sightings")
 
 
 def _add_gripper_factors(
@@ -703,17 +703,19 @@ def assemble_joint_graph(
   poses_smoothed, velocities_smoothed = _add_smoothness_priors(trackers, keys, graph)
   if base_tags or fingers:
     print(
-      f"base-tag reprojection: {base_tags} factors; "
+      f"[graph] base-tag reprojection: {base_tags} factors; "
       f"finger joint-angle reprojection: {fingers} factors"
     )
   if cross_base:
-    print(f"cross-tracker reprojection: {cross_base} factors")
+    print(f"[graph] cross-tracker reprojection: {cross_base} factors")
   if cross_finger:
-    print(f"finger-tag cross-tracker reprojection: {cross_finger} factors")
+    print(f"[graph] finger-tag cross-tracker reprojection: {cross_finger} factors")
   if poses_smoothed:
-    print(f"unanchored-stretch pose smoothness priors: {poses_smoothed}")
+    print(f"[graph] unanchored-stretch pose smoothness priors: {poses_smoothed}")
   if velocities_smoothed:
-    print(f"unanchored-stretch velocity smoothness priors: {velocities_smoothed}")
+    print(
+      f"[graph] unanchored-stretch velocity smoothness priors: {velocities_smoothed}"
+    )
   return graph, values
 
 

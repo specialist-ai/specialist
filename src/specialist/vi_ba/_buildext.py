@@ -232,11 +232,11 @@ def build(force: bool = False) -> Path:
     ]
   print(f"compiling {src.name} -> {out.name}")
   _run(cmd)
-  print(f"built {out}")
   return out
 
 
 def main() -> None:
+  sys.stdout.reconfigure(line_buffering=True)  # type: ignore[union-attr]
   build(force=True)
   subprocess.run(
     [

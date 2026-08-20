@@ -20,6 +20,7 @@ via ``TrackerKeys``, builds one VI subgraph per tracker, then adds:
 from __future__ import annotations
 
 import dataclasses
+import sys
 import time
 from collections import Counter
 from collections.abc import Callable
@@ -70,7 +71,7 @@ def _resolve_urdf_path(explicit: Path | None) -> Path | None:
       )
     )
   except Exception as exc:  # headless env without the gripper-URDF package
-    print(f"  gripper URDF unavailable ({exc}); finger joint factors disabled")
+    print(f"  [warn] [gripper] URDF unavailable ({exc}); finger joint factors disabled")
     return None
 
 
@@ -80,7 +81,7 @@ def _stage_timer() -> Callable[[str], None]:
   def mark(stage: str) -> None:
     nonlocal last
     now = time.perf_counter()
-    print(f"  [{stage}] +{now - last:.1f}s")
+    print(f"  [timing] {stage} +{now - last:.1f}s")
     last = now
 
   return mark
@@ -127,6 +128,9 @@ def _non_default_flags(args: object, prefix: str = "") -> list[str]:
 
 
 def main(args: Args) -> None:
+  # Runs are usually redirected to a file; line buffering keeps every line
+  # visible as it happens instead of in one burst at exit.
+  sys.stdout.reconfigure(line_buffering=True)  # type: ignore[union-attr]
   session = SessionRecording(args.base)
   names = tuple(session.tracker_names)
   validate(args, len(names))
@@ -195,10 +199,10 @@ def main(args: Args) -> None:
       # traceback only lands once it finishes; name the failure when it happens
       # rather than leave the wait looking like a hang.
       if concurrent > 1:
-        print(f"\n=== prep tracker {name!r} FAILED: {exc!r} ===", flush=True)
+        print(f"\n=== prep tracker {name!r} FAILED: {exc!r} ===")
       raise
     print(
-      f"  [{name}] kf={tracker.n_keyframes}  "
+      f"  [{name}/prep] kf={tracker.n_keyframes}  "
       f"anchor_obs={len(anchored_keyframes(tracker))}  "
       f"front_pts={len(tracker.front.points)}  rear_pts={len(tracker.rear.points)}  "
       f"body_T_base_tag={'yes' if tracker.body_T_base_tag else 'no'}"
@@ -221,18 +225,15 @@ def main(args: Args) -> None:
   mark("trackers prepared")
 
   cross_obs = cross_sightings(trackers, list(args.base_tag_ids), args.gripper.tag_size)
-  print(f"cross-tracker observations: {len(cross_obs)}")
+  print(f"[graph] cross-tracker observations: {len(cross_obs)}")
   if cross_obs:
     by_pair = Counter((sighting.observer, sighting.owner) for sighting in cross_obs)
     for (obs_t, own_t), n in sorted(by_pair.items()):
-      print(f"  {obs_t} → {own_t}: {n}")
+      print(f"  [graph] {obs_t} → {own_t}: {n}")
   mark("cross-tracker obs assembled")
 
   keys = TrackerKeys(list(names))
   solve = solve_joint(trackers, keys, args, cross_obs)
-  print(
-    f"\nshared world: anchor t={np.asarray(solve.world_T_ref_anchor.translation())}"
-  )
   mark("joint LM (cull-reoptimize)")
 
   adopt_ba_refined_estimates(trackers, solve.result, keys)

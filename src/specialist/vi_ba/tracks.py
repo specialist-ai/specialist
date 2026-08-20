@@ -57,6 +57,8 @@ def run_lens_frontend(
   params: MeiParams,
   cfg: FrontendCfg,
   masks: list[list[Rect]] | None = None,
+  *,
+  label: str | None = None,
 ) -> tuple[list[Float64Array], dict[int, dict[int, Float64Array]]]:
   """DIS flow → essential-RANSAC → chain for one lens, returning the per-frame
   keypoints and the chained tracks. ``masks[k]`` (optional, the blocked
@@ -70,6 +72,7 @@ def run_lens_frontend(
     masks=masks,
     gpu_flow=cfg.gpu_flow,
     flow_scale=cfg.flow_scale,
+    label=label,
   )
 
   def ransac_pair(k: int) -> npt.NDArray[np.int64]:
@@ -93,8 +96,9 @@ def run_lens_frontend(
   n_kp = sum(len(k) for k in keypoints)
   n_match = sum(int(m.shape[0]) for m in matches_between)
   n_in = sum(int(f.shape[0]) for f in filtered)
+  scope = f"{label}/frontend" if label else "frontend"
   print(
-    f"  [frontend funnel] keypoints={n_kp} matched={n_match} "
+    f"  [{scope}] funnel keypoints={n_kp} matched={n_match} "
     f"ransac_inliers={n_in} chained_tracks={len(tracks)}"
   )
   return keypoints, tracks
@@ -337,7 +341,6 @@ def add_loop_landmarks(
   points.update(loop_pts)
   kept.update(loop_tracks)
   print(
-    f"  [{name}] loop closure: +{len(loop_pts)} landmarks "
-    f"from {len(loop_tracks)} revisit tracks"
+    f"  [{name}/loop] +{len(loop_pts)} landmarks from {len(loop_tracks)} revisit tracks"
   )
   return loop_pts
