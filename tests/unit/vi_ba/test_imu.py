@@ -8,11 +8,13 @@ import numpy as np
 from specialist.vi_ba.imu import (
   ImuSamples,
   factory_imu_bias,
+  find_stationary_windows,
   from_deg_per_s,
   integrate_samples,
   make_preintegration_params,
   preintegrate_between_keyframes,
   slice_samples_at_keyframes,
+  stationary_mask,
 )
 
 _GRAVITY = np.array([0.0, 0.0, -9.81], dtype=np.float64)
@@ -129,3 +131,19 @@ def test_preintegrate_between_keyframes_produces_n_minus_one() -> None:
   assert len(pims) == 4
   for pim in pims:
     assert np.linalg.norm(gtsam.Rot3.Logmap(pim.deltaRij())) < math.radians(0.5)
+
+
+def test_stationary_family_agree() -> None:
+  """The window finder is the mask's predicate expressed as index ranges."""
+  rng = np.random.default_rng(20260820)
+  n = 512
+  gyro = rng.normal(0.0, 0.5, (n, 3))
+  gyro[100:250] = rng.normal(0.0, 0.01, (150, 3))
+  accel = rng.normal(0.0, 0.4, (n, 3)) + np.array([0.0, 0.0, 9.81])
+  accel[100:250] = rng.normal(0.0, 0.005, (150, 3)) + np.array([0.0, 0.0, 9.81])
+  samples = ImuSamples(t=np.arange(n) / 1000.0, gyro=gyro, accel=accel)
+  bias = gtsam.imuBias.ConstantBias(np.zeros(3), np.zeros(3))
+  windows = find_stationary_windows(samples, bias)
+  mask = stationary_mask(samples, bias)
+  assert windows == [(int(i) * 50, int(i) * 50 + 50) for i in np.flatnonzero(mask)]
+  assert windows, "the quiet stretch must be found"

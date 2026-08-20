@@ -94,7 +94,15 @@ select = ["E4", "E7", "E9", "F", "I", "B"]
 [tool.mypy]
 python_version = "3.12"
 strict = true
-files = ["src/specialist", "scripts/track.py"]
+files = [
+  "src/specialist",
+  "scripts/track.py",
+  "scripts/_probe.py",
+  "scripts/imu.py",
+  "scripts/video_imu_timing.py",
+]
+mypy_path = ["src"]
+explicit_package_bases = true
 # The vendored DIS kernels are untyped research code.
 exclude = ["src/specialist/vi_ba/gpu_dis/"]
 
