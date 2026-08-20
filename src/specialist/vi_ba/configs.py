@@ -19,7 +19,6 @@ __all__ = [
   "FrontendCfg",
   "GpuMode",
   "GripperCfg",
-  "ImuCfg",
   "SolverCfg",
   "validate",
 ]
@@ -83,15 +82,6 @@ class FrontendCfg:
   max_obs_per_track: int = 8
   # Per-thread AprilTag detectors so concurrent tag walks overlap.
   parallel_tag_detect: bool = True
-
-
-@dataclass
-class ImuCfg:
-  imu_to_body: tuple[tuple[float, float, float], ...] = (
-    (0.0, 0.0, -1.0),
-    (1.0, 0.0, 0.0),
-    (0.0, -1.0, 0.0),
-  )
 
 
 @dataclass
@@ -163,7 +153,6 @@ class Args:
   right_finger_tag_ids: tuple[int, ...] = ()
 
   frontend: FrontendCfg = field(default_factory=FrontendCfg)
-  imu: ImuCfg = field(default_factory=ImuCfg)
   gripper: GripperCfg = field(default_factory=GripperCfg)
   solver: SolverCfg = field(default_factory=SolverCfg)
 
@@ -196,8 +185,11 @@ def validate(args: Args, n_trackers: int) -> None:
       f"--base-tag-ids must be distinct per tracker for cross-tracker "
       f"disambiguation, got {list(args.base_tag_ids)}"
     )
-  if not args.anchor.tag_ids:
-    raise ValueError("--anchor.tag-ids must name at least the reference anchor id")
+  if not args.anchor.enabled_tag_ids:
+    raise ValueError(
+      "--anchor.tag-ids must name at least one enabled anchor id; the solve "
+      f"reads {list(args.anchor.enabled_tag_ids)} from {list(args.anchor.tag_ids)}"
+    )
   if len(set(args.anchor.tag_ids)) != len(args.anchor.tag_ids):
     raise ValueError(
       f"--anchor.tag-ids must be distinct, got {list(args.anchor.tag_ids)}"

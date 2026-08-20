@@ -118,7 +118,7 @@ def exposure_chunks(
 
 
 def calibration_chunks(
-  tracker: str, insv: InsvData, imu_to_body: Float64Array
+  tracker: str, insv: InsvData, imu_to_body: Float64Array = IMU_TO_BODY
 ) -> list[Chunk]:
   """Static per-lens MEI intrinsics (raw stitched-sensor units), body -> lens
   extrinsics, the IMU mounting with its factory bias calibration, the factory

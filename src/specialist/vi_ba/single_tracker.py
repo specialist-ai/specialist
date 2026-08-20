@@ -41,7 +41,6 @@ from specialist.vi_ba.configs import (
   AnchorCfg,
   FrontendCfg,
   GripperCfg,
-  ImuCfg,
 )
 from specialist.vi_ba.features import (
   Frame,
@@ -111,11 +110,16 @@ __all__ = [
 
 
 def resolve_keyframe_every(keyframe_every: int, fps: float) -> int:
-  """Resolve the keyframe stride: an explicit positive value, else auto — round to
-  a ~0.10s interval (6 at 60fps, 3 at 30fps). A frame-count default undersamples
-  sub-60fps clips (9 frames is 0.15s at 60fps but 0.30s at 30fps), so auto keeps
-  the time interval constant regardless of the recording rate."""
-  return keyframe_every if keyframe_every > 0 else schema.keyframe_stride(fps)
+  """Resolve the keyframe stride: an explicit positive value, else a ~0.10s
+  interval (6 at 60fps, 3 at 30fps). The review timeline buckets by the auto
+  stride, so an override must be a multiple of it."""
+  stride = schema.keyframe_stride(fps)
+  if keyframe_every > 0 and keyframe_every % stride:
+    raise ValueError(
+      f"--keyframe-every {keyframe_every} does not land on the {stride}-frame "
+      f"keyframe lattice at {fps:.2f} fps; use a multiple of {stride}"
+    )
+  return keyframe_every if keyframe_every > 0 else stride
 
 
 def release_freed_memory() -> None:
@@ -161,7 +165,6 @@ class TrackerArgs:
   left_finger_tag_id: int
   right_finger_tag_id: int
   frontend: FrontendCfg
-  imu: ImuCfg
   gripper: GripperCfg
   # True when sibling captures prepare concurrently; gates per-thread AprilTag
   # detectors, which only pay for themselves when tag walks actually overlap.
@@ -686,11 +689,8 @@ def _anchor_pose_seed(
 ) -> list[gtsam.Pose3] | None:
   """Metric body-pose seed from the front-lens anchor PnP: world (= the anchor
   tag frame) ``T_body`` at every keyframe that sees the anchor, with gaps
-  SLERP+lerp-filled. The anchor poses are metric (known tag size) and correctly
-  shaped wherever the tag is visible, so this is the seed of choice when the
-  visual odometry is too starved to register; the joint BA then refines it from
-  the anchor, IMU, and reprojection factors. Returns ``None`` when too few
-  keyframes see the anchor to seed a trajectory."""
+  geodesic-filled. Returns ``None`` when too few keyframes see the anchor to
+  seed a trajectory."""
   cam_poses = {
     kf: sides["front"].inverse()
     for kf, sides in anchor_obs_per_kf.items()
@@ -1213,7 +1213,11 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
   front = _LensChannel(setup=front_lens, tags=front_tags_per_kf)
   rear = _LensChannel(setup=rear_lens, tags=rear_tags_per_kf)
   anchor_tag_ids = set(obs_by_tag)
-  static_rects = list(args.frontend.mask_rear_rects)
+  # The rects are applied inside the rear lens's frontend, so a run that does
+  # not build rear landmarks never masks anything and has none to record.
+  static_rects = (
+    list(args.frontend.mask_rear_rects) if args.frontend.rear_landmarks else []
+  )
 
   def run_lens(
     ch: _LensChannel,

@@ -12,6 +12,7 @@ import pytest
 from rerun.experimental import RrdReader
 
 from specialist.record.base import (
+  IMU_TO_BODY,
   calibration_chunks,
   exposure_chunks,
   imu_chunks,
@@ -25,7 +26,6 @@ from specialist.record.session import (
   nearest_rows,
 )
 from specialist.record.video import normalize_h264, video_chunks
-from specialist.vi_ba.configs import ImuCfg
 from specialist.vi_ba.extrinsics import parse_offset_v3
 from tests.record_fixtures import encode_clip, synthetic_insv
 
@@ -56,7 +56,7 @@ def base_rrd(tmp_path_factory: pytest.TempPathFactory) -> Path:
   sidecars = (
     imu_chunks("tracker_0", insv, time_shift=0.0, window=_WINDOW)
     + exposure_chunks("tracker_0", insv, time_shift=0.0, window=_WINDOW)
-    + calibration_chunks("tracker_0", insv, np.asarray(ImuCfg().imu_to_body))
+    + calibration_chunks("tracker_0", insv)
   )
   out = tmp / "base.rrd"
   write_base_recording(
@@ -211,9 +211,7 @@ def test_imu_calibration_roundtrips(base_rrd: Path) -> None:
   np.testing.assert_allclose(
     np.asarray(bias.gyroscope()), np.asarray(expected.gyroscope()), atol=1e-12
   )
-  np.testing.assert_allclose(
-    session.imu_to_body("tracker_0"), np.asarray(ImuCfg().imu_to_body), atol=1e-12
-  )
+  np.testing.assert_allclose(session.imu_to_body("tracker_0"), IMU_TO_BODY, atol=1e-12)
   assert session.rolling_shutter_readout("tracker_0") == pytest.approx(0.0157)
 
 

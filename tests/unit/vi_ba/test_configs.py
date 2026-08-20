@@ -57,8 +57,14 @@ def test_rejects_nonpositive_solver_iterations() -> None:
 
 
 def test_rejects_empty_anchor_tag_ids() -> None:
-  with pytest.raises(ValueError, match="at least the reference anchor"):
+  with pytest.raises(ValueError, match="at least one enabled anchor"):
     validate(_args(anchor=AnchorCfg(tag_ids=())), n_trackers=1)
+
+
+def test_rejects_anchor_tag_ids_that_are_all_disabled() -> None:
+  """A list of nothing but the disabled sentinel leaves no enabled anchor."""
+  with pytest.raises(ValueError, match="at least one enabled anchor"):
+    validate(_args(anchor=AnchorCfg(tag_ids=(-1,))), n_trackers=1)
 
 
 def test_rejects_duplicate_anchor_tag_ids() -> None:

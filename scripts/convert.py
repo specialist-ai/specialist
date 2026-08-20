@@ -25,13 +25,13 @@ from specialist.loader.capture import capture_duration, probe_capture
 from specialist.loader.parse_insv import load_insv
 from specialist.record import schema
 from specialist.record.base import (
+  IMU_TO_BODY,
   calibration_chunks,
   exposure_chunks,
   imu_chunks,
   write_base_recording,
 )
 from specialist.record.video import normalize_h264, video_chunks
-from specialist.vi_ba.configs import ImuCfg
 
 
 @dataclass
@@ -59,7 +59,7 @@ class Args:
   duration: float | None = None
   # The IMU mounting rotation stored with each capture's calibration; the
   # solve reads it back off the recording.
-  imu_to_body: tuple[tuple[float, float, float], ...] = ImuCfg.imu_to_body
+  imu_to_body: tuple[tuple[float, float, float], ...] = tuple(map(tuple, IMU_TO_BODY))
 
 
 def main(args: Args) -> None:

@@ -12,7 +12,6 @@ from specialist.record.base import (
   imu_chunks,
   write_base_recording,
 )
-from specialist.vi_ba.configs import ImuCfg
 from specialist.vi_ba.extrinsics import parse_offset_v3
 from tests.record_fixtures import synthetic_insv
 
@@ -71,9 +70,7 @@ def test_imu_window_trims_rows(tmp_path: Path) -> None:
 
 def test_calibration_chunks_extrinsics(tmp_path: Path) -> None:
   insv = synthetic_insv()
-  reader = _write(
-    tmp_path, calibration_chunks("tracker_0", insv, np.asarray(ImuCfg().imu_to_body))
-  )
+  reader = _write(tmp_path, calibration_chunks("tracker_0", insv))
   expected = parse_offset_v3(insv.offset_v3)
   _, front_t = _column(
     reader, "/calibration/tracker_0/front", "Transform3D:translation"

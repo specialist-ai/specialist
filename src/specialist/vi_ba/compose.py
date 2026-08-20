@@ -135,8 +135,20 @@ class TrackerKeys:
     return self._kf_key(_BIAS_CHAR, name, keyframe_idx)
 
   def _lm_key(self, name: str, half: int, track_id: int) -> int:
-    """Collision-free key for a landmark in one tracker's front (``half=0``) or
-    rear (``half=1``) lens slot."""
+    """Key for a landmark in one tracker's front (``half=0``) or rear
+    (``half=1``) lens slot.
+
+    Track ids are handed out monotonically by the frontend and never renumbered,
+    so a long capture that keeps redetecting can outgrow its slot. A key that
+    lands in the next slot is inserted once and then shared, fusing two
+    unrelated points into one variable, so the bound is checked rather than
+    assumed.
+    """
+    if not 0 <= track_id < _MAX_LANDMARKS_PER_TRACKER:
+      raise ValueError(
+        f"track id {track_id} does not fit the {_MAX_LANDMARKS_PER_TRACKER}-wide "
+        f"landmark slot for {name!r}; its key would collide with another slot"
+      )
     return self._slot_key(
       LANDMARK_CHAR, name, half, _MAX_LANDMARKS_PER_TRACKER, track_id
     )
