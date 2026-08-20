@@ -13,6 +13,7 @@ one-line verdict.
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -21,9 +22,12 @@ import numpy as np
 import numpy.typing as npt
 import rerun as rr
 import tyro
-from _probe import finalize_probe
 
+if __package__ in (None, ""):  # `python scripts/x.py` puts scripts/ itself first
+  sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from scripts._probe import finalize_probe, verdict
 from specialist.loader.parse_insv import InsvData, load_insv
+from specialist.vi_ba.imu import ImuSamples, stationary_mask
 
 Float64Array = npt.NDArray[np.float64]
 
@@ -81,14 +85,16 @@ def _build_stationary(
   window: float,
   threshold_dps: float,
 ) -> StationarySegment | None:
+  """Per-axis noise over the longest run of stationary windows."""
   median_dt = float(np.median(np.diff(ts)))
   win = max(8, int(round(window / max(median_dt, 1e-6))))
-  mag = np.linalg.norm(gyro, axis=1)
-  if mag.size < win:
-    return None
-  kernel = np.ones(win) / win
-  mag_smooth = np.convolve(mag, kernel, mode="valid")
-  quiet = mag_smooth < threshold_dps
+  # Gate on the gyro alone; the accel sigma is reported, never thresholded.
+  quiet = stationary_mask(
+    ImuSamples(t=ts, gyro=np.radians(gyro), accel=accel),
+    window=win,
+    gyro_threshold=float(np.deg2rad(threshold_dps)),
+    accel_var_threshold=float("inf"),
+  )
   if not quiet.any():
     return None
   # The False padding turns a run touching either end into a normal edge pair.
@@ -96,12 +102,9 @@ def _build_stationary(
   edges = np.flatnonzero(np.diff(padded))
   starts, ends = edges[::2], edges[1::2]
   longest = int(np.argmax(ends - starts))
-  best_start = int(starts[longest])
-  best_len = int(ends[longest] - starts[longest])
-  if best_len < win * 4:
+  if int(ends[longest] - starts[longest]) < 4:
     return None
-  i0 = best_start + win // 2
-  i1 = min(best_start + best_len + win // 2, ts.size)
+  i0, i1 = int(starts[longest]) * win, int(ends[longest]) * win
   g_seg = gyro[i0:i1]
   a_seg = accel[i0:i1]
   return StationarySegment(
@@ -148,14 +151,20 @@ def _allan_for_axis(
 
 def _log_to_rerun(data: InsvData, allans: list[AllanResult]) -> None:
   rr.log("imu", rr.SeriesLines(names=["x", "y", "z"]), static=True)
-  for i, ts in enumerate(data.imu_timestamps):
-    rr.set_time("imu_time", duration=float(ts))
-    rr.log("imu/gyro", rr.Scalars(data.gyro_deg[i].tolist()))
-    rr.log("imu/accel", rr.Scalars(data.accel[i].tolist()))
+  times = rr.TimeColumn("imu_time", duration=data.imu_timestamps)
+  triples = np.full(data.imu_timestamps.size, 3)
+  for entity, samples in (("gyro", data.gyro_deg), ("accel", data.accel)):
+    rr.send_columns(
+      f"imu/{entity}",
+      indexes=[times],
+      columns=rr.Scalars.columns(scalars=samples.reshape(-1)).partition(triples),
+    )
   for allan in allans:
-    for tau, val in zip(allan.taus, allan.adev, strict=True):
-      rr.set_time("allan_tau", duration=float(tau))
-      rr.log(f"imu/allan/{allan.axis}", rr.Scalars([float(val)]))
+    rr.send_columns(
+      f"imu/allan/{allan.axis}",
+      indexes=[rr.TimeColumn("allan_tau", duration=allan.taus)],
+      columns=rr.Scalars.columns(scalars=allan.adev),
+    )
 
 
 def _verdict(summary: ImuSummary) -> str:
@@ -166,11 +175,10 @@ def _verdict(summary: ImuSummary) -> str:
     problems.append(f"rate jitter {summary.rate_jitter_pct:.1f}%")
   if not summary.gyro_accel_aligned:
     problems.append("gyro/accel timestamps not aligned")
-  return "green" if not problems else "yellow: " + ", ".join(problems)
+  return verdict(problems)
 
 
 def main(args: ImuArgs) -> None:
-  args.output_dir.mkdir(parents=True, exist_ok=True)
   data = load_insv(args.input_insv)
 
   ts = data.imu_timestamps
@@ -223,13 +231,7 @@ def main(args: ImuArgs) -> None:
   )
   summary.verdict = _verdict(summary)
 
-  finalize_probe(
-    "imu",
-    "specialist.imu_probe",
-    args.output_dir,
-    summary,
-    lambda: _log_to_rerun(data, allans),
-  )
+  finalize_probe("imu", args.output_dir, summary, lambda: _log_to_rerun(data, allans))
 
 
 if __name__ == "__main__":

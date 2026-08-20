@@ -18,6 +18,7 @@ summary, console verdict on both checks.
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -27,11 +28,18 @@ import numpy as np
 import numpy.typing as npt
 import rerun as rr
 import tyro
-from _probe import UInt8Array, finalize_probe, read_lens_grays
 
+if __package__ in (None, ""):  # `python scripts/x.py` puts scripts/ itself first
+  sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from scripts._probe import UInt8Array, finalize_probe, read_lens_grays, verdict
 from specialist.loader.parse_insv import load_insv
 
 Float64Array = npt.NDArray[np.float64]
+
+# Offset search grid: the video and IMU clocks come off the same capture, so
+# half a second at 5 ms brackets any plausible shift.
+_MAX_OFFSET = 0.5
+_OFFSET_STEP = 0.005
 
 
 @dataclass
@@ -75,17 +83,6 @@ class TimingSummary:
   verdict: str = "unknown"
 
 
-def _read_fisheye_grays(
-  video_path: Path, max_frames: int, lens: str
-) -> tuple[list[UInt8Array], list[float], float]:
-  frames = read_lens_grays(video_path, lens, max_frames=max_frames)
-  cap = cv2.VideoCapture(str(video_path))
-  fps = float(cap.get(cv2.CAP_PROP_FPS)) or 60.0
-  cap.release()
-  ts = [i / fps for i in range(len(frames))]
-  return frames, ts, fps
-
-
 def _flow_magnitudes(grays: list[UInt8Array], args: TimingArgs) -> Float64Array:
   """Median Lucas-Kanade flow magnitude per frame transition."""
 
@@ -107,7 +104,9 @@ def _flow_magnitudes(grays: list[UInt8Array], args: TimingArgs) -> Float64Array:
       prev_pts = corners(curr)
       prev = curr
       continue
-    next_pts, status, _ = cv2.calcOpticalFlowPyrLK(prev, curr, prev_pts, None)
+    next_pts, status, _ = cv2.calcOpticalFlowPyrLK(
+      prev, curr, prev_pts, np.empty_like(prev_pts)
+    )
     if next_pts is None or status is None:
       mags.append(0.0)
     else:
@@ -127,15 +126,11 @@ def _estimate_offset(
   flow_mag: Float64Array,
   imu_t: Float64Array,
   gyro_mag: Float64Array,
-  *,
-  max_offset: float = 0.5,
-  step: float = 0.005,
 ) -> OffsetResult:
   flow = (flow_mag - flow_mag.mean()) / (flow_mag.std() + 1e-9)
 
-  offsets = np.arange(-max_offset, max_offset + step, step)
   best_off, best_corr = 0.0, -np.inf
-  for off in offsets:
+  for off in np.arange(-_MAX_OFFSET, _MAX_OFFSET + _OFFSET_STEP, _OFFSET_STEP):
     shifted = np.interp(video_t, imu_t + off, gyro_mag)
     z = (shifted - shifted.mean()) / (shifted.std() + 1e-9)
     corr = float(np.dot(flow, z) / flow.size)
@@ -144,7 +139,7 @@ def _estimate_offset(
   return OffsetResult(
     best_offset=best_off,
     peak_correlation=best_corr,
-    search_range=float(max_offset),
+    search_range=_MAX_OFFSET,
   )
 
 
@@ -230,7 +225,7 @@ def _verdict(summary: TimingSummary) -> str:
       f"RS readout mismatch: {summary.shear.measured_readout * 1e3:.2f} ms vs "
       f"{summary.shear.factory_readout * 1e3:.2f} ms factory"
     )
-  return "green" if not parts else "yellow: " + "; ".join(parts)
+  return verdict(parts)
 
 
 def _log_to_rerun(
@@ -240,24 +235,25 @@ def _log_to_rerun(
   gyro_mag: Float64Array,
   applied_offset: float,
 ) -> None:
-  for t, v in zip(video_t, flow_mag, strict=True):
-    rr.set_time("t", duration=float(t))
-    rr.log("flow/median_magnitude", rr.Scalars([float(v)]))
-  for t, v in zip(imu_t + applied_offset, gyro_mag, strict=True):
-    rr.set_time("t", duration=float(t))
-    rr.log("gyro/magnitude_dps", rr.Scalars([float(v)]))
+  rr.send_columns(
+    "flow/median_magnitude",
+    indexes=[rr.TimeColumn("t", duration=video_t)],
+    columns=rr.Scalars.columns(scalars=flow_mag),
+  )
+  rr.send_columns(
+    "gyro/magnitude_dps",
+    indexes=[rr.TimeColumn("t", duration=imu_t + applied_offset)],
+    columns=rr.Scalars.columns(scalars=gyro_mag),
+  )
 
 
 def main(args: TimingArgs) -> None:
-  args.output_dir.mkdir(parents=True, exist_ok=True)
   data = load_insv(args.input_insv)
 
-  grays, video_t_list, fps = _read_fisheye_grays(
-    args.input_insv, args.max_frames, args.lens
-  )
+  grays, fps = read_lens_grays(args.input_insv, args.lens, max_frames=args.max_frames)
   if len(grays) < 5:
     raise RuntimeError(f"only {len(grays)} frames decoded — capture too short?")
-  video_t = np.asarray(video_t_list, dtype=np.float64)
+  video_t = np.arange(len(grays), dtype=np.float64) / fps
 
   flow_mag = _flow_magnitudes(grays, args)
   gyro_mag = np.linalg.norm(data.gyro_deg, axis=1)
@@ -286,7 +282,6 @@ def main(args: TimingArgs) -> None:
 
   finalize_probe(
     "video_imu_timing",
-    "specialist.video_imu_timing",
     args.output_dir,
     summary,
     lambda: _log_to_rerun(

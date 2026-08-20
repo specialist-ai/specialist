@@ -23,6 +23,7 @@ _FlowPair = tuple[npt.NDArray[np.float32], npt.NDArray[np.float32]]
 _R = TypeVar("_R")
 
 __all__ = [
+  "detect_corners",
   "Frame",
   "chain_tracks",
   "detect_orb",
@@ -242,7 +243,7 @@ _REDETECT_RATIO = 0.5
 _FB_ERROR_THRESHOLD = 1.0
 
 
-def _detect_corners(
+def detect_corners(
   img: np.ndarray,
   mask: np.ndarray | None,
   max_corners: int,
@@ -354,7 +355,7 @@ def dis_flow_track(
           0,
           thickness=-1,
         )
-      new_corners = _detect_corners(
+      new_corners = detect_corners(
         img,
         redetect_mask,
         max_corners=n_features - n_active,
