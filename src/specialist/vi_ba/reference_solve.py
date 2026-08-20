@@ -218,10 +218,10 @@ class ReferenceSolve:
   selected candidate is reused without re-solving."""
 
   ref_tag_id: int
-  ref_anchor: gtsam.Pose3
+  world_T_ref_anchor: gtsam.Pose3
   result: OptimizeResult
   landmark_keep: LandmarkKeep
-  secondary_world: dict[int, gtsam.Pose3]
+  secondary_anchor_world: dict[int, gtsam.Pose3]
   body_poses: dict[str, list[gtsam.Pose3]]
   # Per secondary anchor, how far its post-solve re-estimate moved off its seed
   # (metres, radians): the sighting-geometry consistency check.
@@ -242,9 +242,9 @@ def _solve_joint_graph(
   keys: TrackerKeys,
   args: Args,
   cross_obs: list[CrossSighting],
-  ref_anchor: gtsam.Pose3,
+  world_T_ref_anchor: gtsam.Pose3,
 ) -> ReferenceSolve:
-  """Solve the joint graph with the reference anchor pinned at ``ref_anchor``
+  """Solve the joint graph with the reference anchor pinned at ``world_T_ref_anchor``
   and resolve every secondary anchor's world pose.
 
   Solves once with the secondaries pinned at their prep-composed seeds, then
@@ -257,7 +257,7 @@ def _solve_joint_graph(
     keys,
     args,
     cross_obs,
-    tag_corners_in_frame(ref_anchor, args.anchor.tag_size),
+    tag_corners_in_frame(world_T_ref_anchor, args.anchor.tag_size),
     seed,
   )
   result, landmark_keep = _solve_with_cull_reoptimize(
@@ -281,10 +281,10 @@ def _solve_joint_graph(
     moves[tag_id] = (dt, dr)
   return ReferenceSolve(
     ref_tag_id=int(args.anchor.enabled_tag_ids[0]),
-    ref_anchor=ref_anchor,
+    world_T_ref_anchor=world_T_ref_anchor,
     result=result,
     landmark_keep=landmark_keep,
-    secondary_world=resolved,
+    secondary_anchor_world=resolved,
     body_poses=solved_poses,
     secondary_moves=moves,
   )
@@ -298,8 +298,8 @@ def solve_joint(
 ) -> ReferenceSolve:
   """Solve the joint graph, with the first enabled tag pinning the world, and
   return the solution to export."""
-  ref_anchor = align_to_shared_world(trackers, args.anchor.enabled_tag_ids)
-  return _solve_joint_graph(trackers, keys, args, cross_obs, ref_anchor)
+  world_T_ref_anchor = align_to_shared_world(trackers, args.anchor.enabled_tag_ids)
+  return _solve_joint_graph(trackers, keys, args, cross_obs, world_T_ref_anchor)
 
 
 def adopt_ba_refined_estimates(

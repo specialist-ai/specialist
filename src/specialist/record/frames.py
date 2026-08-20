@@ -47,7 +47,7 @@ def _scan_video(base_rrd: Path) -> dict[str, tuple[pa.Table, list[int]]]:
     if cached is not None:
       return cached
     batches: dict[str, list[pa.RecordBatch]] = {}
-    keyframe_ns: dict[str, list[int]] = {}
+    iframe_ns: dict[str, list[int]] = {}
     stream = (
       RrdReader(str(base_rrd))
       .store()
@@ -70,7 +70,7 @@ def _scan_video(base_rrd: Path) -> dict[str, tuple[pa.Table, list[int]]]:
       if "VideoStream:is_keyframe" in names:
         flags = batch.column(names.index("VideoStream:is_keyframe")).to_pylist()
         stamps = batch.column(names.index(schema.TIMELINE))
-        keyframe_ns.setdefault(entity, []).extend(
+        iframe_ns.setdefault(entity, []).extend(
           t.value
           for t, flag in zip(stamps, flags, strict=True)
           if flag is not None and len(flag) and bool(flag[0])
@@ -78,7 +78,7 @@ def _scan_video(base_rrd: Path) -> dict[str, tuple[pa.Table, list[int]]]:
     tables = {
       entity: (
         _time_ordered(pa.Table.from_batches(group, schema=group[0].schema)),
-        keyframe_ns.get(entity, []),
+        iframe_ns.get(entity, []),
       )
       for entity, group in batches.items()
     }
@@ -114,15 +114,15 @@ def lens_times(base_rrd: Path, entity: str) -> Float64Array:
 class LensVideo:
   """One lens's encoded samples and the timeline they sit on."""
 
-  def __init__(self, base_rrd: Path, tracker: str, lens: str) -> None:
-    self.entity = schema.image_entity(tracker, lens)
-    table, keyframe_ns = _sample_table(base_rrd, self.entity)
+  def __init__(self, base_rrd: Path, tracker: str, side: str) -> None:
+    self.entity = schema.image_entity(tracker, side)
+    table, iframe_ns = _sample_table(base_rrd, self.entity)
     times_ns = schema.times_ns(table.column(schema.TIMELINE))
     self.times: Float64Array = times_ns / schema.NS_PER_SECOND
-    self.keyframes = _keyframe_rows(times_ns, keyframe_ns)
-    if not self.keyframes.size:
+    self.iframe_rows = _iframe_rows(times_ns, iframe_ns)
+    if not self.iframe_rows.size:
       raise RuntimeError(
-        f"{self.entity}: no keyframe markers; every decode would start at row 0"
+        f"{self.entity}: no I-frame markers; every decode would start at row 0"
       )
     # The samples stay in the chunks the scan holds them in: joining them into
     # one array copies the lens's whole video onto the heap beside the scan.
@@ -145,8 +145,8 @@ class LensVideo:
 
   def anchor(self, row: int) -> int:
     """The keyframe row a decode of ``row`` must start from."""
-    position = int(np.searchsorted(self.keyframes, row, side="right")) - 1
-    return int(self.keyframes[position]) if position >= 0 else 0
+    position = int(np.searchsorted(self.iframe_rows, row, side="right")) - 1
+    return int(self.iframe_rows[position]) if position >= 0 else 0
 
 
 def _packet_arrays(
@@ -163,9 +163,9 @@ def _packet_arrays(
   )
 
 
-def _keyframe_rows(times_ns: Int64Array, keyframe_ns: list[int]) -> Int64Array:
+def _iframe_rows(times_ns: Int64Array, iframe_ns: list[int]) -> Int64Array:
   """Sample rows whose timestamp carries a true ``is_keyframe`` marker."""
-  stamps = np.sort(np.asarray(keyframe_ns, dtype=np.int64))
+  stamps = np.sort(np.asarray(iframe_ns, dtype=np.int64))
   rows = np.searchsorted(times_ns, stamps)
   inside = rows < len(times_ns)
   rows, stamps = rows[inside], stamps[inside]

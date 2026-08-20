@@ -35,7 +35,7 @@ from specialist.record.session import SessionRecording
 from specialist.vi_ba.compose import (
   TrackerKeys,
   anchored_keyframes,
-  cross_tracker_observations,
+  cross_sightings,
 )
 from specialist.vi_ba.configs import Args, TrackerArgs, validate
 from specialist.vi_ba.features import set_precompute_concurrency
@@ -220,9 +220,7 @@ def main(args: Args) -> None:
     gpu_flow.shutdown()
   mark("trackers prepared")
 
-  cross_obs = cross_tracker_observations(
-    trackers, list(args.base_tag_ids), args.gripper.tag_size
-  )
+  cross_obs = cross_sightings(trackers, list(args.base_tag_ids), args.gripper.tag_size)
   print(f"cross-tracker observations: {len(cross_obs)}")
   if cross_obs:
     by_pair = Counter((sighting.observer, sighting.owner) for sighting in cross_obs)
@@ -232,7 +230,9 @@ def main(args: Args) -> None:
 
   keys = TrackerKeys(list(names))
   solve = solve_joint(trackers, keys, args, cross_obs)
-  print(f"\nshared world: anchor t={np.asarray(solve.ref_anchor.translation())}")
+  print(
+    f"\nshared world: anchor t={np.asarray(solve.world_T_ref_anchor.translation())}"
+  )
   mark("joint LM (cull-reoptimize)")
 
   adopt_ba_refined_estimates(trackers, solve.result, keys)
@@ -245,9 +245,9 @@ def main(args: Args) -> None:
     solve.landmark_keep,
     args,
     cross_obs,
-    solve.ref_anchor,
+    solve.world_T_ref_anchor,
     solve.ref_tag_id,
-    solve.secondary_world,
+    solve.secondary_anchor_world,
     urdf_path=urdf_path,
   )
 

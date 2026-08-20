@@ -3,6 +3,13 @@
 ``TrackerKeys`` allocates a collision-free symbol namespace per tracker.
 ``assemble_joint_graph`` is the pure "trackers + anchors → one gtsam graph"
 step; solving that graph is ``specialist.vi_ba.reference_solve``.
+
+Vocabulary, held throughout the solve side: a **detection** is frontend
+output, one tag in one frame (``TagDetection``); a **sighting** is a
+``(observer, keyframe, lens, detection)`` tuple selected to become a factor
+(``CrossSighting``, ``anchor_sightings``); an **observation** is a pixel
+measurement of a landmark at a keyframe (the inner ``{kf: pixel}`` of a
+track).
 """
 
 from __future__ import annotations
@@ -58,7 +65,7 @@ __all__ = [
   "anchor_sightings",
   "anchored_keyframes",
   "assemble_joint_graph",
-  "cross_tracker_observations",
+  "cross_sightings",
   "points_from_values",
 ]
 
@@ -106,22 +113,20 @@ class TrackerKeys:
       raise KeyError(f"unknown tracker {name!r}")
     return self._index[name]
 
-  def _kf_key(self, char: str, name: str, keyframe_idx: int) -> int:
+  def _kf_key(self, char: str, name: str, kf: int) -> int:
     """Collision-free key for a per-keyframe variable in one tracker's slice."""
     return int(
-      gtsam.symbol(
-        char, self.tracker_index(name) * _MAX_KEYFRAMES_PER_TRACKER + keyframe_idx
-      )
+      gtsam.symbol(char, self.tracker_index(name) * _MAX_KEYFRAMES_PER_TRACKER + kf)
     )
 
-  def pose_key(self, name: str, keyframe_idx: int) -> int:
-    return self._kf_key(_POSE_CHAR, name, keyframe_idx)
+  def pose_key(self, name: str, kf: int) -> int:
+    return self._kf_key(_POSE_CHAR, name, kf)
 
-  def velocity_key(self, name: str, keyframe_idx: int) -> int:
-    return self._kf_key(_VEL_CHAR, name, keyframe_idx)
+  def velocity_key(self, name: str, kf: int) -> int:
+    return self._kf_key(_VEL_CHAR, name, kf)
 
-  def bias_key(self, name: str, keyframe_idx: int) -> int:
-    return self._kf_key(_BIAS_CHAR, name, keyframe_idx)
+  def bias_key(self, name: str, kf: int) -> int:
+    return self._kf_key(_BIAS_CHAR, name, kf)
 
   def _lm_key(self, name: str, half: int, track_id: int) -> int:
     """Key for a landmark in one tracker's front (``half=0``) or rear
@@ -148,12 +153,10 @@ class TrackerKeys:
   def rear_landmark_key(self, name: str, track_id: int) -> int:
     return self._lm_key(name, 1, track_id)
 
-  def theta_key(self, name: str, finger_idx: int, keyframe_idx: int) -> int:
+  def theta_key(self, name: str, finger_idx: int, kf: int) -> int:
     """Key for a finger's revolute joint angle (scalar) at one keyframe.
     ``finger_idx`` 0 = left, 1 = right; collision-free per tracker and finger."""
-    return self._slot_key(
-      _ANGLE_CHAR, name, finger_idx, _MAX_KEYFRAMES_PER_TRACKER, keyframe_idx
-    )
+    return self._slot_key(_ANGLE_CHAR, name, finger_idx, _MAX_KEYFRAMES_PER_TRACKER, kf)
 
   def _slot_key(self, char: str, name: str, half: int, width: int, index: int) -> int:
     """One integer key in the tracker's ``half`` slice of a ``width``-wide slot."""
@@ -250,7 +253,7 @@ class CrossSighting:
   finger: int | None  # None = base tag; 0 = left finger, 1 = right finger
 
 
-def cross_tracker_observations(
+def cross_sightings(
   trackers: list[PreparedTracker],
   base_tag_ids: list[int],
   base_tag_size: float,

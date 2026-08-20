@@ -15,7 +15,7 @@ def test_lens_video_refuses_markerless_streams(
   monkeypatch.setattr(
     frames, "_scan_video", lambda path: {"image/t/front": (table, [])}
   )
-  with pytest.raises(RuntimeError, match="no keyframe markers"):
+  with pytest.raises(RuntimeError, match="no I-frame markers"):
     frames.LensVideo(Path("base.rrd"), "t", "front")
 
 

@@ -4,9 +4,24 @@ timeline decodes.
 Base recordings, track layers, the viewer logging, and the record readers
 all build paths through these helpers so the two files of a session (matched
 by ``recording_id``) can never drift apart.
+
+A session is indexed by four clocks:
+
+1. ``video_time`` (``TIMELINE``) — seconds on the session clock.
+2. Session frame row — ``round(t * fps)``, integer, phase-locked across
+   trackers; ``keyframe_index`` maps it to the next clock.
+3. ``keyframe`` timeline bucket — ``ceil(row / stride)`` with
+   ``stride = keyframe_stride(fps)``, the review cursor's step.
+4. Solver keyframe ordinal ``kf`` — dense ``0..n_keyframes-1``, the index
+   behind every solver structure (poses, tracks, theta keys). It steps by
+   the run's ``keyframe_every``, which is only required to be a multiple of
+   ``stride``, so ``kf`` equals ``keyframe_index(row)`` exactly when the
+   stride is the auto one and the grid phase is zero.
 """
 
 from __future__ import annotations
+
+from typing import Literal
 
 import numpy as np
 import numpy.typing as npt
@@ -14,6 +29,10 @@ import pyarrow as pa
 
 Float64Array = npt.NDArray[np.float64]
 Int64Array = npt.NDArray[np.int64]
+
+# The two sides of a stitched dual-fisheye capture; every per-lens entity and
+# payload is keyed by one of these.
+Side = Literal["front", "rear"]
 
 APPLICATION_ID = "specialist"
 TIMELINE = "video_time"
@@ -46,10 +65,11 @@ def keyframe_stride(fps: float) -> int:
 
 
 def keyframe_index(
-  frame_rows: npt.NDArray[np.int64], stride: int
+  session_rows: npt.NDArray[np.int64], stride: int
 ) -> npt.NDArray[np.int64]:
-  """``ceil(row / stride)`` per frame row: the ``keyframe`` timeline value."""
-  return (frame_rows + stride - 1) // stride
+  """``ceil(row / stride)`` per session frame row: the ``keyframe`` timeline
+  value."""
+  return (session_rows + stride - 1) // stride
 
 
 def times_ns(column: pa.Array | pa.ChunkedArray) -> Int64Array:
@@ -71,8 +91,8 @@ def image_root(tracker: str) -> str:
   return f"{IMAGE_ROOT}/{tracker}"
 
 
-def image_entity(tracker: str, lens: str) -> str:
-  return f"{image_root(tracker)}/{lens}"
+def image_entity(tracker: str, side: str) -> str:
+  return f"{image_root(tracker)}/{side}"
 
 
 def imu_entity(tracker: str, kind: str) -> str:

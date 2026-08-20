@@ -191,7 +191,7 @@ class _LensPrep:
   """One lens's prep state: its setup and per-keyframe tag detections in, the
   surviving tracks and their triangulated landmarks out."""
 
-  side: str
+  side: schema.Side
   setup: LensSetup
   tags: list[list[TagDetection]]
   static_mask_rects: list[Rect] = field(default_factory=list)

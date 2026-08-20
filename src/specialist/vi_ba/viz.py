@@ -321,15 +321,15 @@ def _log_static_mask_rects(
   )
 
 
-def _send_point_columns(
+def _send_pixel_columns(
   emit: Sink,
   entity_path: str,
-  points_per_kf: list[Float64Array],
+  pixels_per_kf: list[Float64Array],
   index: _OverlayIndex,
   radius: float,
   color: tuple[int, int, int],
 ) -> None:
-  partition = [int(kp.shape[0]) for kp in points_per_kf]
+  partition = [int(kp.shape[0]) for kp in pixels_per_kf]
   total = sum(partition)
   if total == 0:
     return
@@ -339,7 +339,7 @@ def _send_point_columns(
     index,
     rr.Points2D,
     partition,
-    positions=np.concatenate([kp for kp in points_per_kf if kp.shape[0] > 0]),
+    positions=np.concatenate([kp for kp in pixels_per_kf if kp.shape[0] > 0]),
     radii=np.full(total, radius, dtype=np.float32),
     colors=_solid_colors(color, total),
   )
@@ -410,7 +410,7 @@ def _send_lens_columns(
 ) -> None:
   if not keypoints:
     return
-  _send_point_columns(emit, f"{entity_path}/keypoints", keypoints, index, 1.5, color)
+  _send_pixel_columns(emit, f"{entity_path}/keypoints", keypoints, index, 1.5, color)
 
 
 @dataclass
@@ -908,7 +908,7 @@ def _lens_streams(
       )
   for lens_name, lens in data.lenses.items():
     if lens.rejected_keypoints is not None:
-      _send_point_columns(
+      _send_pixel_columns(
         viz,
         f"{image_root}/{lens_name}/keypoints_rejected",
         lens.rejected_keypoints,
@@ -918,7 +918,7 @@ def _lens_streams(
       )
   for lens_name, lens in data.lenses.items():
     if lens.landmark_reprojections is not None:
-      _send_point_columns(
+      _send_pixel_columns(
         viz,
         f"{image_root}/{lens_name}/landmark_reprojection",
         lens.landmark_reprojections,
