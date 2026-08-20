@@ -3,18 +3,16 @@
 The gtsam wheel ships ``libgtsam`` but no C++ headers, so this shallow-clones the
 matching gtsam source (pinned to the wheel's version) once into a gitignored
 build cache for its headers, then compiles ``cpp/mei_factor.cpp`` against them +
-the vendored generated headers in ``cpp/gtsam_generated/`` (``config.h`` /
-``dllexport.h``). Vendoring those avoids running gtsam's full cmake configure,
-which needs Boost component libraries that minimal Linux installs lack. Boost
-headers are taken from the system (``libboost-dev`` / ``brew install boost``)
-when present and otherwise fetched pinned into the same build cache, so the only
-system prerequisites are a C++17 compiler and git.
+the vendored generated headers in ``cpp/gtsam_generated/``. Boost headers are
+taken from the system (``libboost-dev`` / ``brew install boost``) when present
+and otherwise fetched pinned into the same build cache, so the only system
+prerequisites are a C++17 compiler and git.
 
-Invoked automatically at install time by ``hatch_build.py`` (so ``uv sync``
-builds it) and re-runnable by hand with ``uv run build-mei-factor``. Idempotent
-and platform-aware (macOS arm64/x86, Linux). pybind11 must be the 2.x series
-(internals v5) so the extension's type registry matches the gtsam wheel —
-pybind11 3.x will not interoperate.
+Invoked at install time by ``hatch_build.py`` and re-runnable with ``uv run
+build-mei-factor``, which needs a source checkout: the header cache and the C++
+source both live in the repo. Idempotent and platform-aware (macOS arm64/x86,
+Linux). pybind11 must be the 2.x series (internals v5) so the extension's type
+registry matches the gtsam wheel.
 """
 
 from __future__ import annotations
@@ -45,7 +43,7 @@ def _run(cmd: list[str]) -> None:
 
 def _gtsam_paths() -> tuple[Path, Path]:
   """Return ``(gtsam_package_dir, libgtsam_path)`` from the installed wheel."""
-  import gtsam  # noqa: PLC0415
+  import gtsam
 
   pkg = Path(gtsam.__file__).resolve().parent
   if sys.platform == "darwin":
@@ -94,9 +92,9 @@ def _ensure_boost(boost_src: Path) -> None:
   """Fetch the pinned Boost release headers; ``boost/`` is all the build needs."""
   if (boost_src / "boost" / "concept_check.hpp").exists():
     return
-  import io  # noqa: PLC0415
-  import tarfile  # noqa: PLC0415
-  import urllib.request  # noqa: PLC0415
+  import io
+  import tarfile
+  import urllib.request
 
   plain = BOOST_TAG.replace(".", "_")
   url = f"https://archives.boost.io/release/{BOOST_TAG}/source/boost_{plain}.tar.gz"
@@ -157,8 +155,8 @@ def _detect_cxx11_abi(libgtsam: Path) -> str:
 
 
 def _includes(gtsam_src: Path, generated: Path, boost_root: Path) -> list[str]:
-  import numpy  # noqa: PLC0415
-  import pybind11  # noqa: PLC0415
+  import numpy
+  import pybind11
 
   return [
     pybind11.get_include(),
@@ -193,9 +191,8 @@ def build(force: bool = False) -> Path:
       f"installed gtsam {gtsam_version} != pinned headers {GTSAM_TAG}; bump "
       f"GTSAM_TAG and re-vendor cpp/gtsam_generated/ from the matching source"
     )
-  here = Path(__file__).resolve()
-  repo = _repo_root(here)
-  viba_pkg = repo / "src" / "specialist" / "vi_ba"
+  viba_pkg = Path(__file__).resolve().parent
+  repo = _repo_root(viba_pkg)
   src = viba_pkg / "cpp" / "mei_factor.cpp"
   generated = viba_pkg / "cpp" / "gtsam_generated"
   gtsam_src = repo / ".build" / f"gtsam-{GTSAM_TAG}"

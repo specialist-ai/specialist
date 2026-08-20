@@ -1,5 +1,6 @@
-"""Tests for ``specialist.vi_ba.single_tracker``: the anchor-PnP pose and
-metric-scale seeds, and the loop-closure landmark merge."""
+"""Tests for ``specialist.vi_ba.single_tracker``'s anchor-PnP pose and
+metric-scale seeds, and for the loop-closure landmark merge in
+``specialist.vi_ba.tracks``."""
 
 from __future__ import annotations
 
@@ -12,11 +13,10 @@ from specialist.loader.mei_model import mei_project
 from specialist.vi_ba.build import LensSetup
 from specialist.vi_ba.configs import FrontendCfg
 from specialist.vi_ba.single_tracker import (
-  _add_loop_landmarks,
   _anchor_metric_scale,
   _anchor_pose_seed,
 )
-from specialist.vi_ba.tracks import run_lens_frontend
+from specialist.vi_ba.tracks import add_loop_landmarks, run_lens_frontend
 from tests.frame_fixtures import translating_frames
 from tests.mei_fixtures import narrow_omni_params
 
@@ -154,14 +154,13 @@ def test_add_loop_landmarks_merges_revisit_into_bundle() -> None:
   front_points: dict[int, np.ndarray] = {}
   front_kept = {5: {0: np.array([1.0, 1.0])}}
 
-  loop_pts = _add_loop_landmarks(
+  loop_pts = add_loop_landmarks(
     front_points,
     front_kept,
     loop_tracks,
     body_poses,
     lens,
-    min_track_length=2,
-    max_landmark_depth=5.0,
+    FrontendCfg(min_track_length=2, max_landmark_depth=5.0),
     name="t",
   )
 
@@ -177,14 +176,13 @@ def test_add_loop_landmarks_empty_is_noop() -> None:
   lens = LensSetup(extrinsic=gtsam.Pose3(), params=params)
   front_points: dict[int, np.ndarray] = {}
   front_kept = {5: {0: np.array([1.0, 1.0])}}
-  loop_pts = _add_loop_landmarks(
+  loop_pts = add_loop_landmarks(
     front_points,
     front_kept,
     {},
     [gtsam.Pose3()],
     lens,
-    min_track_length=2,
-    max_landmark_depth=5.0,
+    FrontendCfg(min_track_length=2, max_landmark_depth=5.0),
     name="t",
   )
   assert loop_pts == {}
@@ -219,27 +217,25 @@ def test_add_loop_landmarks_reliable_views_resist_drift() -> None:
 
   fp_rel: dict[int, np.ndarray] = {}
   fk_rel: dict[int, dict[int, np.ndarray]] = {}
-  _add_loop_landmarks(
+  add_loop_landmarks(
     fp_rel,
     fk_rel,
     {99: dict(obs)},
     body_poses,
     lens,
-    min_track_length=2,
-    max_landmark_depth=5.0,
+    FrontendCfg(min_track_length=2, max_landmark_depth=5.0),
     name="t",
     anchor_kfs={1, 4},
   )
   fp_all: dict[int, np.ndarray] = {}
   fk_all: dict[int, dict[int, np.ndarray]] = {}
-  _add_loop_landmarks(
+  add_loop_landmarks(
     fp_all,
     fk_all,
     {99: dict(obs)},
     body_poses,
     lens,
-    min_track_length=2,
-    max_landmark_depth=5.0,
+    FrontendCfg(min_track_length=2, max_landmark_depth=5.0),
     name="t",
   )
 

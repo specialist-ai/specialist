@@ -5,6 +5,7 @@ from __future__ import annotations
 import numpy as np
 import numpy.typing as npt
 
+from specialist.vi_ba.geometry import rotate_about_z
 from specialist.vi_ba.urdf_joints import RevoluteJoint
 
 Float64Array = npt.NDArray[np.float64]
@@ -17,10 +18,7 @@ def _tag_points(joint: RevoluteJoint, angles: Float64Array) -> Float64Array:
   if joint.joint_T_tag0 is None:
     raise ValueError("finger joint has no tag frame (joint_T_tag0 is None)")
   p = np.asarray(joint.joint_T_tag0.translation(), dtype=np.float64)
-  c, s = np.cos(angles), np.sin(angles)
-  rotated = np.stack(
-    [c * p[0] - s * p[1], s * p[0] + c * p[1], np.full_like(angles, p[2])], axis=1
-  )
+  rotated = rotate_about_z(p, angles)
   rotation = np.asarray(joint.base_T_joint.rotation().matrix(), dtype=np.float64)
   translation = np.asarray(joint.base_T_joint.translation(), dtype=np.float64)
   out: Float64Array = rotated @ rotation.T + translation

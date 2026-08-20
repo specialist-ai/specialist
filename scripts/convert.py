@@ -21,7 +21,7 @@ import numpy as np
 import tyro
 
 from specialist.loader.audio_sync import sync_two_clips
-from specialist.loader.capture import capture_duration, probe_capture
+from specialist.loader.capture import probe_capture
 from specialist.loader.parse_insv import load_insv
 from specialist.record import schema
 from specialist.record.base import (
@@ -77,7 +77,7 @@ def main(args: Args) -> None:
       f"must then be re-registered with register.py --replace-base "
       f"{args.session_id}, or its byte-range index goes stale)"
     )
-  rears = [rear for rear, _, _ in map(probe_capture, args.input_insvs)]
+  captures = [probe_capture(insv) for insv in args.input_insvs]
   if args.audio_offsets:
     if len(args.audio_offsets) != len(args.input_insvs):
       raise SystemExit("--audio-offsets needs one value per --input-insvs")
@@ -94,10 +94,9 @@ def main(args: Args) -> None:
       )
 
   # The span every capture covers.
-  durations = [capture_duration(p) for p in args.input_insvs]
   window = (
     max(-off for off in offsets),
-    min(dur - off for dur, off in zip(durations, offsets, strict=True)),
+    min(cap.duration - off for cap, off in zip(captures, offsets, strict=True)),
   )
   if args.duration is not None:
     window = (window[0], min(window[1], window[0] + args.duration))
@@ -107,11 +106,11 @@ def main(args: Args) -> None:
   sidecars = []
   imu_to_body = np.asarray(args.imu_to_body, dtype=np.float64)
   with tempfile.TemporaryDirectory(dir=args.tmpdir) as tmp:
-    for master, rear, tracker, offset in zip(
-      args.input_insvs, rears, names, offsets, strict=True
+    for master, capture, tracker, offset in zip(
+      args.input_insvs, captures, names, offsets, strict=True
     ):
       insv = load_insv(master)
-      for lens, src in (("front", master), ("rear", rear)):
+      for lens, src in (("front", master), ("rear", capture.rear_path)):
         mp4 = normalize_h264(src, Path(tmp) / f"{tracker}_{lens}.mp4")
         video_streams.append(
           video_chunks(

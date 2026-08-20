@@ -13,7 +13,10 @@ from pathlib import Path
 import gtsam
 import numpy as np
 
-__all__ = ["RevoluteJoint", "read_revolute_joints"]
+__all__ = ["FINGER_JOINTS", "RevoluteJoint", "read_revolute_joints"]
+
+# Finger-index order: 0 = left, 1 = right.
+FINGER_JOINTS = ("left_finger", "right_finger")
 
 
 @dataclass(frozen=True)

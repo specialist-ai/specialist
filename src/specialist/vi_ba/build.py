@@ -7,8 +7,8 @@ the first keyframe pose."""
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
 
 import gtsam
 import numpy as np
@@ -16,6 +16,8 @@ import numpy.typing as npt
 from gtsam.symbol_shorthand import B, L, V, X
 
 from specialist.loader.mei_model import MeiParams
+from specialist.vi_ba.anchor_detection import TagDetection
+from specialist.vi_ba.features import Rect
 
 try:
   # Native C++ MEI reprojection factors (pose+point, base-tag, finger, and
@@ -44,6 +46,7 @@ _BIAS_PRIOR_SIGMA_GYRO = 1.0e-3
 _REAR_LANDMARK_OFFSET = 1_000_000
 
 __all__ = [
+  "LensChannel",
   "LensSetup",
   "add_mei_base_tag_factor",
   "add_mei_cross_finger_factor",
@@ -96,6 +99,24 @@ class LensSetup:
 
   extrinsic: gtsam.Pose3
   params: MeiParams
+
+
+@dataclass
+class LensChannel:
+  """Everything one lens of one tracker contributes: its fixed setup, its
+  per-keyframe tag detections and keypoints, and the surviving tracks with the
+  landmarks they triangulate to."""
+
+  side: str  # "front" or "rear", the key anchor observations come back under
+  setup: LensSetup
+  tags: list[list[TagDetection]] = field(default_factory=list)
+  keypoints: list[Float64Array] = field(default_factory=list)
+  tracks: dict[int, dict[int, Float64Array]] = field(default_factory=dict)
+  points: dict[int, Float64Array] = field(default_factory=dict)
+  rejected: dict[int, dict[int, Float64Array]] = field(default_factory=dict)
+  # Rectangles masked out of this lens's frames at every keyframe; the front
+  # lens is never masked.
+  static_mask_rects: list[Rect] = field(default_factory=list)
 
 
 def front_landmark_key(track_id: int) -> int:
@@ -294,19 +315,17 @@ def add_mei_cross_finger_factor(
 def _add_projection_factors(
   graph: gtsam.NonlinearFactorGraph,
   values: gtsam.Values,
-  tracks: Mapping[int, Mapping[int, Float64Array]],
-  points: Mapping[int, Float64Array],
-  lens: LensSetup,
+  channel: LensChannel,
   landmark_key_fn: Callable[[int], int],
   pixel_noise: gtsam.noiseModel.Base,
   pose_key_fn: Callable[[int], int],
 ) -> None:
-  for tid, xyz in points.items():
+  for tid, xyz in channel.points.items():
     lm_key = landmark_key_fn(tid)
     if not values.exists(lm_key):
       values.insert(lm_key, _as_point3(xyz))
-    for kf, pt in tracks[tid].items():
-      add_mei_factor(graph, pose_key_fn(kf), lm_key, pt, pixel_noise, lens)
+    for kf, pt in channel.tracks[tid].items():
+      add_mei_factor(graph, pose_key_fn(kf), lm_key, pt, pixel_noise, channel.setup)
 
 
 def build_vi_graph(
@@ -315,12 +334,8 @@ def build_vi_graph(
   velocities: list[Float64Array] | None = None,
   biases: list[gtsam.imuBias.ConstantBias] | None = None,
   preintegrated: list[gtsam.PreintegratedCombinedMeasurements] | None = None,
-  front: LensSetup,
-  front_tracks: Mapping[int, Mapping[int, Float64Array]],
-  front_points: Mapping[int, Float64Array],
-  rear: LensSetup,
-  rear_tracks: Mapping[int, Mapping[int, Float64Array]],
-  rear_points: Mapping[int, Float64Array],
+  front: LensChannel,
+  rear: LensChannel,
   sigma: float,
   velocity_prior_sigma: float = 0.1,
   anchor_last_pose: bool = False,
@@ -418,10 +433,8 @@ def build_vi_graph(
         )
       )
 
-  _add_projection_factors(
-    graph, values, front_tracks, front_points, front, front_lm, pixel_noise, pose_key
-  )
-  _add_projection_factors(
-    graph, values, rear_tracks, rear_points, rear, rear_lm, pixel_noise, pose_key
-  )
+  for channel, landmark_key_fn in ((front, front_lm), (rear, rear_lm)):
+    _add_projection_factors(
+      graph, values, channel, landmark_key_fn, pixel_noise, pose_key
+    )
   return graph, values

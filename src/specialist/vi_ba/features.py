@@ -26,10 +26,14 @@ _R = TypeVar("_R")
 __all__ = [
   "detect_corners",
   "Frame",
+  "Rect",
+  "available_ram",
   "chain_tracks",
+  "cpu_budget",
   "detect_orb",
   "dis_flow_track",
   "essential_ransac_inliers",
+  "mask_plane",
   "match_pair",
   "parallel_map",
   "set_precompute_concurrency",
@@ -192,11 +196,9 @@ _FlowIter = Callable[[Sequence[np.ndarray], range], Iterator[tuple[int, _FlowPai
 
 
 class _ScaledFrames(Sequence[np.ndarray]):
-  """A lazily downscaled view of a frame sequence.
-
-  The flow streams frames in windows, so resizing the whole sequence per
-  chunk (or materialising it up front) costs far more than the flow itself.
-  This resizes on access and keeps only a small ring of recent frames.
+  """A lazily downscaled view of a frame sequence: resized on access, keeping a
+  small ring of recent frames. ``band`` forwards the underlying decoder's, when
+  it has one, so the flow's lookahead can stay inside it.
   """
 
   def __init__(self, frames: Sequence[np.ndarray], scale: float, cache: int = 64):
@@ -205,6 +207,10 @@ class _ScaledFrames(Sequence[np.ndarray]):
     self._cache: dict[int, np.ndarray] = {}
     self._order: list[int] = []
     self._capacity = cache
+
+  @property
+  def band(self) -> int | None:
+    return getattr(self._frames, "band", None)
 
   def __len__(self) -> int:
     return len(self._frames)
@@ -257,6 +263,34 @@ def _select_flow_iter(frames: Sequence[np.ndarray], gpu: bool) -> _FlowIter:
   except Exception as exc:
     print(f"  [flow] GPU DIS unavailable ({exc}); using cv2 DIS", flush=True)
     return _iter_dis_flows
+
+
+def _flow_pairs(
+  flow_iter: _FlowIter, frames: Sequence[np.ndarray], chunk: int
+) -> Iterator[tuple[_FlowPair, str]]:
+  """``((forward, backward), backend)`` per consecutive pair, requested one
+  RAM-bounded chunk at a time and lazily. A chunk that fails on the GPU restarts
+  on the cv2 path and the lens finishes there."""
+  backend = "cv2" if flow_iter is _iter_dis_flows else "gpu"
+  k = 1
+  while k < len(frames):
+    band = getattr(frames, "band", None)
+    lookahead = chunk if band is None else min(chunk, band - k % band)
+    chunk_end = min(k + max(1, lookahead), len(frames))
+    stream = flow_iter(frames, range(k, chunk_end))
+    while k < chunk_end:
+      try:
+        flow_k, pair = next(stream)
+      except Exception as exc:
+        if flow_iter is _iter_dis_flows:
+          raise
+        print(f"  [flow] GPU DIS lost ({exc}); using cv2 DIS", flush=True)
+        flow_iter, backend = _iter_dis_flows, "cv2"
+        stream = flow_iter(frames, range(k, chunk_end))
+        flow_k, pair = next(stream)
+      assert flow_k == k
+      yield pair, backend
+      k += 1
 
 
 def _in_bounds(xy: Float64Array, h: int, w: int) -> npt.NDArray[np.bool_]:
@@ -324,31 +358,27 @@ def dis_flow_track(
   masks: list[list[Rect]] | None = None,
   gpu_flow: bool = False,
   flow_scale: float = 1.0,
-) -> tuple[list[Frame], list[npt.NDArray[np.int64]]]:
+) -> tuple[list[Float64Array], list[npt.NDArray[np.int64]]]:
   """Sparse-track propagation via DIS dense optical flow: Shi-Tomasi seeding
   with redetect, and a per-pair propagation step that samples the dense flow
   bilinearly at each prior-kf pixel position.
+
+  Returns each frame's ``(N, 2)`` tracked points and the ``(M, 2)`` index
+  pairs linking consecutive frames' points.
   """
   if masks is not None and len(masks) != len(frames):
     raise ValueError(f"masks length {len(masks)} != frames length {len(frames)}")
   if not frames:
     return [], []
 
-  # Stream each consecutive pair's flow from the chosen backend in RAM-bounded
-  # chunks (see _flow_chunk_size); the loop below samples pair ``k`` as soon as
-  # it is ready (the stream also sets the cv2 thread budget for the lighter
-  # ops below).
-  # The flow runs on its own (optionally downscaled) view of the frames; the
-  # backend is primed on that view so its buffers match what it will be fed.
+  # The backend is primed on the same (optionally downscaled) view it will be
+  # fed, and priming also sets the cv2 thread budget for the ops below.
   flow_frames = frames if flow_scale == 1.0 else _ScaledFrames(frames, flow_scale)
   flow_iter = _select_flow_iter(flow_frames, gpu_flow)
+  scale_note = "" if flow_scale == 1.0 else f" @{flow_scale:g}x"
   backend = "cv2" if flow_iter is _iter_dis_flows else "gpu"
-  if flow_scale != 1.0:
-    backend = f"{backend} @{flow_scale:g}x"
   flow_begin = time.perf_counter()
-  chunk_size = _flow_chunk_size(flow_frames)
-  flow_stream: Iterator[tuple[int, _FlowPair]] = iter(())
-  chunk_end = 1
+  pairs = _flow_pairs(flow_iter, flow_frames, _flow_chunk_size(flow_frames))
   # Sized by ``len(frames)``: iterating a banded reader decodes the whole lens.
   per_frame_pts: list[Float64Array] = [np.empty((0, 2)) for _ in range(len(frames))]
   matches_between: list[npt.NDArray[np.int64]] = []
@@ -356,21 +386,7 @@ def dis_flow_track(
   for k, img in enumerate(frames):
     mask_k = None if masks is None else masks[k]
     if k >= 1:
-      if k >= chunk_end:
-        chunk_end = min(k + chunk_size, len(frames))
-        flow_stream = flow_iter(flow_frames, range(k, chunk_end))
-      try:
-        flow_k, (flow_fwd, flow_bwd) = next(flow_stream)
-      except Exception as exc:
-        if flow_iter is _iter_dis_flows:
-          raise
-        # The GPU can be lost after priming: a laptop shares it with the display,
-        # and a shared host with a co-tenant. Finish the lens on the cv2 path.
-        print(f"  [flow] GPU DIS lost ({exc}); using cv2 DIS", flush=True)
-        flow_iter, backend = _iter_dis_flows, "cv2"
-        flow_stream = flow_iter(flow_frames, range(k, chunk_end))
-        flow_k, (flow_fwd, flow_bwd) = next(flow_stream)
-      assert flow_k == k
+      (flow_fwd, flow_bwd), backend = next(pairs)
 
     if k > 0 and per_frame_pts[k - 1].shape[0]:
       prev_xy = per_frame_pts[k - 1]
@@ -404,14 +420,14 @@ def dis_flow_track(
       per_frame_pts[k] = pts_subpix.reshape(-1, 2).astype(np.float64)
 
     n_active = per_frame_pts[k].shape[0]
-    need_redetect = k == 0 or n_active < int(round(_REDETECT_RATIO * n_features))
+    need_redetect = k == 0 or n_active < round(_REDETECT_RATIO * n_features)
     if need_redetect:
       redetect_mask = mask_plane(img.shape[:2], mask_k or [])
       for p in per_frame_pts[k]:
         cv2.circle(
           redetect_mask,
-          (int(round(float(p[0]))), int(round(float(p[1])))),
-          int(round(_CORNER_MIN_DISTANCE)),
+          (round(float(p[0])), round(float(p[1]))),
+          round(_CORNER_MIN_DISTANCE),
           0,
           thickness=-1,
         )
@@ -426,21 +442,11 @@ def dis_flow_track(
         per_frame_pts[k] = np.vstack([per_frame_pts[k], new_corners])
 
   print(
-    f"  [flow] {backend} DIS tracked {len(frames)} frames in "
+    f"  [flow] {backend}{scale_note} DIS tracked {len(frames)} frames in "
     f"{time.perf_counter() - flow_begin:.1f}s",
     flush=True,
   )
-
-  frames_out: list[Frame] = []
-  for pts in per_frame_pts:
-    kps = pts if pts.shape[0] else np.empty((0, 2))
-    frames_out.append(
-      Frame(
-        keypoints=kps,
-        descriptors=np.empty((kps.shape[0], 32), dtype=np.uint8),
-      )
-    )
-  return frames_out, matches_between
+  return per_frame_pts, matches_between
 
 
 def detect_orb(
@@ -491,25 +497,22 @@ def match_pair(a: Frame, b: Frame, ratio: float) -> npt.NDArray[np.int64]:
 
 
 def essential_ransac_inliers(
-  pts_a: Float64Array,
-  pts_b: Float64Array,
   bearings_a: Float64Array,
   bearings_b: Float64Array,
   threshold_px: float,
   fx: float,
   max_half_angle: float = np.pi / 2.0 - 1e-6,
 ) -> npt.NDArray[np.bool_]:
-  """RANSAC essential-matrix inlier mask.
+  """RANSAC essential-matrix inlier mask, one row per correspondence.
 
-  ``pts_*`` and ``bearings_*`` must be row-aligned. Bearings are unit
-  vectors in each lens frame (the caller unprojects through its own MEI/KB
-  model). ``threshold_px / fx`` sets the inlier threshold in
-  normalised-image units. Correspondences whose bearing z-component falls
-  below ``cos(max_half_angle)`` are excluded from the solve — they
-  are numerically unstable once divided by a near-zero z.
+  ``bearings_*`` are row-aligned unit vectors in each lens frame (the caller
+  unprojects through its own MEI/KB model). ``threshold_px / fx`` sets the
+  inlier threshold in normalised-image units. Correspondences whose bearing
+  z-component falls below ``cos(max_half_angle)`` are excluded from the solve —
+  they are numerically unstable once divided by a near-zero z.
   """
-  n = pts_a.shape[0]
-  if n < 8 or pts_b.shape[0] != n:
+  n = bearings_a.shape[0]
+  if n < 8 or bearings_b.shape[0] != n:
     return np.zeros(n, dtype=bool)
 
   cos_min = float(np.cos(max_half_angle))
@@ -542,17 +545,18 @@ def essential_ransac_inliers(
 
 
 def chain_tracks(
-  frames: list[Frame],
+  keypoints: list[Float64Array],
   matches_between: list[npt.NDArray[np.int64]],
 ) -> dict[int, dict[int, Float64Array]]:
   """Chain pairwise matches into per-landmark tracks.
 
-  ``matches_between[k]`` is the ``(M, 2)`` inlier-match array for
-  ``frames[k] → frames[k+1]``. Returns ``{track_id: {frame_idx: pt2d}}``.
+  ``keypoints[k]`` is frame ``k``'s ``(N, 2)`` points and ``matches_between[k]``
+  the ``(M, 2)`` inlier-match array for frame ``k → k+1``. Returns
+  ``{track_id: {frame_idx: pt2d}}``.
   """
-  if len(matches_between) != max(len(frames) - 1, 0):
+  if len(matches_between) != max(len(keypoints) - 1, 0):
     raise ValueError(
-      f"expected {len(frames) - 1} match arrays, got {len(matches_between)}"
+      f"expected {len(keypoints) - 1} match arrays, got {len(matches_between)}"
     )
   tracks: dict[int, dict[int, Float64Array]] = {}
   lookup: dict[tuple[int, int], int] = {}
@@ -567,8 +571,8 @@ def chain_tracks(
       else:
         tid = next_id
         next_id += 1
-        tracks[tid] = {k - 1: frames[k - 1].keypoints[int(a_idx)]}
+        tracks[tid] = {k - 1: keypoints[k - 1][int(a_idx)]}
         lookup[prev_key] = tid
-      tracks[tid][k] = frames[k].keypoints[int(b_idx)]
+      tracks[tid][k] = keypoints[k][int(b_idx)]
       lookup[(k, int(b_idx))] = tid
   return tracks

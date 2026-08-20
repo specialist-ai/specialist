@@ -20,6 +20,7 @@ __all__ = [
   "GpuMode",
   "GripperCfg",
   "SolverCfg",
+  "TrackerArgs",
   "validate",
 ]
 
@@ -38,9 +39,6 @@ class FrontendCfg:
   flow_scale: float = 0.25
 
   min_track_length: int = 3
-  loop_n_neighbors: int = 8
-  loop_match_ratio: float = 0.8
-  loop_min_inliers: int = 10
   # Drop feature correspondences past this bearing half-angle (rad) from the
   # essential-matrix RANSAC.
   feature_max_half_angle: float = float(np.deg2rad(70.0))
@@ -69,8 +67,6 @@ class FrontendCfg:
   # recover tracks the intervening motion breaks.
   loop_closure: bool = True
 
-  loop_closure_max_dist: float = 0.1
-  loop_closure_min_kf_gap: int = 15
   # Triangulate the revisit loop landmarks from the anchor-covisible views alone.
   anchored_loop_closure: bool = True
   # Cap on triangulated landmarks per lens (keeps the longest-track,
@@ -86,8 +82,8 @@ class FrontendCfg:
 
 @dataclass
 class AnchorCfg:
-  # Static wall-tag ids; the first is the reference anchor that pins the
-  # world gauge. Additional ids ground trackers that co-sight them.
+  # Static wall-tag ids. The first is the reference anchor that pins the world
+  # gauge; the rest ground trackers that co-sight them.
   tag_ids: tuple[int, ...]
 
   tag_size: float = 0.1
@@ -128,6 +124,26 @@ class SolverCfg:
 
 
 @dataclass
+class TrackerArgs:
+  """Per-tracker prep knobs. Composes the nested configs above."""
+
+  base_rrd: Path  # the session's base recording
+  tracker: str  # this tracker's entity name inside the base recording
+  base_tag_id: int
+  anchor: AnchorCfg
+  keyframe_every: int  # 0 = auto (round(fps/10))
+  urdf_path: Path | None  # gripper URDF for finger joint kinematics
+  # 0 disables the corresponding URDF revolute joint angle recovery.
+  left_finger_tag_id: int
+  right_finger_tag_id: int
+  frontend: FrontendCfg
+  gripper: GripperCfg
+  # True when sibling captures prepare concurrently; gates per-thread AprilTag
+  # detectors.
+  parallel_siblings: bool = False
+
+
+@dataclass
 class Args:
   """One run's full configuration: the base recording, the keyframe stride,
   the tag ids that identify anchors and grippers, and the nested per-stage
@@ -145,6 +161,7 @@ class Args:
   open_viewer: bool = True
   # Replace an existing track for this session; off refuses.
   overwrite: bool = False
+
   # One id per tracker; cross-tracker disambiguation needs distinct ids.
   base_tag_ids: tuple[int, ...] = ()
   # Per-tracker finger tag ids (or 0 to disable for that tracker). Used to

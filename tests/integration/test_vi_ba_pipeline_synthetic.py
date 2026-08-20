@@ -1,20 +1,10 @@
 """Synthetic end-to-end integration test for the dual-lens VI-BA pipeline.
 
-Drives the pipeline from known 3D landmarks projected through
-``mei_project`` at known body poses, turned into ``vi_ba.features``
-``Frame`` objects with deterministic matches. Image rendering is skipped
-(that belongs to a separate ``.rrd``-visible probe).
-
-What it exercises end-to-end:
-  - ``chain_tracks`` (pairwise matches → per-landmark tracks)
-  - ``two_view_essential`` (essential matrix on MEI-unprojected bearings)
-  - ``interpolate_camera_poses`` + ``body_poses_from_camera_poses``
-  - ``triangulate_track_multiview`` (per-track ray intersection + cheirality)
-  - ``build_vi_graph`` + ``optimize_graph`` (MEI factors + LM)
-
-Verdict: LM converges from the two-view init + triangulation to a solution
-whose landmarks match ground truth to within the metric scale the gauge
-priors have set.
+Known 3D landmarks projected through ``mei_project`` at known body poses, with
+deterministic matches, drive ``chain_tracks``, ``two_view_essential``,
+``interpolate_camera_poses``, ``body_poses_from_camera_poses``,
+``triangulate_track_multiview`` and ``optimize_graph``. LM converges to
+landmarks matching ground truth up to the scale the gauge priors set.
 """
 
 from __future__ import annotations
@@ -26,11 +16,12 @@ from gtsam.symbol_shorthand import X
 
 from specialist.loader.mei_model import MeiParams, mei_project, mei_unproject
 from specialist.vi_ba.build import (
+  LensChannel,
   LensSetup,
   build_vi_graph,
   front_landmark_key,
 )
-from specialist.vi_ba.features import Frame, chain_tracks
+from specialist.vi_ba.features import chain_tracks
 from specialist.vi_ba.init import (
   body_poses_from_camera_poses,
   interpolate_camera_poses,
@@ -72,24 +63,21 @@ def test_pipeline_recovers_ground_truth_from_two_view_init() -> None:
   xyzs = rng.uniform(-0.4, 0.4, size=(n_lm, 3))
   xyzs[:, 2] = rng.uniform(1.5, 3.0, size=n_lm)
 
-  # Project each landmark through each pose; build synthetic Frames with
-  # keypoints in the same order as the landmark index.
-  frames: list[Frame] = []
-  for body_pose in true_poses:
-    pts = np.array(
+  # Keypoints stay in landmark-index order.
+  keypoints = [
+    np.array(
       [_project(body_pose, extrinsic, xyzs[i], params) for i in range(n_lm)],
       dtype=np.float64,
     )
-    frames.append(
-      Frame(keypoints=pts, descriptors=np.zeros((n_lm, 32), dtype=np.uint8))
-    )
+    for body_pose in true_poses
+  ]
 
   # Matches are identity pairs (kp i in frame k ↔ kp i in frame k+1).
   matches_between = [
     np.stack([np.arange(n_lm), np.arange(n_lm)], axis=1).astype(np.int64)
     for _ in range(n_keyframes - 1)
   ]
-  tracks = chain_tracks(frames, matches_between)
+  tracks = chain_tracks(keypoints, matches_between)
   assert len(tracks) == n_lm
 
   # Two-view init on the widest pair (0, n_keyframes-1).
@@ -133,12 +121,13 @@ def test_pipeline_recovers_ground_truth_from_two_view_init() -> None:
   graph, values = build_vi_graph(
     body_poses=body_poses_init,
     preintegrated=None,
-    front=lens,
-    front_tracks={tid: tracks[tid] for tid in points_init},
-    front_points=points_init,
-    rear=lens,
-    rear_tracks={},
-    rear_points={},
+    front=LensChannel(
+      side="front",
+      setup=lens,
+      tracks={tid: tracks[tid] for tid in points_init},
+      points=points_init,
+    ),
+    rear=LensChannel(side="rear", setup=lens),
     sigma=0.5,
     weak_pose_sigmas=(0.3, 0.3, 0.3, 0.3, 0.3, 0.3),
     anchor_last_pose=True,

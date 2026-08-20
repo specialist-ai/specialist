@@ -61,8 +61,8 @@ def _factor_observation_lines(
   tracker."""
   lenses_by_kf: dict[int, list[tuple[LensSetup, Float64Array]]] = {}
   for tag_id, corners_world in anchor_corners_by_tag.items():
-    for lens, kf, _det in anchor_sightings(observer, tag_id, max_half_angle):
-      lenses_by_kf.setdefault(kf, []).append((lens, corners_world))
+    for ch, kf, _det in anchor_sightings(observer, tag_id, max_half_angle):
+      lenses_by_kf.setdefault(kf, []).append((ch.setup, corners_world))
   anchor_lines: list[Float64Array] = []
   cross_lines: list[Float64Array] = []
   for kf in range(observer.n_keyframes):
@@ -176,6 +176,7 @@ def _project_tag_axes_per_kf(
 
 def _build_tracker_outputs(
   tracker: PreparedTracker,
+  base_tag_id: int,
   poses: list[gtsam.Pose3],
   result: OptimizeResult,
   keys: TrackerKeys,
@@ -190,24 +191,37 @@ def _build_tracker_outputs(
   """Assemble one tracker's Rerun viz payload and summary line from the solved
   values: post-bundle landmark cull, per-keyframe reprojection RMSE, tag-axis /
   landmark-reprojection overlays, and factor-observation lines."""
-  front_points, front_reproj_per_kf, front_rmse_per_kf = cull_and_reproject(
-    points_from_values(
-      result.values, keys.front_landmark_key, tracker.name, landmark_keep[0]
-    ),
-    tracker.front_tracks,
-    poses,
-    tracker.front_lens,
-  )
-  rear_points, rear_reproj_per_kf, rear_rmse_per_kf = cull_and_reproject(
-    points_from_values(
-      result.values, keys.rear_landmark_key, tracker.name, landmark_keep[1]
-    ),
-    tracker.rear_tracks,
-    poses,
-    tracker.rear_lens,
-  )
-  front_rmse = _rms(front_rmse_per_kf)
-  rear_rmse = _rms(rear_rmse_per_kf)
+  lenses: dict[str, LensVizData] = {}
+  lens_rmse: dict[str, list[float]] = {}
+  for channel, landmark_key, keep in (
+    (tracker.front, keys.front_landmark_key, landmark_keep[0]),
+    (tracker.rear, keys.rear_landmark_key, landmark_keep[1]),
+  ):
+    points, reprojections, rmse_per_kf = cull_and_reproject(
+      points_from_values(result.values, landmark_key, tracker.name, keep),
+      channel.tracks,
+      poses,
+      channel.setup,
+    )
+    lens_rmse[channel.side] = rmse_per_kf
+    lenses[channel.side] = LensVizData(
+      points=points,
+      keypoints=channel.keypoints,
+      rejected_keypoints=_per_kf_rejected_keypoints(
+        channel.rejected, tracker.n_keyframes
+      ),
+      landmark_reprojections=reprojections,
+      tag_detections=[
+        [(d.tag_id, d.center, d.corners) for d in tags] for tags in channel.tags
+      ],
+      tag_axes=_project_tag_axes_per_kf(channel.tags, channel.setup, tag_size_by_id),
+      rmse_per_kf=rmse_per_kf,
+      extrinsic=channel.setup.extrinsic,
+      mei={k: float(v) for k, v in asdict(channel.setup.params).items()},
+      static_mask_rects=channel.static_mask_rects,
+    )
+  front_rmse = _rms(lens_rmse["front"])
+  rear_rmse = _rms(lens_rmse["rear"])
   bbox_diagonal = bounding_box_diagonal(poses)
   summary = TrackerSummary(
     name=tracker.name,
@@ -217,54 +231,17 @@ def _build_tracker_outputs(
     path_length=path_length(poses),
     front_rmse=front_rmse,
     rear_rmse=rear_rmse,
+    base_tag_id=base_tag_id,
   )
+  rear_note = f" rear_rmse={rear_rmse:.2f}px" if np.isfinite(rear_rmse) else ""
   print(
     f"  {tracker.name}: kf={tracker.n_keyframes} bbox={bbox_diagonal:.3f} m "
-    f"front_rmse={front_rmse:.2f}px rear_rmse={rear_rmse:.2f}px"
+    f"front_rmse={front_rmse:.2f}px{rear_note}"
   )
   if tracker.body_T_base_tag is not None:
     base_tag_poses = [p.compose(tracker.body_T_base_tag) for p in poses]
   else:
     base_tag_poses = poses
-  lenses = {
-    "front": LensVizData(
-      points=front_points,
-      keypoints=tracker.front_keypoints,
-      rejected_keypoints=_per_kf_rejected_keypoints(
-        tracker.front_rejected, tracker.n_keyframes
-      ),
-      landmark_reprojections=front_reproj_per_kf,
-      tag_detections=[
-        [(d.tag_id, d.center, d.corners) for d in tags]
-        for tags in tracker.front_tags_per_kf
-      ],
-      tag_axes=_project_tag_axes_per_kf(
-        tracker.front_tags_per_kf, tracker.front_lens, tag_size_by_id
-      ),
-      rmse_per_kf=front_rmse_per_kf,
-      extrinsic=tracker.front_lens.extrinsic,
-      mei={k: float(v) for k, v in asdict(tracker.front_lens.params).items()},
-    ),
-    "rear": LensVizData(
-      points=rear_points,
-      keypoints=tracker.rear_keypoints,
-      rejected_keypoints=_per_kf_rejected_keypoints(
-        tracker.rear_rejected, tracker.n_keyframes
-      ),
-      landmark_reprojections=rear_reproj_per_kf,
-      tag_detections=[
-        [(d.tag_id, d.center, d.corners) for d in tags]
-        for tags in tracker.rear_tags_per_kf
-      ],
-      tag_axes=_project_tag_axes_per_kf(
-        tracker.rear_tags_per_kf, tracker.rear_lens, tag_size_by_id
-      ),
-      rmse_per_kf=rear_rmse_per_kf,
-      extrinsic=tracker.rear_lens.extrinsic,
-      mei={k: float(v) for k, v in asdict(tracker.rear_lens.params).items()},
-      static_mask_rects=tracker.rear_static_mask_rects,
-    ),
-  }
   biases_final = [
     result.values.atConstantBias(keys.bias_key(tracker.name, i))
     for i in range(tracker.n_keyframes)
@@ -399,9 +376,10 @@ def build_run_outputs(
 
   viz_trackers: list[TrackerVizData] = []
   per_tracker: list[TrackerSummary] = []
-  for t in trackers:
+  for t, base_tag_id in zip(trackers, args.base_tag_ids, strict=True):
     viz_data, summary = _build_tracker_outputs(
       t,
+      base_tag_id=base_tag_id,
       poses=optimized_body_poses[t.name],
       result=result,
       keys=keys,
