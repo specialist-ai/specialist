@@ -3,6 +3,8 @@
 // shared lens kernel (MeiCorner) and differs only in how the corner reaches the
 // body frame; the two finger factors also share a RevoluteCorner joint kernel:
 //   * MeiFactorCpp            — binary on (body_pose, world_landmark).
+//   * MeiWorldPointFactorCpp  — unary on the observing pose; the anchor corner
+//                               is a constant, so it pins the world gauge.
 //   * MeiFingerFactorCpp      — binary on (theta, body_T_base_tag); a finger tag
 //                               on a 1-DoF joint off the base tag.
 //   * MeiBaseTagFactorCpp     — unary on body_T_base_tag; the base tag.
