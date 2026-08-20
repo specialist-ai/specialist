@@ -11,7 +11,7 @@ Float64Array = npt.NDArray[np.float64]
 def unit_rows(v: Float64Array) -> Float64Array:
   """Normalise each row of ``v`` to unit length, leaving zero rows unchanged."""
   norms = np.linalg.norm(v, axis=1, keepdims=True)
-  norms = np.where(norms == 0.0, 1.0, norms)
+  norms = np.where(norms <= 1e-12, 1.0, norms)
   return v / norms
 
 

@@ -123,7 +123,12 @@ class TrackerKeys:
     return self._kf_key(_BIAS_CHAR, name, keyframe_idx)
 
   def _lm_key(self, name: str, half: int, track_id: int) -> int:
-    """A landmark key in a tracker's front (``half=0``) or rear (``half=1``) slot."""
+    """Landmark key in a front or rear slot; raises ValueError on slot overflow."""
+    if not 0 <= track_id < _MAX_LANDMARKS_PER_TRACKER:
+      raise ValueError(
+        f"track id {track_id} does not fit the {_MAX_LANDMARKS_PER_TRACKER}-wide "
+        f"landmark slot for {name!r}; its key would collide with another slot"
+      )
     return self._slot_key(
       LANDMARK_CHAR, name, half, _MAX_LANDMARKS_PER_TRACKER, track_id
     )
