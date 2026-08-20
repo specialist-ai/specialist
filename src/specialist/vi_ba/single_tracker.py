@@ -176,7 +176,7 @@ class PreparedTracker:
 class _LensPrep:
   """One lens's prep state: tag detections in, surviving tracks and landmarks out."""
 
-  side: str
+  side: schema.Side
   setup: LensSetup
   tags: list[list[TagDetection]]
   static_mask_rects: list[Rect] = field(default_factory=list)

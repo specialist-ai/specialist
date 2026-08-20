@@ -11,6 +11,7 @@ import numpy.typing as npt
 from gtsam.symbol_shorthand import B, L, V, X
 
 from specialist.loader.mei_model import MeiParams
+from specialist.record import schema
 from specialist.vi_ba.anchor_detection import TagDetection
 from specialist.vi_ba.features import Rect
 
@@ -99,7 +100,7 @@ class LensSetup:
 class LensChannel:
   """One tracker lens's setup, tag detections, keypoints, tracks and landmarks."""
 
-  side: str  # "front" or "rear", the key anchor observations come back under
+  side: schema.Side  # the key anchor observations come back under
   setup: LensSetup
   tags: list[list[TagDetection]] = field(default_factory=list)
   keypoints: list[Float64Array] = field(default_factory=list)

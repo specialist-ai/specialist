@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 import numpy as np
 import numpy.typing as npt
 import pyarrow as pa
 
 Float64Array = npt.NDArray[np.float64]
 Int64Array = npt.NDArray[np.int64]
+
+# The two sides of a stitched dual-fisheye capture.
+Side = Literal["front", "rear"]
 
 APPLICATION_ID = "specialist"
 TIMELINE = "video_time"
@@ -34,10 +39,11 @@ def keyframe_stride(fps: float) -> int:
 
 
 def keyframe_index(
-  frame_rows: npt.NDArray[np.int64], stride: int
+  session_rows: npt.NDArray[np.int64], stride: int
 ) -> npt.NDArray[np.int64]:
-  """``ceil(row / stride)`` per frame row: the ``keyframe`` timeline value."""
-  return (frame_rows + stride - 1) // stride
+  """The ``keyframe`` timeline value ``ceil(row / stride)`` per session frame row, equal
+  to the solver's ``kf`` only at the auto stride and phase zero."""
+  return (session_rows + stride - 1) // stride
 
 
 def times_ns(column: pa.Array | pa.ChunkedArray) -> Int64Array:
@@ -57,8 +63,8 @@ def image_root(tracker: str) -> str:
   return f"{IMAGE_ROOT}/{tracker}"
 
 
-def image_entity(tracker: str, lens: str) -> str:
-  return f"{image_root(tracker)}/{lens}"
+def image_entity(tracker: str, side: str) -> str:
+  return f"{image_root(tracker)}/{side}"
 
 
 def imu_entity(tracker: str, kind: str) -> str:

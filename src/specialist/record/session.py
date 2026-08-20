@@ -136,18 +136,18 @@ class SessionRecording:
     row = self._entity_row("__properties/session")
     return [str(source) for source in row.get("sources", [])]
 
-  def lens_times(self, tracker: str, lens: str) -> Float64Array:
+  def lens_times(self, tracker: str, side: str) -> Float64Array:
     """One lens's frame times (s), one per encoded sample."""
-    return frames.lens_times(self.path, schema.image_entity(tracker, lens))
+    return frames.lens_times(self.path, schema.image_entity(tracker, side))
 
   @property
   def frame_times(self) -> dict[str, Float64Array]:
     """Per-tracker front-lens frame times (s), the grid keyframes must land on."""
     return {name: self.lens_times(name, "front") for name in self.tracker_names}
 
-  def lens_video(self, tracker: str, lens: str) -> frames.LensVideo:
+  def lens_video(self, tracker: str, side: str) -> frames.LensVideo:
     """One lens's encoded samples, ready for banded decoding."""
-    return frames.LensVideo(self.path, tracker, lens)
+    return frames.LensVideo(self.path, tracker, side)
 
   def decoded_shape(self, tracker: str) -> tuple[int, int]:
     """``(height, width)`` of decoded front-lens frames, from a one-frame decode."""
@@ -165,8 +165,8 @@ class SessionRecording:
       self._lens_setup(tracker, "rear", decoded_width),
     )
 
-  def _lens_setup(self, tracker: str, lens: str, decoded_width: int) -> LensSetup:
-    row = self._entity_row(schema.calibration_entity(tracker, lens))
+  def _lens_setup(self, tracker: str, side: str, decoded_width: int) -> LensSetup:
+    row = self._entity_row(schema.calibration_entity(tracker, side))
 
     def scalar(name: str) -> float:
       return float(np.asarray(row[name], dtype=np.float64).reshape(-1)[0])
@@ -174,7 +174,7 @@ class SessionRecording:
     # Rear-lens raw ``cx`` is measured from the stitched-frame left edge.
     frame_width = scalar("frame_width")
     scale = 2 * decoded_width / frame_width
-    left_edge = frame_width / 2.0 if lens == "rear" else 0.0
+    left_edge = frame_width / 2.0 if side == "rear" else 0.0
     params = MeiParams(
       fx=scalar("fx") * scale,
       fy=scalar("fy") * scale,

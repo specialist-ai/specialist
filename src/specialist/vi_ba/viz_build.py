@@ -171,7 +171,7 @@ def _build_tracker_outputs(
   poses: list[gtsam.Pose3],
   result: OptimizeResult,
   keys: TrackerKeys,
-  landmark_keep: tuple[LandmarkTracks, LandmarkTracks],
+  lens_keeps: tuple[LandmarkTracks, LandmarkTracks],
   args: Args,
   tag_size_by_id: dict[int, float],
   cross_obs: list[CrossSighting],
@@ -183,8 +183,8 @@ def _build_tracker_outputs(
   lenses: dict[str, LensVizData] = {}
   lens_rmse: dict[str, list[float]] = {}
   for channel, landmark_key, keep in (
-    (tracker.front, keys.front_landmark_key, landmark_keep[0]),
-    (tracker.rear, keys.rear_landmark_key, landmark_keep[1]),
+    (tracker.front, keys.front_landmark_key, lens_keeps[0]),
+    (tracker.rear, keys.rear_landmark_key, lens_keeps[1]),
   ):
     points, reprojections, rmse_per_kf = cull_and_reproject(
       points_from_values(result.values, landmark_key, tracker.name, keep),
@@ -339,13 +339,13 @@ def build_run_outputs(
   landmark_keep: LandmarkKeep,
   args: Args,
   cross_obs: list[CrossSighting],
-  reference_anchor: gtsam.Pose3,
+  world_T_ref_anchor: gtsam.Pose3,
   reference_tag_id: int,
   secondary_anchor_world: dict[int, gtsam.Pose3],
   urdf_path: Path | None = None,
 ) -> RunOutputs:
   """Each tracker's payload from one solved graph, on the base recording's clock."""
-  anchor_poses_world = {reference_tag_id: reference_anchor, **secondary_anchor_world}
+  anchor_poses_world = {reference_tag_id: world_T_ref_anchor, **secondary_anchor_world}
   anchor_corners_by_tag = {
     tag_id: tag_corners_in_frame(pose, args.anchor.tag_size)
     for tag_id, pose in anchor_poses_world.items()
@@ -368,7 +368,7 @@ def build_run_outputs(
       poses=optimized_body_poses[t.name],
       result=result,
       keys=keys,
-      landmark_keep=landmark_keep[t.name],
+      lens_keeps=landmark_keep[t.name],
       args=args,
       tag_size_by_id=tag_sizes,
       cross_obs=by_observer[t.name],
