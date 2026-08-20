@@ -30,7 +30,7 @@ import gtsam
 import numpy as np
 import tyro
 
-from specialist.record.layer import write_track_layer
+from specialist.record.layer import write_solution_layers
 from specialist.record.session import SessionRecording
 from specialist.vi_ba.compose import (
   TrackerKeys,
@@ -131,12 +131,16 @@ def main(args: Args) -> None:
   names = tuple(session.tracker_names)
   validate(args, len(names))
   rrd_path = args.output_dir / "track" / f"{session.session_id}.rrd"
-  if rrd_path.exists() and not args.overwrite:
+  viz_path = args.output_dir / "viz" / f"{session.session_id}.rrd"
+  existing = [p for p in (rrd_path, viz_path) if p.exists()]
+  if existing and not args.overwrite:
     raise SystemExit(
-      f"{rrd_path} exists; pass --overwrite to replace it (a registered "
-      f"track must also be re-registered, or its byte-range index goes stale)"
+      f"{', '.join(str(p) for p in existing)} exists; pass --overwrite to "
+      f"replace it (a registered layer must also be re-registered, or its "
+      f"byte-range index goes stale)"
     )
   rrd_path.parent.mkdir(parents=True, exist_ok=True)
+  viz_path.parent.mkdir(parents=True, exist_ok=True)
   mark = _stage_timer()
   print(f"session {session.session_id}: trackers {list(names)}")
 
@@ -258,8 +262,9 @@ def main(args: Args) -> None:
   # The frame period bounds each image overlay to the one video frame it was
   # computed from.
   frame_period = float(np.median(np.diff(session.lens_times(names[0], "front"))))
-  write_track_layer(
-    rrd_path=rrd_path,
+  write_solution_layers(
+    track_path=rrd_path,
+    viz_path=viz_path,
     timeline_start=timeline_start,
     frame_period=frame_period,
     outputs=outputs,
@@ -271,7 +276,7 @@ def main(args: Args) -> None:
     session_id=session.session_id,
     open_viewer=args.open_viewer,
   )
-  print(f"Wrote {rrd_path}")
+  print(f"Wrote {rrd_path} and {viz_path}")
 
 
 if __name__ == "__main__":
