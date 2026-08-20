@@ -10,11 +10,14 @@ import numpy as np
 import numpy.typing as npt
 import pytest
 
+from specialist.vi_ba import features
 from specialist.vi_ba.features import (
   Frame,
+  _mask_ok,
   chain_tracks,
   detect_orb,
   essential_ransac_inliers,
+  mask_plane,
   match_pair,
 )
 
@@ -200,8 +203,6 @@ def test_chain_tracks_unrelated_pairs_produce_separate_tracks() -> None:
 
 def test_rect_mask_matches_the_plane_it_replaces() -> None:
   """The blocked-rectangle point test agrees exactly with the full-resolution plane."""
-  from specialist.vi_ba.features import _mask_ok, mask_plane
-
   shape = (40, 60)
   blocked = [(5, 5, 20, 15), (30, 25, 55, 38)]
   plane = mask_plane(shape, blocked)
@@ -219,16 +220,12 @@ def test_rect_mask_matches_the_plane_it_replaces() -> None:
 
 
 def test_rect_mask_with_no_rectangles_keeps_everything_in_frame() -> None:
-  from specialist.vi_ba.features import _mask_ok
-
   xy = np.array([[0.0, 0.0], [9.0, 9.0], [-1.0, 5.0], [5.0, 99.0]])
   assert list(_mask_ok(xy, [], (10, 10))) == [True, True, False, False]
 
 
 def test_flow_chunk_budget_tracks_available_memory() -> None:
   """Total RAM over-commits: decoded keyframes and co-tenants already hold memory."""
-  from specialist.vi_ba import features
-
   frames = [np.zeros((2880, 2880), dtype=np.uint8) for _ in range(400)]
   per_pair = 2880 * 2880 * 2 * 4 * 2
   cached = features._flow_chunk_size(frames) * per_pair
@@ -236,56 +233,47 @@ def test_flow_chunk_budget_tracks_available_memory() -> None:
   assert features.available_ram() > 0
 
 
-def test_available_ram_counts_reclaimable_page_cache(
-  tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-  """With a warm page cache, the budget follows available memory, not free memory."""
-  from specialist.vi_ba import features
-
-  meminfo = tmp_path / "meminfo"
-  meminfo.write_text(
+_MEMINFO_CASES = (
+  # A warm page cache leaves little memory free but plenty available.
+  (
     "MemTotal:       263773316 kB\nMemFree:         3145728 kB\n"
     "Buffers:          524288 kB\nCached:        226492416 kB\n"
-    "MemAvailable:   229638144 kB\n"
-  )
-  monkeypatch.setattr(features, "_MEMINFO", meminfo)
-  assert features.available_ram() == 229638144 * 1024
+    "MemAvailable:   229638144 kB\n",
+    229638144 * 1024,
+  ),
+  # An old kernel's meminfo lacks MemAvailable, so the sysconf pages answer.
+  ("MemTotal:       263773316 kB\nMemFree:         3145728 kB\n", None),
+  # No meminfo file at all (macOS) falls back the same way.
+  (None, None),
+)
 
 
-def test_available_ram_falls_back_without_meminfo(
-  tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(("meminfo", "expected"), _MEMINFO_CASES)
+def test_available_ram_follows_the_available_figure(
+  meminfo: str | None,
+  expected: int | None,
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-  """No meminfo file (macOS) falls back to the sysconf pages."""
-  from specialist.vi_ba import features
-
-  monkeypatch.setattr(features, "_MEMINFO", tmp_path / "absent")
-  assert features.available_ram() > 0
-
-
-def test_available_ram_falls_back_without_memavailable(
-  tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-  """A meminfo lacking MemAvailable (old kernels) falls back too."""
-  from specialist.vi_ba import features
-
-  meminfo = tmp_path / "meminfo"
-  meminfo.write_text("MemTotal:       263773316 kB\nMemFree:         3145728 kB\n")
-  monkeypatch.setattr(features, "_MEMINFO", meminfo)
-  assert features.available_ram() > 0
+  """The budget falls back to a positive figure wherever MemAvailable is missing."""
+  path = tmp_path / "meminfo"
+  if meminfo is not None:
+    path.write_text(meminfo)
+  monkeypatch.setattr(features, "_MEMINFO", path)
+  if expected is None:
+    assert features.available_ram() > 0
+  else:
+    assert features.available_ram() == expected
 
 
 def test_flow_chunk_is_capped_regardless_of_memory() -> None:
   """The cap is ``_FLOW_CHUNK_MAX_PAIRS`` however much memory the host has."""
-  from specialist.vi_ba import features
-
   frames = [np.zeros((2880, 2880), dtype=np.uint8) for _ in range(4000)]
   assert features._flow_chunk_size(frames) <= features._FLOW_CHUNK_MAX_PAIRS
 
 
 def test_cpu_budget_follows_the_cores_the_process_may_run_on() -> None:
   """``os.cpu_count`` reports the machine, not the cores this process may use."""
-  from specialist.vi_ba import features
-
   budget = features.cpu_budget()
   assert 0 < budget <= (os.cpu_count() or budget)
   if (affinity := getattr(os, "sched_getaffinity", None)) is not None:
@@ -296,8 +284,6 @@ def test_flow_falls_back_to_cv2_when_the_gpu_stream_fails_mid_lens(
   capsys: pytest.CaptureFixture[str],
 ) -> None:
   """Losing the GPU part-way through a lens costs accuracy, not the run."""
-  from specialist.vi_ba import features
-
   rng = np.random.default_rng(0)
   base = _textured_image(rng, 120, 160)
   frames = [np.roll(base, shift, axis=1) for shift in range(6)]

@@ -167,7 +167,6 @@ def _project_tag_axes_per_kf(
 
 def _build_tracker_outputs(
   tracker: PreparedTracker,
-  base_tag_id: int,
   poses: list[gtsam.Pose3],
   result: OptimizeResult,
   keys: TrackerKeys,
@@ -180,7 +179,6 @@ def _build_tracker_outputs(
   urdf_joints: dict[str, RevoluteJoint] | None,
 ) -> tuple[TrackerVizData, TrackerSummary]:
   """One tracker's Rerun payload and summary line from the solved values."""
-  # Post-bundle map cull: it cleans the map, RMSE and overlay, never the poses.
   front_points, front_reproj_per_kf, front_rmse_per_kf = cull_and_reproject(
     points_from_values(
       result.values, keys.front_landmark_key, tracker.name, landmark_keep[0]
@@ -208,12 +206,10 @@ def _build_tracker_outputs(
     path_length=path_length(poses),
     front_rmse=front_rmse,
     rear_rmse=rear_rmse,
-    base_tag_id=base_tag_id,
   )
-  rear_note = f" rear_rmse={rear_rmse:.2f}px" if np.isfinite(rear_rmse) else ""
   print(
     f"  {tracker.name}: kf={tracker.n_keyframes} bbox={bbox_diagonal:.3f} m "
-    f"front_rmse={front_rmse:.2f}px{rear_note}"
+    f"front_rmse={front_rmse:.2f}px rear_rmse={rear_rmse:.2f}px"
   )
   if tracker.body_T_base_tag is not None:
     base_tag_poses = [p.compose(tracker.body_T_base_tag) for p in poses]
@@ -386,10 +382,9 @@ def build_run_outputs(
 
   viz_trackers: list[TrackerVizData] = []
   per_tracker: list[TrackerSummary] = []
-  for t, base_tag_id in zip(trackers, args.base_tag_ids, strict=True):
+  for t in trackers:
     viz_data, summary = _build_tracker_outputs(
       t,
-      base_tag_id=base_tag_id,
       poses=optimized_body_poses[t.name],
       result=result,
       keys=keys,

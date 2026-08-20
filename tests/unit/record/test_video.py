@@ -1,14 +1,13 @@
 """Video ingest: SPS-normalizing remux and VideoStream chunk production."""
 
-import subprocess
 from pathlib import Path
 
 import numpy as np
 import pytest
 
-from specialist.loader.audio_sync import resolve_ffmpeg
 from specialist.record import schema
 from specialist.record.video import normalize_h264, video_chunks
+from tests.record_fixtures import encode_clip
 
 _FRAMES = 12
 _RATE = 30
@@ -18,26 +17,14 @@ _WHOLE_CLIP = (-10.0, 10.0)
 
 @pytest.fixture(scope="module")
 def h264_clip(tmp_path_factory: pytest.TempPathFactory) -> Path:
-  path = tmp_path_factory.mktemp("clip") / "clip.mp4"
-  subprocess.run(
-    [
-      resolve_ffmpeg(),
-      "-y",
-      "-loglevel",
-      "error",
-      "-f",
-      "lavfi",
-      "-i",
-      f"testsrc=duration={_FRAMES / _RATE}:size=64x64:rate={_RATE}",
-      "-c:v",
-      "libx264",
-      "-pix_fmt",
-      "yuv420p",
-      str(path),
-    ],
-    check=True,
+  return encode_clip(
+    tmp_path_factory.mktemp("clip") / "clip.mp4", _FRAMES, rate=_RATE, bframes=True
   )
-  return path
+
+
+@pytest.fixture(scope="module")
+def clean_clip(tmp_path_factory: pytest.TempPathFactory, h264_clip: Path) -> Path:
+  return normalize_h264(h264_clip, tmp_path_factory.mktemp("clean") / "clean.mp4")
 
 
 def _collect(clip: Path, shift: float) -> tuple[list[object], list[int], list[bool]]:
@@ -56,9 +43,31 @@ def _collect(clip: Path, shift: float) -> tuple[list[object], list[int], list[bo
   return static, times, keyframes
 
 
-def test_normalize_and_chunks(tmp_path: Path, h264_clip: Path) -> None:
-  clean = normalize_h264(h264_clip, tmp_path / "clean.mp4")
-  static, times, keyframes = _collect(clean, shift=0.0)
+def _keyframe_rows(clip: Path, shift: float) -> list[tuple[int, int]]:
+  """Every surviving video row as ``(session time, keyframe index)``, sorted."""
+  rows: list[tuple[int, int]] = []
+  for chunk in video_chunks(
+    clip, "image/t/front", time_shift=shift, window=(0.0, 10.0)
+  ).to_chunks():
+    if chunk.is_static:
+      continue
+    batch = chunk.to_record_batch()
+    names = batch.schema.names
+    assert schema.KEYFRAME_TIMELINE in names, "keyframe index missing from chunk"
+    t = batch.column(names.index(schema.TIMELINE))
+    k = batch.column(names.index(schema.KEYFRAME_TIMELINE))
+    rows.extend((t[i].value, k[i].as_py()) for i in range(batch.num_rows))
+  rows.sort()
+  return rows
+
+
+def _stride(rows: list[tuple[int, int]]) -> tuple[int, float]:
+  period = float(np.median(np.diff([t for t, _ in rows])))
+  return schema.keyframe_stride(schema.NS_PER_SECOND / period), period
+
+
+def test_normalize_and_chunks(clean_clip: Path) -> None:
+  static, times, keyframes = _collect(clean_clip, shift=0.0)
   assert len(static) == 1
   assert len(times) == _FRAMES
   assert times == sorted(times)
@@ -68,18 +77,15 @@ def test_normalize_and_chunks(tmp_path: Path, h264_clip: Path) -> None:
   assert keyframes[0] is True
 
 
-def test_time_shift(tmp_path: Path, h264_clip: Path) -> None:
-  clean = normalize_h264(h264_clip, tmp_path / "clean.mp4")
-  _, unshifted, _ = _collect(clean, shift=0.0)
-  _, shifted, _ = _collect(clean, shift=0.5)
+def test_time_shift(clean_clip: Path) -> None:
+  _, unshifted, _ = _collect(clean_clip, shift=0.0)
+  _, shifted, _ = _collect(clean_clip, shift=0.5)
   assert shifted == [t + 500_000_000 for t in unshifted]
 
 
-def test_window_keeps_and_drops_chunks(tmp_path: Path, h264_clip: Path) -> None:
-  clean = normalize_h264(h264_clip, tmp_path / "clean.mp4")
-
+def test_window_keeps_and_drops_chunks(clean_clip: Path) -> None:
   def rows(window: tuple[float, float]) -> int:
-    stream = video_chunks(clean, "image/cam/front", time_shift=0.0, window=window)
+    stream = video_chunks(clean_clip, "image/cam/front", time_shift=0.0, window=window)
     return sum(c.num_rows for c in stream.to_chunks() if not c.is_static)
 
   # A chunk overlapping the window survives whole; one entirely outside drops.
@@ -97,25 +103,9 @@ def test_remux_failure_raises(tmp_path: Path) -> None:
 
 def test_keyframe_timeline_buckets_frames_to_the_stride(h264_clip: Path) -> None:
   """Each row's keyframe index is ``ceil(row / stride)``."""
-  chunks = video_chunks(
-    h264_clip, "image/t/front", time_shift=0.0, window=(0.0, 10.0)
-  ).to_chunks()
-  rows: list[tuple[int, int]] = []
-  for chunk in chunks:
-    if chunk.is_static:
-      continue
-    batch = chunk.to_record_batch()
-    names = batch.schema.names
-    assert schema.KEYFRAME_TIMELINE in names, "keyframe index missing from chunk"
-    t = batch.column(names.index(schema.TIMELINE))
-    k = batch.column(names.index(schema.KEYFRAME_TIMELINE))
-    rows.extend((t[i].value, k[i].as_py()) for i in range(batch.num_rows))
-  rows.sort()
-  ranks = np.arange(len(rows))
-  stride = schema.keyframe_stride(
-    schema.NS_PER_SECOND / float(np.median(np.diff([t for t, _ in rows])))
-  )
-  expected = schema.keyframe_index(ranks, stride)
+  rows = _keyframe_rows(h264_clip, shift=0.0)
+  stride, _period = _stride(rows)
+  expected = schema.keyframe_index(np.arange(len(rows)), stride)
   assert [k for _, k in rows] == expected.tolist()
   # The last row of bucket k is frame stride*k.
   buckets: dict[int, int] = {}
@@ -126,58 +116,18 @@ def test_keyframe_timeline_buckets_frames_to_the_stride(h264_clip: Path) -> None
 
 def test_keyframe_timeline_buckets_on_the_session_clock(h264_clip: Path) -> None:
   """An audio-shifted capture buckets by session time, not by its own frame count."""
-  shift = 2.0 / _RATE  # this capture starts two frame periods into the session
-  chunks = video_chunks(
-    h264_clip, "image/t/front", time_shift=shift, window=(0.0, 10.0)
-  ).to_chunks()
-  rows: list[tuple[int, int]] = []
-  for chunk in chunks:
-    if chunk.is_static:
-      continue
-    batch = chunk.to_record_batch()
-    names = batch.schema.names
-    t = batch.column(names.index(schema.TIMELINE))
-    k = batch.column(names.index(schema.KEYFRAME_TIMELINE))
-    rows.extend((t[i].value, k[i].as_py()) for i in range(batch.num_rows))
-  rows.sort()
-  period = float(np.median(np.diff([t for t, _ in rows])))
-  stride = schema.keyframe_stride(schema.NS_PER_SECOND / period)
+  # this capture starts two frame periods into the session
+  rows = _keyframe_rows(h264_clip, shift=2.0 / _RATE)
+  stride, period = _stride(rows)
   session_n = np.asarray([round(t / period) for t, _ in rows], dtype=np.int64)
   assert session_n[0] == 2, "the shift must appear in the session frame number"
   expected = schema.keyframe_index(session_n, stride)
   assert [k for _, k in rows] == expected.tolist()
 
 
-@pytest.fixture(scope="module")
-def bframe_clip(tmp_path_factory: pytest.TempPathFactory) -> Path:
+def test_dropped_keyframe_markers_fail_ingest(tmp_path: Path) -> None:
   """In a short-GOP B-frame clip, the reader's keyframe markers collapse."""
-  path = tmp_path_factory.mktemp("bframes") / "clip.mp4"
-  subprocess.run(
-    [
-      resolve_ffmpeg(),
-      "-y",
-      "-loglevel",
-      "error",
-      "-f",
-      "lavfi",
-      "-i",
-      f"testsrc=duration=1.0:size=64x64:rate={_RATE}",
-      "-c:v",
-      "libx264",
-      "-g",
-      "5",
-      "-pix_fmt",
-      "yuv420p",
-      str(path),
-    ],
-    check=True,
-  )
-  return path
-
-
-def test_dropped_keyframe_markers_fail_ingest(
-  tmp_path: Path, bframe_clip: Path
-) -> None:
-  clean = normalize_h264(bframe_clip, tmp_path / "clean.mp4")
+  clip = encode_clip(tmp_path / "bframes.mp4", _RATE, rate=_RATE, gop=5, bframes=True)
+  clean = normalize_h264(clip, tmp_path / "clean.mp4")
   with pytest.raises(RuntimeError, match="randomly accessible"):
     video_chunks(clean, "image/cam/front", time_shift=0.0, window=_WHOLE_CLIP)
