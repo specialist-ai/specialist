@@ -35,7 +35,7 @@ from specialist.vi_ba.optimize import OptimizeResult
 from specialist.vi_ba.single_tracker import PreparedTracker
 from specialist.vi_ba.summary import TrackerSummary
 from specialist.vi_ba.urdf_joints import RevoluteJoint, read_revolute_joints
-from specialist.vi_ba.viz import TrackerVizData
+from specialist.vi_ba.viz import LensVizData, TrackerVizData
 
 Float64Array = npt.NDArray[np.float64]
 
@@ -215,29 +215,49 @@ def _build_tracker_outputs(
     base_tag_poses = [p.compose(tracker.body_T_base_tag) for p in poses]
   else:
     base_tag_poses = poses
-  front_tag_viz = [
-    [(d.tag_id, d.center, d.corners) for d in tags]
-    for tags in tracker.front_tags_per_kf
-  ]
-  rear_tag_viz = [
-    [(d.tag_id, d.center, d.corners) for d in tags] for tags in tracker.rear_tags_per_kf
-  ]
+  lenses = {
+    "front": LensVizData(
+      points=front_points,
+      keypoints=tracker.front_keypoints,
+      rejected_keypoints=_per_kf_rejected_keypoints(
+        tracker.front_rejected, tracker.n_keyframes
+      ),
+      landmark_reprojections=front_reproj_per_kf,
+      tag_detections=[
+        [(d.tag_id, d.center, d.corners) for d in tags]
+        for tags in tracker.front_tags_per_kf
+      ],
+      tag_axes=_project_tag_axes_per_kf(
+        tracker.front_tags_per_kf, tracker.front_lens, tag_size_by_id
+      ),
+      rmse_per_kf=front_rmse_per_kf,
+      extrinsic=tracker.front_lens.extrinsic,
+      mei={k: float(v) for k, v in asdict(tracker.front_lens.params).items()},
+    ),
+    "rear": LensVizData(
+      points=rear_points,
+      keypoints=tracker.rear_keypoints,
+      rejected_keypoints=_per_kf_rejected_keypoints(
+        tracker.rear_rejected, tracker.n_keyframes
+      ),
+      landmark_reprojections=rear_reproj_per_kf,
+      tag_detections=[
+        [(d.tag_id, d.center, d.corners) for d in tags]
+        for tags in tracker.rear_tags_per_kf
+      ],
+      tag_axes=_project_tag_axes_per_kf(
+        tracker.rear_tags_per_kf, tracker.rear_lens, tag_size_by_id
+      ),
+      rmse_per_kf=rear_rmse_per_kf,
+      extrinsic=tracker.rear_lens.extrinsic,
+      mei={k: float(v) for k, v in asdict(tracker.rear_lens.params).items()},
+      static_mask_rects=tracker.rear_static_mask_rects,
+    ),
+  }
   biases_final = [
     result.values.atConstantBias(keys.bias_key(tracker.name, i))
     for i in range(tracker.n_keyframes)
   ]
-  front_tag_axes = _project_tag_axes_per_kf(
-    tracker.front_tags_per_kf, tracker.front_lens, tag_size_by_id
-  )
-  rear_tag_axes = _project_tag_axes_per_kf(
-    tracker.rear_tags_per_kf, tracker.rear_lens, tag_size_by_id
-  )
-  front_rejected_kp = _per_kf_rejected_keypoints(
-    tracker.front_rejected, tracker.n_keyframes
-  )
-  rear_rejected_kp = _per_kf_rejected_keypoints(
-    tracker.rear_rejected, tracker.n_keyframes
-  )
   velocities_final = [
     np.asarray(result.values.atVector(keys.velocity_key(tracker.name, i)))
     for i in range(tracker.n_keyframes)
@@ -277,33 +297,17 @@ def _build_tracker_outputs(
     body_poses=poses,
     keyframe_times=np.asarray(tracker.keyframe_times, dtype=np.float64),
     keyframe_rows=np.asarray(tracker.keyframe_rows, dtype=np.int64),
-    front_points=front_points,
-    rear_points=rear_points,
-    front_keypoints=tracker.front_keypoints,
-    rear_keypoints=tracker.rear_keypoints,
-    front_tag_detections=front_tag_viz,
-    rear_tag_detections=rear_tag_viz,
+    lenses=lenses,
     velocities=velocities_final,
     gyro_biases=[np.asarray(b.gyroscope(), dtype=np.float64) for b in biases_final],
     accel_biases=[
       np.asarray(b.accelerometer(), dtype=np.float64) for b in biases_final
     ],
-    front_rmse_per_kf=front_rmse_per_kf,
-    rear_rmse_per_kf=rear_rmse_per_kf,
-    front_tag_axes=front_tag_axes,
-    rear_tag_axes=rear_tag_axes,
-    front_landmark_reprojections=front_reproj_per_kf,
-    rear_landmark_reprojections=rear_reproj_per_kf,
-    front_rejected_keypoints=front_rejected_kp,
-    rear_rejected_keypoints=rear_rejected_kp,
-    rear_static_mask_rects=tracker.rear_static_mask_rects,
     anchor_obs_lines=anchor_lines,
     cross_tracker_lines=cross_lines,
     urdf_root_poses=base_tag_poses,
     joint_angles=tracker.joint_angles or None,
     trajectory_offset_in_gripper=args.gripper.keypoint_offset,
-    front_lens_extrinsic=tracker.front_lens.extrinsic,
-    rear_lens_extrinsic=tracker.rear_lens.extrinsic,
     highrate_times=highrate_times,
     highrate_positions=highrate_positions,
     highrate_quats=highrate_quats,
@@ -311,8 +315,6 @@ def _build_tracker_outputs(
     joint_frame_angles=joint_frame_angles or None,
     body_T_base_tag=tracker.body_T_base_tag,
     gripper_opening=gripper_opening,
-    front_lens_mei={k: float(v) for k, v in asdict(tracker.front_lens.params).items()},
-    rear_lens_mei={k: float(v) for k, v in asdict(tracker.rear_lens.params).items()},
   )
   return viz_data, summary
 

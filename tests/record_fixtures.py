@@ -13,7 +13,7 @@ from specialist.loader.audio_sync import resolve_ffmpeg
 from specialist.loader.parse_insv import InsvData, LensIntrinsics
 from specialist.record.layer import write_solution_layers
 from specialist.vi_ba.summary import Summary, TrackerSummary
-from specialist.vi_ba.viz import TrackerVizData
+from specialist.vi_ba.viz import LensVizData, TrackerVizData
 from specialist.vi_ba.viz_build import RunOutputs
 
 BASE_TAG = gtsam.Pose3(gtsam.Rot3.Rz(0.3), gtsam.Point3(0.01, -0.02, 0.05))
@@ -122,8 +122,10 @@ def viz_tracker(
     body_T_base_tag=BASE_TAG,
     gripper_opening=(times, opening),
   )
-  data.front_points = {0: np.zeros(3), 1: np.ones(3)}
-  data.rear_points = {2: np.full(3, 0.5)}
+  data.lenses = {
+    "front": LensVizData(points={0: np.zeros(3), 1: np.ones(3)}),
+    "rear": LensVizData(points={2: np.full(3, 0.5)}),
+  }
   if highrate:
     hr_t = np.linspace(0.0, times[-1], 10 * n + 1)
     zeros = np.zeros_like(hr_t)
@@ -163,7 +165,10 @@ def write_run(
   track_path = root / "track" / f"{session_id}.rrd"
   viz_path = root / "viz" / f"{session_id}.rrd"
   for tracker in trackers:
-    tracker.rear_static_mask_rects = list(mask_rects)
+    if mask_rects:
+      tracker.lenses.setdefault("rear", LensVizData()).static_mask_rects = list(
+        mask_rects
+      )
     if urdf_path is not None:
       tracker.urdf_root_poses = list(tracker.body_poses)
   write_solution_layers(
