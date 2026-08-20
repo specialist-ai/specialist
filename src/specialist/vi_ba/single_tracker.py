@@ -3,18 +3,15 @@
 from __future__ import annotations
 
 import ctypes
-from bisect import bisect_left
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import TypeVar
+from typing import NamedTuple, TypeVar
 
-import cv2
 import gtsam
 import numpy as np
 import numpy.typing as npt
 
-from specialist.loader.mei_model import MeiParams, mei_unproject
+from specialist.loader.mei_model import mei_unproject
 from specialist.record import schema
 from specialist.record.frames import LensFrames, LensVideo
 from specialist.record.session import (
@@ -26,15 +23,15 @@ from specialist.record.session import (
 from specialist.vi_ba.anchor_detection import (
   TagDetection,
   anchor_pose_from_tags,
+  apply_static_mask_rects,
   configure_detector,
   detect_all_tags,
-  tag_half_angle,
+  non_anchor_tag_masks,
 )
-from specialist.vi_ba.build import LensSetup
+from specialist.vi_ba.build import LensChannel, LensSetup
 from specialist.vi_ba.configs import (
-  AnchorCfg,
   FrontendCfg,
-  GripperCfg,
+  TrackerArgs,
 )
 from specialist.vi_ba.features import (
   Frame,
@@ -42,14 +39,10 @@ from specialist.vi_ba.features import (
   available_ram,
   detect_orb,
   mask_plane,
-  match_pair,
   parallel_map,
 )
-from specialist.vi_ba.finger_kinematics import (
-  FingerReproj,
-  build_finger_reproj,
-  frame_finger_angles,
-)
+from specialist.vi_ba.finger_kinematics import FingerReproj, recover_gripper_tags
+from specialist.vi_ba.geometry import translation
 from specialist.vi_ba.imu import (
   GRAVITY,
   GRAVITY_WORLD,
@@ -63,30 +56,28 @@ from specialist.vi_ba.init import (
   Alignment,
   apply_alignment_to_poses,
   body_poses_from_camera_poses,
+  fill_camera_poses,
   incremental_sfm,
   interpolate_camera_poses,
   pick_init_pair,
+  reject_vo_pose_outliers,
   two_view_essential,
   visual_inertial_align,
 )
 from specialist.vi_ba.tracks import (
+  add_loop_landmarks,
+  bearings_by_track,
+  cap_landmarks,
   filter_tracks_by_parallax,
+  loop_closure_tracks,
   run_lens_frontend,
+  subsample_obs,
   triangulate_lens,
-  unproject_tracks,
 )
-from specialist.vi_ba.urdf_joints import read_revolute_joints
 
 Float64Array = npt.NDArray[np.float64]
 
 _A = TypeVar("_A")
-
-# ORB loop-closure track recovery (``_loop_closure_tracks``).
-_LOOP_RANSAC_PX = 4.5  # homography RANSAC reprojection tolerance
-_LOOP_MIN_VIEWS = 3  # keyframes a union-found track must span to be kept
-
-# Visual-odometry pose-spike rejection (``_reject_vo_pose_outliers``).
-_VO_REJECT_FACTOR = 8.0  # residual/median-step ratio marking a PnP teleport
 
 # Keyframes read at once from a banded lens.
 _PREP_BAND = 256
@@ -97,7 +88,6 @@ _PREP_MEMORY_SHARE = 0.35
 
 __all__ = [
   "PreparedTracker",
-  "TrackerArgs",
   "captures_that_fit",
   "prepare_tracker",
 ]
@@ -142,25 +132,6 @@ def _enough_registered(
 
 
 @dataclass
-class TrackerArgs:
-  """Per-tracker prep knobs composed from the nested configs in ``configs.py``."""
-
-  base_rrd: Path  # the session's base recording; the recording is the window
-  tracker: str  # this tracker's entity name inside the base recording
-  base_tag_id: int
-  anchor: AnchorCfg
-  keyframe_every: int  # 0 = auto (round(fps/10))
-  urdf_path: Path | None  # gripper URDF for finger joint kinematics
-  # 0 disables the corresponding URDF revolute joint angle recovery.
-  left_finger_tag_id: int
-  right_finger_tag_id: int
-  frontend: FrontendCfg
-  gripper: GripperCfg
-  # Set when sibling captures prep at once; it gates per-thread AprilTag detectors.
-  parallel_siblings: bool = False
-
-
-@dataclass
 class PreparedTracker:
   """Everything one tracker contributes to the joint graph + viz."""
 
@@ -169,12 +140,8 @@ class PreparedTracker:
   velocities: list[Float64Array]
   biases: list[gtsam.imuBias.ConstantBias]
   preintegrated: list[gtsam.PreintegratedCombinedMeasurements]
-  front_lens: LensSetup
-  rear_lens: LensSetup
-  front_tracks: dict[int, dict[int, Float64Array]]
-  rear_tracks: dict[int, dict[int, Float64Array]]
-  front_points: dict[int, Float64Array]
-  rear_points: dict[int, Float64Array]
+  front: LensChannel
+  rear: LensChannel
   # ``{tag_id: {kf: {side: cam_T_tag}}}``.
   anchor_obs_by_tag: dict[int, dict[int, dict[str, gtsam.Pose3]]]
   anchor_locals_by_tag: dict[int, gtsam.Pose3]
@@ -184,13 +151,6 @@ class PreparedTracker:
   keyframe_times: Float64Array
   # Session-clock frame per keyframe; ``schema.keyframe_index`` maps it to the timeline.
   keyframe_rows: npt.NDArray[np.int64]
-  front_keypoints: list[Float64Array]
-  rear_keypoints: list[Float64Array]
-  front_tags_per_kf: list[list[TagDetection]]
-  rear_tags_per_kf: list[list[TagDetection]]
-  front_rejected: dict[int, dict[int, Float64Array]]
-  rear_rejected: dict[int, dict[int, Float64Array]]
-  rear_static_mask_rects: list[tuple[int, int, int, int]]
   # URDF joint name -> kinematic inputs for the joint-angle reprojection factors.
   finger_reproj: dict[str, FingerReproj]
   left_finger_tag_id: int
@@ -198,58 +158,54 @@ class PreparedTracker:
   # Body-frame, rescaled IMU samples, for IMU-rate propagation between keyframes.
   imu: ImuSamples | None = None
   # Per-joint raw ``(times, angles)`` at the finger rate; export pins them to the solve.
-  finger_frame_angles: dict[str, tuple[Float64Array, Float64Array]] | None = None
+  finger_frame_angles: dict[str, tuple[Float64Array, Float64Array]] = field(
+    default_factory=dict
+  )
 
   @property
   def n_keyframes(self) -> int:
     return len(self.body_poses)
 
-
-def _build_non_anchor_tag_masks(
-  shape: tuple[int, int],
-  tags_per_kf: list[list[TagDetection]],
-  exclude_tag_ids: set[int],
-  pad_px: int,
-) -> list[list[Rect]]:
-  """Per keyframe, the padded, clipped box of each tag not in ``exclude_tag_ids``."""
-  h, w = shape
-  blocked: list[list[Rect]] = []
-  for tags in tags_per_kf:
-    rects: list[Rect] = []
-    for tag in tags:
-      if int(tag.tag_id) in exclude_tag_ids:
-        continue
-      corners = np.asarray(tag.corners, dtype=np.float64)
-      x0 = max(int(np.floor(corners[:, 0].min())) - pad_px, 0)
-      y0 = max(int(np.floor(corners[:, 1].min())) - pad_px, 0)
-      x1 = min(int(np.ceil(corners[:, 0].max())) + pad_px, w)
-      y1 = min(int(np.ceil(corners[:, 1].max())) + pad_px, h)
-      if x1 > x0 and y1 > y0:
-        rects.append((x0, y0, x1, y1))
-    blocked.append(rects)
-  return blocked
+  @property
+  def lenses(self) -> tuple[LensChannel, LensChannel]:
+    """Both lens channels, front first."""
+    return (self.front, self.rear)
 
 
-def _apply_static_mask_rects(
-  blocked: list[list[Rect]], rects: list[Rect], shape: tuple[int, int]
-) -> None:
-  if not rects or not blocked:
-    return
-  h, w = shape
-  for x1, y1, x2, y2 in rects:
-    x1c, y1c = max(0, x1), max(0, y1)
-    x2c, y2c = min(w, x2), min(h, y2)
-    if x2c <= x1c or y2c <= y1c:
-      raise ValueError(
-        f"mask_rear_rects entry {(x1, y1, x2, y2)} is empty after clamping to the "
-        f"{w}x{h} frame — check the coordinate order (x1 y1 x2 y2) and bounds"
-      )
-    for frame_rects in blocked:
-      frame_rects.append((x1c, y1c, x2c, y2c))
+@dataclass
+class _LensPrep:
+  """One lens's prep state: tag detections in, surviving tracks and landmarks out."""
+
+  side: str
+  setup: LensSetup
+  tags: list[list[TagDetection]]
+  static_mask_rects: list[Rect] = field(default_factory=list)
+  keypoints: list[Float64Array] = field(default_factory=list)
+  kept: dict[int, dict[int, Float64Array]] = field(default_factory=dict)
+  rejected: dict[int, dict[int, Float64Array]] = field(default_factory=dict)
+  landmarks_prealign: dict[int, Float64Array] = field(default_factory=dict)
+  points: dict[int, Float64Array] = field(default_factory=dict)
+  tracks: dict[int, dict[int, Float64Array]] = field(default_factory=dict)
+
+  def channel(self, n_keyframes: int) -> LensChannel:
+    """This lens's onward share, leaving ``kept`` and ``landmarks_prealign`` behind."""
+    return LensChannel(
+      side=self.side,
+      setup=self.setup,
+      tags=self.tags,
+      keypoints=self.keypoints[:n_keyframes],
+      tracks=self.tracks,
+      points=self.points,
+      rejected=self.rejected,
+      static_mask_rects=self.static_mask_rects,
+    )
 
 
-# Anchor-detection lens side: name, lens, per-kf tag detections, gyro increments.
-_LensSide = tuple[str, LensSetup, list[list[TagDetection]], list[Float64Array]]
+class _LensSide(NamedTuple):
+  """One lens's prep state and its gyro-derived rotation increments for anchor PnP."""
+
+  lens: _LensPrep
+  rotations: list[Float64Array]
 
 
 def _detect_anchor_obs(
@@ -259,15 +215,15 @@ def _detect_anchor_obs(
 ) -> dict[int, dict[str, gtsam.Pose3]]:
   """``{kf: {side: cam_T_tag}}`` for one anchor id over the given lenses, ungated."""
   obs: dict[int, dict[str, gtsam.Pose3]] = {}
-  for side, lens, tags, rotations in lens_sides:
+  for lens, rotations in lens_sides:
     for kf, pose in anchor_pose_from_tags(
-      tags,
+      lens.tags,
       tag_id,
       tag_size,
-      lens.params,
+      lens.setup.params,
       kf_rotations=rotations,
     ).items():
-      obs.setdefault(kf, {})[side] = pose
+      obs.setdefault(kf, {})[lens.side] = pose
   return obs
 
 
@@ -276,69 +232,9 @@ def _choose_prep_anchor(
   obs_by_tag: dict[int, dict[int, dict[str, gtsam.Pose3]]],
 ) -> int:
   """The id sighted at most keyframes; a tie goes to the earlier ``tag_ids`` entry."""
+  if not tag_ids:
+    raise ValueError("no anchor tag id is enabled; prep has nothing to ground on")
   return max(tag_ids, key=lambda tid: len(obs_by_tag.get(tid, {})))
-
-
-def _print_anchor_geometry(
-  name: str,
-  tag_id: int,
-  lens_sides: tuple[_LensSide, ...],
-  obs: dict[int, dict[str, gtsam.Pose3]],
-) -> None:
-  """Print per-anchor edge length (px), bearing half-angle and PnP incidence angle."""
-  edges: list[float] = []
-  half_angles: list[float] = []
-  for _side, lens, tags, _rotations in lens_sides:
-    for dets in tags:
-      for det in dets:
-        if int(det.tag_id) != tag_id:
-          continue
-        corners = det.corners
-        edge = np.linalg.norm(np.roll(corners, -1, axis=0) - corners, axis=1)
-        edges.append(float(edge.min()))
-        half_angle = tag_half_angle(det, lens.params)
-        if np.isfinite(half_angle):
-          half_angles.append(float(np.degrees(half_angle)))
-  if not edges:
-    return
-  incidences: list[float] = []
-  for sides in obs.values():
-    for pose in sides.values():
-      t = np.asarray(pose.translation(), dtype=np.float64)
-      dist = float(np.linalg.norm(t))
-      if dist < 1e-9:
-        continue
-      cos_incidence = -float(pose.rotation().matrix()[:, 2] @ t) / dist
-      incidences.append(float(np.degrees(np.arccos(np.clip(cos_incidence, -1.0, 1.0)))))
-
-  def med_p90(values: list[float]) -> str:
-    if not values:
-      return "-/-"
-    return f"{float(np.median(values)):.0f}/{float(np.percentile(values, 90)):.0f}"
-
-  print(
-    f"  [{name}] anchor {tag_id} geometry: {len(edges)} sightings, "
-    f"edge px min/median {min(edges):.0f}/{float(np.median(edges)):.0f}, "
-    f"half-angle median/p90 {med_p90(half_angles)} deg, "
-    f"incidence median/p90 {med_p90(incidences)} deg"
-  )
-
-
-def _per_kf_cam_T_tag(
-  tags_per_kf: list[list[TagDetection]],
-  lens: LensSetup,
-  tag_id: int,
-  tag_size: float,
-  n_keyframes: int,
-  kf_rotations: list[Float64Array],
-) -> list[gtsam.Pose3 | None]:
-  """Per-keyframe ``cam_T_tag`` of one tag, IPPE resolved by the gyro-rotated prior."""
-  out: list[gtsam.Pose3 | None] = [None] * n_keyframes
-  for kf, p in anchor_pose_from_tags(
-    tags_per_kf[:n_keyframes], tag_id, tag_size, lens.params, kf_rotations
-  ).items():
-    out[kf] = p
-  return out
 
 
 def _first_sighting_local(
@@ -351,265 +247,6 @@ def _first_sighting_local(
   first_kf = min(obs)
   lens, cam_T_tag = _side_lens_and_pose(obs[first_kf], front_lens, rear_lens)
   return body_poses[first_kf].compose(lens.extrinsic).compose(cam_T_tag)
-
-
-def _translation(pose: gtsam.Pose3) -> Float64Array:
-  return np.asarray(pose.translation(), dtype=np.float64)
-
-
-def _mean_pose(poses: list[gtsam.Pose3]) -> gtsam.Pose3:
-  """Mean translation and log-mean rotation about the first pose."""
-  ref = poses[0]
-  translations = np.stack([_translation(p) for p in poses])
-  log_sum = np.zeros(3)
-  for p in poses:
-    log_sum += gtsam.Rot3.Logmap(ref.rotation().between(p.rotation()))
-  delta = gtsam.Rot3.Expmap(log_sum / len(poses))
-  return gtsam.Pose3(
-    ref.rotation().compose(delta), gtsam.Point3(*translations.mean(axis=0))
-  )
-
-
-def _finger_joint_angles_per_kf(
-  tags_per_kf: list[list[TagDetection]],
-  lens: LensSetup,
-  base_tag_id: int,
-  finger_tag_id: int,
-  tag_size: float,
-  n_keyframes: int,
-  kf_rotations: list[Float64Array],
-) -> list[float]:
-  """Per keyframe, the finger's signed +z angle to the base tag; NaN where unseen."""
-  cam_T_base_per_kf = _per_kf_cam_T_tag(
-    tags_per_kf, lens, base_tag_id, tag_size, n_keyframes, kf_rotations
-  )
-  cam_T_finger_per_kf = _per_kf_cam_T_tag(
-    tags_per_kf, lens, finger_tag_id, tag_size, n_keyframes, kf_rotations
-  )
-  observed_base = [p for p in cam_T_base_per_kf if p is not None]
-  if not observed_base:
-    return [float("nan")] * n_keyframes
-  cam_T_base = _mean_pose(observed_base)
-  out: list[float] = [float("nan")] * n_keyframes
-  for kf in range(n_keyframes):
-    cam_T_finger = cam_T_finger_per_kf[kf]
-    if cam_T_finger is None:
-      continue
-    base_tag_T_finger = cam_T_base.between(cam_T_finger)
-    out[kf] = float(gtsam.Rot3.Logmap(base_tag_T_finger.rotation())[2])
-  return out
-
-
-def _bearings_by_track(
-  tracks: dict[int, dict[int, Float64Array]], params: MeiParams
-) -> dict[int, dict[int, Float64Array]]:
-  """``{tid: {kf: unit bearing}}`` for the visual-odometry front-end."""
-  return {
-    tid: dict(zip(kfs, bearings, strict=True))
-    for tid, kfs, bearings in unproject_tracks(
-      tracks, params, min_obs=1, normalize=True
-    )
-  }
-
-
-def _subsample_obs(
-  track: dict[int, Float64Array], max_obs: int
-) -> dict[int, Float64Array]:
-  """Keep at most ``max_obs`` observations, the endpoints plus an even middle spread."""
-  kfs = sorted(track)
-  if max_obs <= 0 or len(kfs) <= max_obs:
-    return track
-  idx = np.unique(np.linspace(0, len(kfs) - 1, max_obs).round().astype(int))
-  return {kfs[i]: track[kfs[i]] for i in idx}
-
-
-def _cap_landmarks(
-  points: dict[int, Float64Array],
-  tracks: dict[int, dict[int, Float64Array]],
-  cap: int,
-) -> dict[int, Float64Array]:
-  """Keep at most ``cap`` landmarks, longest tracks first; ``cap <= 0`` keeps all."""
-  if cap <= 0 or len(points) <= cap:
-    return points
-  keep = set(sorted(points, key=lambda t: -len(tracks.get(t, {})))[:cap])
-  return {t: p for t, p in points.items() if t in keep}
-
-
-def _loop_closure_tracks(
-  orb: list[Frame],
-  body_poses: list[gtsam.Pose3],
-  lens: LensSetup,
-  base_track_id: int,
-  max_center_dist: float,
-  min_kf_gap: int,
-  n_neighbors: int,
-  match_ratio: float,
-  min_inliers: int,
-) -> dict[int, dict[int, Float64Array]]:
-  """Recover tracks broken by fast lifts via ORB loop closure."""
-  centers = np.asarray([_translation(p.compose(lens.extrinsic)) for p in body_poses])
-  n = len(orb)
-  parent: dict[tuple[int, int], tuple[int, int]] = {}
-
-  def find(x: tuple[int, int]) -> tuple[int, int]:
-    parent.setdefault(x, x)
-    root = x
-    while parent[root] != root:
-      root = parent[root]
-    while parent[x] != root:
-      parent[x], x = root, parent[x]
-    return root
-
-  pairs: list[tuple[int, int]] = []
-  for i in range(n):
-    if len(orb[i].keypoints) == 0:
-      continue
-    dist = np.linalg.norm(centers - centers[i], axis=1)
-    cand = [
-      int(j)
-      for j in np.argsort(dist)
-      if j > i and (j - i) > min_kf_gap and dist[j] <= max_center_dist
-    ][:n_neighbors]
-    pairs.extend((i, j) for j in cand)
-
-  def verify_pair(i: int, j: int) -> npt.NDArray[np.int64] | None:
-    m = match_pair(orb[i], orb[j], match_ratio)
-    if len(m) < min_inliers:
-      return None
-    pa = orb[i].keypoints[m[:, 0]]
-    pb = orb[j].keypoints[m[:, 1]]
-    # The cv2 RNG is thread-local, so a per-pair seed keeps RANSAC deterministic.
-    cv2.setRNGSeed(i * n + j)
-    _, mask = cv2.findHomography(pa, pb, cv2.RANSAC, _LOOP_RANSAC_PX)
-    if mask is None:
-      return None
-    inl = mask.ravel().astype(bool)
-    if int(inl.sum()) < min_inliers:
-      return None
-    return np.asarray(m[inl], dtype=np.int64)
-
-  verified = parallel_map(verify_pair, [i for i, _ in pairs], [j for _, j in pairs])
-  for (i, j), matches in zip(pairs, verified, strict=True):
-    if matches is None:
-      continue
-    for a_idx, b_idx in matches:
-      ra = find((i, int(a_idx)))
-      rb = find((j, int(b_idx)))
-      if ra != rb:
-        parent[ra] = rb
-
-  comps: dict[tuple[int, int], dict[int, int]] = {}
-  for node in list(parent):
-    comps.setdefault(find(node), {})[node[0]] = node[1]
-  tracks: dict[int, dict[int, Float64Array]] = {}
-  tid = base_track_id + 1
-  for by_kf in comps.values():
-    if len(by_kf) < _LOOP_MIN_VIEWS:
-      continue
-    # Store pixels; downstream code unprojects through the MEI model itself.
-    tracks[tid] = {
-      kf: np.asarray(orb[kf].keypoints[kp], dtype=np.float64)
-      for kf, kp in by_kf.items()
-    }
-    tid += 1
-  return tracks
-
-
-def _add_loop_landmarks(
-  front_points: dict[int, Float64Array],
-  front_kept: dict[int, dict[int, Float64Array]],
-  loop_tracks: dict[int, dict[int, Float64Array]],
-  body_poses: list[gtsam.Pose3],
-  lens: LensSetup,
-  *,
-  min_track_length: int,
-  max_landmark_depth: float,
-  name: str,
-  anchor_kfs: set[int] | None = None,
-) -> dict[int, Float64Array]:
-  """Add ``loop_tracks`` to ``front_kept`` and their landmarks to ``front_points``."""
-  if anchor_kfs:
-    tri_tracks = {
-      t: {k: v for k, v in obs.items() if k in anchor_kfs}
-      for t, obs in loop_tracks.items()
-    }
-  else:
-    tri_tracks = loop_tracks
-  loop_pts = triangulate_lens(
-    tri_tracks,
-    body_poses,
-    lens.extrinsic,
-    lens.params,
-    min_track_length,
-    max_landmark_depth=max_landmark_depth,
-  )
-  front_points.update(loop_pts)
-  front_kept.update(loop_tracks)
-  print(
-    f"  [{name}] loop closure: +{len(loop_pts)} landmarks "
-    f"from {len(loop_tracks)} revisit tracks"
-  )
-  return loop_pts
-
-
-def _reject_vo_pose_outliers(
-  cam_poses: dict[int, gtsam.Pose3],
-) -> tuple[dict[int, gtsam.Pose3], list[int]]:
-  """Drop incremental-SfM keyframes whose camera center is a local spike."""
-  kept = dict(cam_poses)
-  removed: list[int] = []
-  for _ in range(len(cam_poses)):
-    kfs = sorted(kept)
-    if len(kfs) < 5:
-      break
-    centers = {kf: _translation(kept[kf]) for kf in kfs}
-    steps = [
-      float(np.linalg.norm(centers[kfs[i + 1]] - centers[kfs[i]]))
-      / (kfs[i + 1] - kfs[i])
-      for i in range(len(kfs) - 1)
-    ]
-    median_step = float(np.median(steps))
-    if median_step < 1e-12:
-      break
-    worst_kf: int | None = None
-    worst_residual = 0.0
-    for i in range(1, len(kfs) - 1):
-      prev_kf, kf, next_kf = kfs[i - 1], kfs[i], kfs[i + 1]
-      frac = (kf - prev_kf) / (next_kf - prev_kf)
-      interpolated = (1.0 - frac) * centers[prev_kf] + frac * centers[next_kf]
-      residual = float(np.linalg.norm(centers[kf] - interpolated))
-      if residual > worst_residual:
-        worst_residual, worst_kf = residual, kf
-    if worst_kf is not None and worst_residual > _VO_REJECT_FACTOR * median_step:
-      del kept[worst_kf]
-      removed.append(worst_kf)
-    else:
-      break
-  return kept, sorted(removed)
-
-
-def _fill_camera_poses(
-  cam_poses: dict[int, gtsam.Pose3], n_keyframes: int
-) -> list[gtsam.Pose3]:
-  """Every keyframe's camera pose; gaps interpolate on SE(3) and hold at the ends."""
-  reg = sorted(cam_poses)
-  out: list[gtsam.Pose3] = []
-  for k in range(n_keyframes):
-    if k in cam_poses:
-      out.append(cam_poses[k])
-      continue
-    after = bisect_left(reg, k)
-    lo = reg[after - 1] if after else None
-    hi = reg[after] if after < len(reg) else None
-    if lo is None:
-      out.append(cam_poses[hi])  # type: ignore[index]
-    elif hi is None:
-      out.append(cam_poses[lo])
-    else:
-      pa, pb = cam_poses[lo], cam_poses[hi]
-      f = (k - lo) / (hi - lo)
-      out.append(pa.compose(gtsam.Pose3.Expmap(f * gtsam.Pose3.Logmap(pa.between(pb)))))
-  return out
 
 
 def _anchor_pose_seed(
@@ -626,7 +263,7 @@ def _anchor_pose_seed(
   if not _enough_registered(len(cam_poses), n_keyframes):
     return None
   return body_poses_from_camera_poses(
-    _fill_camera_poses(cam_poses, n_keyframes), front_extrinsic
+    fill_camera_poses(cam_poses, n_keyframes), front_extrinsic
   )
 
 
@@ -642,8 +279,8 @@ def _anchor_metric_scale(
   for kf, sides in anchor_obs_per_kf.items():
     lens, cam_T_tag = _side_lens_and_pose(sides, front_lens, rear_lens)
     body_in_tag = lens.extrinsic.compose(cam_T_tag).inverse()
-    anc.append(_translation(body_in_tag))
-    vo.append(_translation(body_poses_unscaled[kf]))
+    anc.append(translation(body_in_tag))
+    vo.append(translation(body_poses_unscaled[kf]))
   if len(vo) < 3:
     return None
   vo_arr = np.asarray(vo, dtype=np.float64)
@@ -699,131 +336,20 @@ def _imu_and_initial_gravity(
   return imu, bias0, gravity_world_initial
 
 
-def _recover_gripper_tags(
-  args: TrackerArgs,
-  rear_tags_per_kf: list[list[TagDetection]],
-  rear_lens: LensSetup,
-  n_keyframes: int,
-  kf_rotations: list[Float64Array],
-  rear_tags_per_frame: list[list[TagDetection]] | None = None,
-  frame_times: Float64Array | None = None,
-) -> tuple[
-  gtsam.Pose3 | None,
-  dict[str, list[float]],
-  dict[str, FingerReproj],
-  dict[str, tuple[Float64Array, Float64Array]],
-]:
-  """Base-tag body pose and per-finger angles, reprojection inputs and frame angles."""
-  base_tag_obs = anchor_pose_from_tags(
-    rear_tags_per_kf,
-    tag_id=args.base_tag_id,
-    tag_size=args.gripper.tag_size,
-    params=rear_lens.params,
-    kf_rotations=kf_rotations,
-  )
-  body_T_base_tag: gtsam.Pose3 | None = None
-  if base_tag_obs:
-    body_T_base_tag = _mean_pose(
-      [rear_lens.extrinsic.compose(p) for p in base_tag_obs.values()]
-    )
-  if args.base_tag_id > 0 and body_T_base_tag is None:
-    raise ValueError(
-      f"base tag {args.base_tag_id} was configured but never detected in the rear "
-      f"lens across {n_keyframes} keyframes — its base-tag, finger, and cross-tracker "
-      f"factors would all be silently disabled. Wrong id, or the tag out of the "
-      f"rear-lens field of view?"
-    )
-
-  # URDF joints sit in the base frame; body_T_base_tag carries them to the body.
-  joints = read_revolute_joints(args.urdf_path) if args.urdf_path is not None else {}
-  joint_angles: dict[str, list[float]] = {}
-  finger_reproj: dict[str, FingerReproj] = {}
-  frame_angles: dict[str, tuple[Float64Array, Float64Array]] = {}
-  for joint_name, finger_id in (
-    ("left_finger", args.left_finger_tag_id),
-    ("right_finger", args.right_finger_tag_id),
-  ):
-    if finger_id <= 0:
-      continue
-    joint_angles[joint_name] = _finger_joint_angles_per_kf(
-      rear_tags_per_kf,
-      rear_lens,
-      base_tag_id=args.base_tag_id,
-      finger_tag_id=finger_id,
-      tag_size=args.gripper.tag_size,
-      n_keyframes=n_keyframes,
-      kf_rotations=kf_rotations,
-    )
-    if args.urdf_path is None:
-      continue
-    joint = joints.get(joint_name)
-    if joint is None or joint.joint_T_tag0 is None:
-      raise ValueError(
-        f"finger tag {finger_id} was configured for '{joint_name}', but "
-        f"{args.urdf_path} has no revolute joint '{joint_name}' carrying an "
-        f"AprilTag frame (revolute joints present: {sorted(joints)}). Wrong URDF?"
-      )
-    if body_T_base_tag is None:
-      continue
-    reproj = build_finger_reproj(
-      joint,
-      rear_tags_per_kf,
-      rear_lens,
-      finger_tag_id=finger_id,
-      body_T_base_tag=body_T_base_tag,
-      tag_size=args.gripper.tag_size,
-      n_keyframes=n_keyframes,
-    )
-    if reproj is None:
-      print(
-        f"  [warn] finger tag {finger_id} ({joint_name}) never detected in the "
-        f"rear lens; its angle stays PnP-only, unrefined by the bundle"
-      )
-    else:
-      finger_reproj[joint_name] = reproj
-    if rear_tags_per_frame is None or frame_times is None:
-      continue
-    indices, angles = frame_finger_angles(
-      joint,
-      rear_tags_per_frame,
-      rear_lens,
-      finger_tag_id=finger_id,
-      body_T_base_tag=body_T_base_tag,
-      tag_size=args.gripper.tag_size,
-    )
-    if len(indices):
-      frame_angles[joint_name] = (frame_times[indices], angles)
-  return body_T_base_tag, joint_angles, finger_reproj, frame_angles
-
-
-@dataclass
-class _LensChannel:
-  """One lens's prep state: tag detections in, surviving tracks and landmarks out."""
-
-  setup: LensSetup
-  tags: list[list[TagDetection]]
-  feature_frames: list[Frame] = field(default_factory=list)
-  kept: dict[int, dict[int, Float64Array]] = field(default_factory=dict)
-  rejected: dict[int, dict[int, Float64Array]] = field(default_factory=dict)
-  landmarks_prealign: dict[int, Float64Array] = field(default_factory=dict)
-  points: dict[int, Float64Array] = field(default_factory=dict)
-  tracks: dict[int, dict[int, Float64Array]] = field(default_factory=dict)
-
-
 def _seed_body_poses(
   name: str,
-  front: _LensChannel,
-  rear: _LensChannel,
+  front: _LensPrep,
+  rear: _LensPrep,
   n_keyframes: int,
   anchor_obs_per_kf: dict[int, dict[str, gtsam.Pose3]],
   cfg: FrontendCfg,
 ) -> tuple[list[gtsam.Pose3], bool]:
   """The pre-alignment body-pose seed and whether it came from the anchor."""
   sfm_cams, _ = incremental_sfm(
-    _bearings_by_track(front.kept, front.setup.params),
+    bearings_by_track(front.kept, front.setup.params),
     min_shared=cfg.init_min_shared_tracks,
   )
-  sfm_cams, vo_outliers = _reject_vo_pose_outliers(sfm_cams)
+  sfm_cams, vo_outliers = reject_vo_pose_outliers(sfm_cams)
   if vo_outliers:
     print(f"  [{name}] visual-odometry rejected {len(vo_outliers)} rotation-spike kfs")
   if _enough_registered(len(sfm_cams), n_keyframes, cfg.vo_min_registered_ratio):
@@ -831,7 +357,7 @@ def _seed_body_poses(
       f"  [{name}] visual-odometry init: registered "
       f"{len(sfm_cams)}/{n_keyframes} keyframes"
     )
-    filled = _fill_camera_poses(sfm_cams, n_keyframes)
+    filled = fill_camera_poses(sfm_cams, n_keyframes)
     return body_poses_from_camera_poses(filled, front.setup.extrinsic), False
 
   anchor_seed = _anchor_pose_seed(anchor_obs_per_kf, front.setup.extrinsic, n_keyframes)
@@ -905,9 +431,9 @@ def _align_visual_inertial(
 
   alignment = align(body_poses_prealign)
   if alignment.scale < 0.0:
-    origin = _translation(body_poses_prealign[0])
+    origin = translation(body_poses_prealign[0])
     body_poses_prealign = [
-      gtsam.Pose3(p.rotation(), gtsam.Point3(*(2.0 * origin - _translation(p))))
+      gtsam.Pose3(p.rotation(), gtsam.Point3(*(2.0 * origin - translation(p))))
       for p in body_poses_prealign
     ]
     alignment = align(body_poses_prealign)
@@ -978,7 +504,7 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
   grid_times = front_video.times[front_rows]
   rear_kf_rows = nearest_rows(rear_video.times, grid_times)
 
-  anchor_tag_ids = set(args.anchor.tag_ids)
+  anchor_tag_ids = set(args.anchor.enabled_tag_ids)
 
   def tag_masks(
     shape: tuple[int, int], tags_per_kf: list[list[TagDetection]]
@@ -986,7 +512,7 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
     """Per-keyframe rectangles over every non-anchor tag, empty with masking off."""
     if not args.frontend.mask_tags:
       return [[] for _ in tags_per_kf]
-    return _build_non_anchor_tag_masks(
+    return non_anchor_tag_masks(
       shape, tags_per_kf, anchor_tag_ids, args.frontend.mask_tag_pad
     )
 
@@ -1057,58 +583,46 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
     r_bl = lens.extrinsic.rotation().matrix()
     return [r_bl.T @ d.T @ r_bl for d in body_deltas]
 
-  front_kf_rotations = lens_kf_rotations(front_lens)
+  front = _LensPrep(side="front", setup=front_lens, tags=front_tags_per_kf)
+  rear = _LensPrep(
+    side="rear",
+    setup=rear_lens,
+    tags=rear_tags_per_kf,
+    # The rear frontend applies the rects, so a run without rear landmarks records none.
+    static_mask_rects=(
+      list(args.frontend.mask_rear_rects) if args.frontend.rear_landmarks else []
+    ),
+  )
   rear_kf_rotations = lens_kf_rotations(rear_lens)
-
   lens_sides = (
-    ("front", front_lens, front_tags_per_kf, front_kf_rotations),
-    ("rear", rear_lens, rear_tags_per_kf, rear_kf_rotations),
+    _LensSide(front, lens_kf_rotations(front_lens)),
+    _LensSide(rear, rear_kf_rotations),
   )
   obs_by_tag = {
     tag_id: _detect_anchor_obs(tag_id, args.anchor.tag_size, lens_sides)
     for tag_id in args.anchor.enabled_tag_ids
   }
-  prep_anchor_tag_id = _choose_prep_anchor(args.anchor.tag_ids, obs_by_tag)
+  prep_anchor_tag_id = _choose_prep_anchor(args.anchor.enabled_tag_ids, obs_by_tag)
   anchor_obs_per_kf: dict[int, dict[str, gtsam.Pose3]] = obs_by_tag.get(
     prep_anchor_tag_id, {}
   )
-  if prep_anchor_tag_id != args.anchor.tag_ids[0]:
-    n_ref = len(obs_by_tag.get(args.anchor.tag_ids[0], {}))
+  reference_tag_id = args.anchor.enabled_tag_ids[0]
+  if prep_anchor_tag_id != reference_tag_id:
+    n_ref = len(obs_by_tag.get(reference_tag_id, {}))
     print(
       f"  [{name}] prep reference anchor: tag {prep_anchor_tag_id} "
       f"({len(anchor_obs_per_kf)} sighted keyframes vs {n_ref} for "
-      f"tag {args.anchor.tag_ids[0]})"
+      f"tag {reference_tag_id})"
     )
-  for tag_id, obs in obs_by_tag.items():
-    _print_anchor_geometry(name, tag_id, lens_sides, obs)
 
-  front = _LensChannel(setup=front_lens, tags=front_tags_per_kf)
-  rear = _LensChannel(setup=rear_lens, tags=rear_tags_per_kf)
-  anchor_tag_ids = set(obs_by_tag)
-  # The rear frontend applies the rects, so a run without rear landmarks records none.
-  static_rects = (
-    list(args.frontend.mask_rear_rects) if args.frontend.rear_landmarks else []
-  )
-
-  def run_lens(
-    ch: _LensChannel,
-    video: LensVideo,
-    rows: npt.NDArray[np.int64],
-    blocked: list[Rect],
-  ) -> None:
+  def run_lens(ch: _LensPrep, video: LensVideo, rows: npt.NDArray[np.int64]) -> None:
     """Decode this lens, take what downstream needs from its pixels, then drop them."""
     frames = LensFrames(video, rows, band=_PREP_BAND)
     shape = frames[0].shape[:2]
-    masks = (
-      _build_non_anchor_tag_masks(
-        shape, ch.tags, anchor_tag_ids, args.frontend.mask_tag_pad
-      )
-      if args.frontend.mask_tags
-      else [[] for _ in ch.tags]
-    )
-    _apply_static_mask_rects(masks, blocked, shape)
-    ch.feature_frames, tracks = run_lens_frontend(
-      frames, ch.setup.params, args.frontend, masks=masks
+    masks = tag_masks(shape, ch.tags)
+    apply_static_mask_rects(masks, ch.static_mask_rects, shape)
+    ch.keypoints, tracks = run_lens_frontend(
+      frames, ch.setup.params, args.frontend, masks=masks, band=frames.band
     )
     ch.kept = {
       t: o for t, o in tracks.items() if len(o) >= args.frontend.min_track_length
@@ -1119,9 +633,9 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
       )
     release_freed_memory()
 
-  run_lens(front, front_video, front_rows, [])
+  run_lens(front, front_video, front_rows)
   if args.frontend.rear_landmarks:
-    run_lens(rear, rear_video, rear_kf_rows, static_rects)
+    run_lens(rear, rear_video, rear_kf_rows)
 
   body_poses_prealign, anchor_seed_used = _seed_body_poses(
     name, front, rear, n_keyframes, anchor_obs_per_kf, args.frontend
@@ -1167,20 +681,20 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
     if obs
   }
 
+  loop_tracks: dict[int, dict[int, Float64Array]] = {}
+  if anchor_obs_per_kf and args.frontend.loop_closure:
+    loop_tracks = loop_closure_tracks(
+      front_orb[:n_keyframes],
+      body_poses,
+      front_lens,
+      max(front.kept, default=0),
+      args.frontend,
+    )
+  # Nothing past loop closure reads the ORB frames, the descriptors' last holder.
+  front_orb.clear()
+  release_freed_memory()
+
   if anchor_obs_per_kf:
-    loop_tracks: dict[int, dict[int, Float64Array]] = {}
-    if args.frontend.loop_closure:
-      loop_tracks = _loop_closure_tracks(
-        front_orb[:n_keyframes],
-        body_poses,
-        front_lens,
-        max(front.kept, default=0),
-        args.frontend.loop_closure_max_dist,
-        args.frontend.loop_closure_min_kf_gap,
-        args.frontend.loop_n_neighbors,
-        args.frontend.loop_match_ratio,
-        args.frontend.loop_min_inliers,
-      )
     for ch in (front, rear):
       ch.points = triangulate_lens(
         {t: ch.kept[t] for t in ch.kept if t in ch.landmarks_prealign},
@@ -1190,19 +704,18 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
         args.frontend.min_track_length,
         max_landmark_depth=args.frontend.max_landmark_depth,
       )
-      ch.points = _cap_landmarks(
+      ch.points = cap_landmarks(
         ch.points, ch.kept, args.frontend.max_landmarks_per_lens
       )
     if loop_tracks:
       # Merge after the cap so the per-lens budget never culls the revisit landmarks.
-      _add_loop_landmarks(
+      add_loop_landmarks(
         front.points,
         front.kept,
         loop_tracks,
         body_poses,
         front_lens,
-        min_track_length=args.frontend.min_track_length,
-        max_landmark_depth=args.frontend.max_landmark_depth,
+        args.frontend,
         name=name,
         anchor_kfs=set(anchor_obs_per_kf)
         if args.frontend.anchored_loop_closure
@@ -1216,7 +729,7 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
 
   for ch in (front, rear):
     ch.tracks = {
-      t: _subsample_obs(ch.kept[t], args.frontend.max_obs_per_track)
+      t: subsample_obs(ch.kept[t], args.frontend.max_obs_per_track)
       for t in ch.points
       if t in ch.kept
     }
@@ -1226,7 +739,7 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
   biases = [bias0 for _ in range(n_keyframes)]
 
   body_T_base_tag, joint_angles, finger_reproj, finger_frame_angles = (
-    _recover_gripper_tags(
+    recover_gripper_tags(
       args,
       rear_tags_per_kf,
       rear_lens,
@@ -1243,28 +756,17 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
     velocities=velocities,
     biases=biases,
     preintegrated=pim,
-    front_lens=front_lens,
-    rear_lens=rear_lens,
-    front_tracks=front.tracks,
-    rear_tracks=rear.tracks,
-    front_points=front.points,
-    rear_points=rear.points,
+    front=front.channel(n_keyframes),
+    rear=rear.channel(n_keyframes),
     anchor_obs_by_tag=obs_by_tag,
     anchor_locals_by_tag=anchor_locals_by_tag,
     body_T_base_tag=body_T_base_tag,
     joint_angles=joint_angles,
     keyframe_times=keyframe_times,
     keyframe_rows=np.round(keyframe_times * fps).astype(np.int64),
-    front_keypoints=[f.keypoints for f in front.feature_frames][:n_keyframes],
-    rear_keypoints=[f.keypoints for f in rear.feature_frames][:n_keyframes],
-    front_tags_per_kf=front_tags_per_kf,
-    rear_tags_per_kf=rear_tags_per_kf,
-    front_rejected=front.rejected,
-    rear_rejected=rear.rejected,
-    rear_static_mask_rects=static_rects,
     finger_reproj=finger_reproj,
     left_finger_tag_id=args.left_finger_tag_id,
     right_finger_tag_id=args.right_finger_tag_id,
     imu=imu,
-    finger_frame_angles=finger_frame_angles or None,
+    finger_frame_angles=finger_frame_angles,
   )

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
-from typing import TypedDict
+from functools import partial
 
 import gtsam
 import numpy as np
@@ -19,6 +19,7 @@ from specialist.vi_ba.anchor_detection import (
   tag_half_angle,
 )
 from specialist.vi_ba.build import (
+  LensChannel,
   LensSetup,
   add_mei_base_tag_factor,
   add_mei_cross_finger_factor,
@@ -32,6 +33,7 @@ from specialist.vi_ba.build import (
 from specialist.vi_ba.configs import Args
 from specialist.vi_ba.single_tracker import PreparedTracker
 from specialist.vi_ba.symbols import LANDMARK_CHAR
+from specialist.vi_ba.urdf_joints import FINGER_JOINTS
 
 Float64Array = npt.NDArray[np.float64]
 
@@ -75,19 +77,6 @@ _CROSS_REPROJ_SIGMA = 3.0
 _MAX_KEYFRAMES_PER_TRACKER = 100_000
 _MAX_LANDMARKS_PER_TRACKER = 1_000_000
 
-# The URDF revolute joints, in finger-index order (0 = left, 1 = right).
-_FINGER_JOINTS = ("left_finger", "right_finger")
-
-
-class ViGraphKeyFns(TypedDict):
-  """Per-tracker key callables, keyed to ``build_vi_graph``'s parameters."""
-
-  pose_key_fn: Callable[[int], int]
-  velocity_key_fn: Callable[[int], int]
-  bias_key_fn: Callable[[int], int]
-  front_landmark_key_fn: Callable[[int], int]
-  rear_landmark_key_fn: Callable[[int], int]
-
 
 class TrackerKeys:
   """Collision-free GTSAM keys per tracker; anchor corners are constants, keyless."""
@@ -98,12 +87,12 @@ class TrackerKeys:
   ) -> None:
     if len(set(tracker_names)) != len(tracker_names):
       raise ValueError(f"tracker names must be unique: {list(tracker_names)}")
-    self._names: list[str] = list(tracker_names)
+    self._index = {name: i for i, name in enumerate(tracker_names)}
 
   def tracker_index(self, name: str) -> int:
-    if name not in self._names:
+    if name not in self._index:
       raise KeyError(f"unknown tracker {name!r}")
-    return self._names.index(name)
+    return self._index[name]
 
   def _kf_key(self, char: str, name: str, keyframe_idx: int) -> int:
     """Collision-free key for a per-keyframe variable in one tracker's slice."""
@@ -158,16 +147,6 @@ class TrackerKeys:
   def base_tag_key(self, name: str) -> int:
     """Key for the tracker's static base-tag pose in its body frame."""
     return int(gtsam.symbol(_BASE_TAG_CHAR, self.tracker_index(name)))
-
-  def vi_graph_kwargs(self, name: str) -> ViGraphKeyFns:
-    """Per-tracker key callables to pass to ``build_vi_graph``."""
-    return ViGraphKeyFns(
-      pose_key_fn=lambda i: self.pose_key(name, i),
-      velocity_key_fn=lambda i: self.velocity_key(name, i),
-      bias_key_fn=lambda i: self.bias_key(name, i),
-      front_landmark_key_fn=lambda i: self.front_landmark_key(name, i),
-      rear_landmark_key_fn=lambda i: self.rear_landmark_key(name, i),
-    )
 
 
 def _bfs_world_alignments(
@@ -226,8 +205,8 @@ def align_to_shared_world(
     align_t = np.asarray(align.translation(), dtype=np.float64)
     t.body_poses = [align.compose(p) for p in t.body_poses]
     t.velocities = [align_R @ v for v in t.velocities]
-    t.front_points = {tid: align_R @ p + align_t for tid, p in t.front_points.items()}
-    t.rear_points = {tid: align_R @ p + align_t for tid, p in t.rear_points.items()}
+    for ch in t.lenses:
+      ch.points = {tid: align_R @ p + align_t for tid, p in ch.points.items()}
   return world_T_anchor[anchor_tag_ids[0]]
 
 
@@ -256,7 +235,7 @@ def cross_tracker_observations(
     targets: dict[int, int | None] = {base_tag_ids[owner_idx]: None}
     finger_ids = (owner.left_finger_tag_id, owner.right_finger_tag_id)
     for idx, (name, finger_id) in enumerate(
-      zip(_FINGER_JOINTS, finger_ids, strict=True)
+      zip(FINGER_JOINTS, finger_ids, strict=True)
     ):
       if finger_id > 0 and name in owner.finger_reproj:
         targets[finger_id] = idx
@@ -264,18 +243,15 @@ def cross_tracker_observations(
       if observer is owner:
         continue
       n = min(observer.n_keyframes, owner.n_keyframes)
-      for lens, tags_per_kf in (
-        (observer.front_lens, observer.front_tags_per_kf),
-        (observer.rear_lens, observer.rear_tags_per_kf),
-      ):
+      for ch in observer.lenses:
         for kf in range(n):
-          for det in tags_per_kf[kf]:
+          for det in ch.tags[kf]:
             tag_id = int(det.tag_id)
             if tag_id not in targets:
               continue
             finger = targets[tag_id]
             if finger is None and (
-              estimate_camera_to_tag_pose(det.corners, base_tag_size, lens.params)
+              estimate_camera_to_tag_pose(det.corners, base_tag_size, ch.setup.params)
               is None
             ):
               continue  # base-tag PnP gate: drop degenerate / behind-camera
@@ -284,9 +260,9 @@ def cross_tracker_observations(
                 observer=observer.name,
                 owner=owner.name,
                 keyframe=kf,
-                lens=lens,
+                lens=ch.setup,
                 corners=det.corners,
-                bearing=tag_center_bearing(det, lens.params),
+                bearing=tag_center_bearing(det, ch.setup.params),
                 finger=finger,
               )
             )
@@ -310,18 +286,15 @@ def anchor_sightings(
   tracker: PreparedTracker,
   anchor_tag_id: int,
   max_half_angle: float,
-) -> list[tuple[LensSetup, int, TagDetection]]:
+) -> list[tuple[LensChannel, int, TagDetection]]:
   """Per-keyframe anchor-tag detections in both lenses, within ``max_half_angle``."""
   return [
-    (lens, kf, det)
-    for lens, tags_per_kf in (
-      (tracker.front_lens, tracker.front_tags_per_kf),
-      (tracker.rear_lens, tracker.rear_tags_per_kf),
-    )
-    for kf, dets in enumerate(tags_per_kf)
+    (ch, kf, det)
+    for ch in tracker.lenses
+    for kf, dets in enumerate(ch.tags)
     for det in dets
     if int(det.tag_id) == anchor_tag_id
-    and tag_half_angle(det, lens.params) <= max_half_angle
+    and tag_half_angle(det, ch.setup.params) <= max_half_angle
   ]
 
 
@@ -360,21 +333,18 @@ def _add_corner_factors_for_anchor(
   n_sightings = 0
   for t in trackers:
     obs = t.anchor_obs_by_tag.get(tag_id, {}) if pnp_bearings else {}
-    for lens, kf, det in anchor_sightings(t, tag_id, max_half_angle):
+    for ch, kf, det in anchor_sightings(t, tag_id, max_half_angle):
       n_sightings += 1
       pose_key = keys.pose_key(t.name, kf)
-      side = "front" if lens is t.front_lens else "rear"
-      bearing = _sighting_bearing(obs, kf, side, det, lens)
-      for j, (corner_xyz, pixel) in enumerate(
-        zip(corners_world, det.corners, strict=True)
-      ):
+      bearing = _sighting_bearing(obs, kf, ch.side, det, ch.setup)
+      for j, pixel in enumerate(det.corners):
         if corner_keys is not None:
           add_mei_factor(
-            graph, pose_key, corner_keys[j], pixel, corner_noise, lens, bearing
+            graph, pose_key, corner_keys[j], pixel, corner_noise, ch.setup, bearing
           )
         else:
           add_mei_world_point_factor(
-            graph, pose_key, pixel, corner_noise, lens, corner_xyz, bearing
+            graph, pose_key, pixel, corner_noise, ch.setup, corners_world[j], bearing
           )
   return n_sightings
 
@@ -393,17 +363,17 @@ def _add_vi_subgraphs(
       velocities=t.velocities,
       biases=t.biases,
       preintegrated=t.preintegrated,
-      front=t.front_lens,
-      front_tracks=t.front_tracks,
-      front_points=t.front_points,
-      rear=t.rear_lens,
-      rear_tracks=t.rear_tracks,
-      rear_points=t.rear_points,
+      front=t.front,
+      rear=t.rear,
       sigma=args.frontend.reproj_sigma,
       velocity_prior_sigma=args.solver.velocity_prior_sigma,
       graph=graph,
       values=values,
-      **keys.vi_graph_kwargs(t.name),
+      pose_key_fn=partial(keys.pose_key, t.name),
+      velocity_key_fn=partial(keys.velocity_key, t.name),
+      bias_key_fn=partial(keys.bias_key, t.name),
+      front_landmark_key_fn=partial(keys.front_landmark_key, t.name),
+      rear_landmark_key_fn=partial(keys.rear_landmark_key, t.name),
     )
 
 
@@ -476,41 +446,40 @@ def _add_gripper_factors(
   base_tag_factor_count = 0
   for t, base_tag_id in zip(trackers, args.base_tag_ids, strict=True):
     reprojs = {
-      idx: t.finger_reproj.get(joint) for idx, joint in enumerate(_FINGER_JOINTS)
+      idx: reproj
+      for idx, joint in enumerate(FINGER_JOINTS)
+      if (reproj := t.finger_reproj.get(joint)) is not None
     }
-    has_fingers = any(r is not None for r in reprojs.values())
-    if t.body_T_base_tag is None or (not has_fingers and base_tag_id <= 0):
+    if t.body_T_base_tag is None or (not reprojs and base_tag_id <= 0):
       continue
     bt_key = keys.base_tag_key(t.name)
     values.insert(bt_key, t.body_T_base_tag)
     graph.add(gtsam.PriorFactorPose3(bt_key, t.body_T_base_tag, base_tag_prior_noise))
     # Base-tag corners reproject through body_T_base_tag into this tracker's rear lens.
     if base_tag_id > 0:
-      for dets in t.rear_tags_per_kf:
+      for dets in t.rear.tags:
         det = next((d for d in dets if int(d.tag_id) == base_tag_id), None)
         if det is None:
           continue
-        bearing = tag_center_bearing(det, t.rear_lens.params)
+        bearing = tag_center_bearing(det, t.rear.setup.params)
         for j in range(4):
           add_mei_base_tag_factor(
             graph,
             bt_key,
             det.corners[j],
             base_tag_noise,
-            t.rear_lens,
+            t.rear.setup,
             base_tag_corners[j],
             bearing,
           )
           base_tag_factor_count += 1
-    both_fingers = reprojs[0] is not None and reprojs[1] is not None
-    observed_kf = sorted(
-      {kf for r in reprojs.values() if r is not None for kf in r.observations}
-    )
+    both_fingers = len(reprojs) == 2
+    observed_kf = sorted({kf for r in reprojs.values() for kf in r.observations})
     for kf in observed_kf:
       seen_seed: dict[int, float] = {}
       for finger_idx, reproj in reprojs.items():
-        obs = None if reproj is None else reproj.observations.get(kf)
-        if reproj is None or obs is None:
+        obs = reproj.observations.get(kf)
+        if obs is None:
           continue
         tkey = keys.theta_key(t.name, finger_idx, kf)
         values.insert(tkey, float(obs.theta_seed))
@@ -521,7 +490,7 @@ def _add_gripper_factors(
             bt_key,
             obs.pixels[j],
             finger_noise,
-            t.rear_lens,
+            t.rear.setup,
             reproj.base_T_joint,
             reproj.corners_in_pivot[j],
             obs.obs_bearing,
@@ -578,7 +547,7 @@ def _add_cross_tracker_factors(
     elif values.exists(
       keys.theta_key(sighting.owner, sighting.finger, sighting.keyframe)
     ):
-      finger_name = _FINGER_JOINTS[sighting.finger]
+      finger_name = FINGER_JOINTS[sighting.finger]
       reproj = tracker_by_name[sighting.owner].finger_reproj[finger_name]
       theta_key = keys.theta_key(sighting.owner, sighting.finger, sighting.keyframe)
       for j in range(4):

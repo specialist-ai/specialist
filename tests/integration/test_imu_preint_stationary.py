@@ -10,7 +10,6 @@ import numpy as np
 
 from specialist.vi_ba.imu import (
   ImuSamples,
-  from_deg_per_s,
   integrate_samples,
   make_preintegration_params,
 )
@@ -31,7 +30,7 @@ def _load_fixture() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
 
 def test_stationary_orientation_drift_within_budget() -> None:
   t, gyro_deg, accel = _load_fixture()
-  samples = from_deg_per_s(t, gyro_deg, accel)
+  samples = ImuSamples(t=t, gyro=np.deg2rad(gyro_deg), accel=accel)
   assert len(samples) > 20_000  # 1 kHz × 30 s minus small head/tail
 
   # The camera sat with body +y up; the world frame puts gravity along −y.

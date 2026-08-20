@@ -25,8 +25,8 @@ def read_lens_grays(
   """Grey frames and fps of ``video_path`` or, for ``rear``, its ``_10_`` sibling."""
   if lens not in ("front", "rear"):
     raise ValueError(f"lens must be 'front' or 'rear', got {lens!r}")
-  rear_path, fps, _ = probe_capture(video_path)
-  path = video_path if lens == "front" else rear_path
+  capture = probe_capture(video_path)
+  path = video_path if lens == "front" else capture.rear_path
   cap = cv2.VideoCapture(str(path))
   if not cap.isOpened():
     raise RuntimeError(f"OpenCV failed to open {path}")
@@ -39,7 +39,7 @@ def read_lens_grays(
       grays.append(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.uint8))
   finally:
     cap.release()
-  return grays, fps
+  return grays, capture.fps
 
 
 def verdict(problems: Sequence[str]) -> str:

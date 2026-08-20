@@ -23,7 +23,6 @@ __all__ = [
   "GRAVITY_WORLD",
   "ImuSamples",
   "find_stationary_windows",
-  "from_deg_per_s",
   "integrate_samples",
   "keyframe_delta_rotations",
   "make_preintegration_params",
@@ -43,19 +42,6 @@ class ImuSamples:
 
   def __len__(self) -> int:
     return int(self.t.shape[0])
-
-
-def from_deg_per_s(
-  t: Float64Array,
-  gyro_deg: Float64Array,
-  accel: Float64Array,
-) -> ImuSamples:
-  """Build an ``ImuSamples`` from raw parse_insv output (gyro is in deg/s)."""
-  return ImuSamples(
-    t=np.asarray(t, dtype=np.float64),
-    gyro=np.deg2rad(np.asarray(gyro_deg, dtype=np.float64)),
-    accel=np.asarray(accel, dtype=np.float64),
-  )
 
 
 def stationary_mask(

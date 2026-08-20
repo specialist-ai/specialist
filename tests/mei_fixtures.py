@@ -7,7 +7,7 @@ import numpy as np
 import numpy.typing as npt
 
 from specialist.loader.mei_model import MeiParams, mei_project
-from specialist.vi_ba.build import LensSetup, build_vi_graph
+from specialist.vi_ba.build import LensChannel, LensSetup, build_vi_graph
 
 
 def pinhole_mei_params() -> MeiParams:
@@ -78,12 +78,10 @@ def front_only_graph(
   return build_vi_graph(
     body_poses=body_poses,
     preintegrated=None,
-    front=front,
-    front_tracks=front_tracks,
-    front_points=front_points,
-    rear=front,
-    rear_tracks={},
-    rear_points={},
+    front=LensChannel(
+      side="front", setup=front, tracks=front_tracks, points=front_points
+    ),
+    rear=LensChannel(side="rear", setup=front),
     sigma=1.0,
     weak_pose_sigmas=(0.3,) * 6,
     anchor_last_pose=True,

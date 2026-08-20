@@ -6,7 +6,7 @@ import cv2
 import numpy as np
 import pytest
 
-from specialist.loader.capture import capture_duration, probe_capture
+from specialist.loader.capture import probe_capture
 
 
 def _write_video(path: Path, n_frames: int, width: int, height: int) -> None:
@@ -25,10 +25,10 @@ def test_probe_capture_returns_sibling_and_container_fps(tmp_path: Path) -> None
   rear = tmp_path / "VID_x_10_001.mp4"
   _write_video(front, n_frames=4, width=64, height=64)
   _write_video(rear, n_frames=4, width=64, height=64)
-  rear_path, fps, native_width = probe_capture(front)
-  assert rear_path == rear
-  assert fps == pytest.approx(30.0)
-  assert native_width == 64
+  capture = probe_capture(front)
+  assert capture.rear_path == rear
+  assert capture.fps == pytest.approx(30.0)
+  assert capture.width == 64
 
 
 def test_probe_capture_square_without_sibling_raises(tmp_path: Path) -> None:
@@ -52,4 +52,4 @@ def test_capture_duration_bounded_by_shorter_lens_file(tmp_path: Path) -> None:
   rear = tmp_path / "VID_x_10_001.mp4"
   _write_video(front, n_frames=13, width=64, height=64)
   _write_video(rear, n_frames=12, width=64, height=64)
-  assert capture_duration(front) == pytest.approx(12 / 30.0)
+  assert probe_capture(front).duration == pytest.approx(12 / 30.0)

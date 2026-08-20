@@ -16,6 +16,7 @@ __all__ = [
   "GpuMode",
   "GripperCfg",
   "SolverCfg",
+  "TrackerArgs",
   "validate",
 ]
 
@@ -33,9 +34,6 @@ class FrontendCfg:
   flow_scale: float = 0.25
 
   min_track_length: int = 3
-  loop_n_neighbors: int = 8
-  loop_match_ratio: float = 0.8
-  loop_min_inliers: int = 10
   # Bearing half-angle (rad) past which the essential-matrix RANSAC drops a match.
   feature_max_half_angle: float = float(np.deg2rad(70.0))
 
@@ -57,8 +55,6 @@ class FrontendCfg:
   # Re-match ORB features between nearby non-adjacent keyframes to rejoin broken tracks.
   loop_closure: bool = True
 
-  loop_closure_max_dist: float = 0.1
-  loop_closure_min_kf_gap: int = 15
   # Triangulate the revisit loop landmarks from the anchor-covisible views alone.
   anchored_loop_closure: bool = True
   # Cap on triangulated landmarks per lens, keeping the longest tracks.
@@ -108,6 +104,25 @@ class SolverCfg:
 
 
 @dataclass
+class TrackerArgs:
+  """One tracker's ``prepare_tracker`` configuration."""
+
+  base_rrd: Path
+  tracker: str  # this tracker's entity name inside the base recording
+  base_tag_id: int
+  anchor: AnchorCfg
+  keyframe_every: int  # 0 = auto (round(fps/10))
+  urdf_path: Path | None  # gripper URDF for finger joint kinematics
+  # 0 disables the corresponding URDF revolute joint angle recovery.
+  left_finger_tag_id: int
+  right_finger_tag_id: int
+  frontend: FrontendCfg
+  gripper: GripperCfg
+  # Set when siblings prepare concurrently; gates per-thread AprilTag detectors.
+  parallel_siblings: bool = False
+
+
+@dataclass
 class Args:
   """One run; the base recording carries the session id, window and tracker names."""
 
@@ -121,6 +136,7 @@ class Args:
   open_viewer: bool = True
   # Replace this session's existing estimate and viz layers; off refuses.
   overwrite: bool = False
+
   # One id per tracker; cross-tracker disambiguation needs distinct ids.
   base_tag_ids: tuple[int, ...] = ()
   # Per-tracker finger tag ids; 0 disables that tracker's finger.

@@ -8,7 +8,6 @@ import numpy as np
 from specialist.vi_ba.imu import (
   ImuSamples,
   find_stationary_windows,
-  from_deg_per_s,
   integrate_samples,
   make_preintegration_params,
   preintegrate_between_keyframes,
@@ -18,14 +17,6 @@ from specialist.vi_ba.imu import (
 
 _GRAVITY = np.array([0.0, 0.0, -9.81], dtype=np.float64)
 _ZERO_BIAS = gtsam.imuBias.ConstantBias(np.zeros(3), np.zeros(3))
-
-
-def test_from_deg_per_s_converts_units() -> None:
-  t = np.array([0.0, 1e-3, 2e-3])
-  g = np.array([[0.0, 0.0, 180.0], [0.0, 0.0, 180.0], [0.0, 0.0, 180.0]])
-  a = np.zeros((3, 3))
-  samples = from_deg_per_s(t, g, a)
-  assert np.allclose(samples.gyro[:, 2], math.pi, atol=1e-10)
 
 
 def test_zero_motion_preintegration_yields_identity_rotation() -> None:
