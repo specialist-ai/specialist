@@ -287,8 +287,8 @@ def recover_gripper_tags(
     )
     if reproj is None:
       print(
-        f"  [warn] finger tag {finger_id} ({joint_name}) never detected in the "
-        f"rear lens; its angle stays PnP-only, unrefined by the bundle"
+        f"  [warn] [gripper] finger tag {finger_id} ({joint_name}) never detected "
+        f"in the rear lens; its angle stays PnP-only, unrefined by the bundle"
       )
     else:
       finger_reproj[joint_name] = reproj

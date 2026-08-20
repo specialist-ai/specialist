@@ -7,6 +7,7 @@ Usage:
 
 from __future__ import annotations
 
+import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -55,6 +56,7 @@ class Args:
 
 
 def main(args: Args) -> None:
+  sys.stdout.reconfigure(line_buffering=True)  # type: ignore[union-attr]
   names = (
     list(args.tracker_names)
     if args.tracker_names

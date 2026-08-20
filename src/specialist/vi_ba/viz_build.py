@@ -224,7 +224,7 @@ def _build_tracker_outputs(
   )
   rear_note = f" rear_rmse={rear_rmse:.2f}px" if np.isfinite(rear_rmse) else ""
   print(
-    f"  {tracker.name}: kf={tracker.n_keyframes} bbox={bbox_diagonal:.3f} m "
+    f"  [{tracker.name}/viz] kf={tracker.n_keyframes} bbox={bbox_diagonal:.3f} m "
     f"front_rmse={front_rmse:.2f}px{rear_note}"
   )
   if tracker.body_T_base_tag is not None:
