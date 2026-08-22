@@ -83,8 +83,8 @@ class FrontendCfg:
 
 @dataclass
 class AnchorCfg:
-  # Static wall-tag ids. The first is the reference anchor that pins the world
-  # gauge; the rest ground trackers that co-sight them.
+  # Static wall-tag ids. Every one is a pose the bundle solves for; the first
+  # additionally names the world frame.
   tag_ids: tuple[int, ...]
 
   tag_size: float = 0.1
@@ -92,12 +92,6 @@ class AnchorCfg:
   # The anchor enters the bundle by reprojecting the tag's four known-metric
   # corners (a fixed-spacing calibration target), which pins absolute scale.
   corner_reproj_sigma: float = 1.5
-  # Co-optimize each secondary anchor's corners as landmark points held near
-  # the seed by a loose prior.
-  free_secondary: bool = True
-
-  # Sigma (m) of the loose prior holding each freed corner near its seed.
-  secondary_corner_prior_sigma: float = 0.05
   # Drop anchor sightings past this bearing half-angle (rad); the fisheye
   # calibration is least constrained at the extreme edge.
   max_half_angle: float = float(np.deg2rad(75.0))

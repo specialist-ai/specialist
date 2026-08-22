@@ -1,19 +1,15 @@
 """VI-BA driver for any number of trackers (N ≥ 1).
 
-Reads one session's base recording (already audio-synced and window-trimmed
-by ``scripts/convert.py``), runs the per-tracker prep (decode → frontend →
-anchor PnP → VI alignment), aligns every tracker into the reference anchor's
-world (through any co-sighted anchor), allocates collision-free GTSAM keys
-via ``TrackerKeys``, builds one VI subgraph per tracker, then adds:
+Reads one session's base recording, runs the per-tracker prep (decode →
+frontend → anchor PnP → VI alignment), aligns every tracker into the reference
+anchor's world, and solves one joint bundle over:
 
-- Anchor obs: reprojecting the reference anchor tag's four metric corners
-  pins the trajectory's absolute scale; each additional static anchor is
-  corner-reprojected from every sighting at a world pose seeded from the
-  prep and re-estimated after the solve as a consistency check.
-- Base + finger tags: each tracker's base and finger tags reproject through one
-  shared base-tag pose variable, recovering the finger joint angles.
-- Cross-tracker obs (N ≥ 2): when tracker O sees tracker W's base tag,
-  reprojecting its corners through O's pose, W's pose, and W's base-tag pose
+- Anchor observations: every static anchor is a pose variable seeded from the
+  prep; the known tag size pins absolute scale and the reference carries the
+  datum.
+- Base + finger tags: each tracker's tags reproject through one shared
+  base-tag pose variable, recovering the finger joint angles.
+- Cross-tracker observations (N ≥ 2): tracker O sighting tracker W's base tag
   ties the two trajectories.
 """
 
@@ -213,14 +209,14 @@ def main(args: Args) -> None:
 
   estimate = build_run_estimate(trackers, solve, keys, args, cross_obs, joints)
 
-  worst_move_translation, worst_move_rotation = solve.worst_secondary_move
+  worst_move_translation, worst_move_rotation = solve.worst_anchor_move
   summary = Summary(
     cross_camera_obs=len(cross_obs),
     initial_graph_error=solve.result.initial_error,
     final_graph_error=solve.result.final_error,
     solver_iterations=solve.result.iterations,
-    secondary_anchor_move_translation=worst_move_translation,
-    secondary_anchor_move_rotation=worst_move_rotation,
+    anchor_move_translation=worst_move_translation,
+    anchor_move_rotation=worst_move_rotation,
   )
   _print_capture_diagnostics(trackers, solve.body_poses)
 

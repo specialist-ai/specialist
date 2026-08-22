@@ -1,11 +1,8 @@
-"""Solve the joint VI-BA graph and pick the reference anchor.
+"""Solve the joint VI-BA graph.
 
-``specialist.vi_ba.compose`` builds the graph for one fixed reference anchor;
-this module owns what sits above that: solving it with a landmark
-cull-reoptimize pass, re-estimating each secondary anchor from the solved
-poses as a consistency check, and — when more than one anchor is configured —
-retrying that whole solve once per candidate reference so the exported
-geometry does not depend on the configured tag-id order.
+``specialist.vi_ba.compose`` builds the graph; this module owns what sits above
+it: solving with a landmark cull-reoptimize pass, and reading the solved
+anchors and body poses back out for export.
 """
 
 from __future__ import annotations
@@ -14,7 +11,6 @@ from dataclasses import dataclass, replace
 
 import gtsam
 import numpy as np
-from specialist_corpus.fiducials import tag_corners_in_frame
 
 from specialist.vi_ba.compose import (
   CrossSighting,
@@ -25,7 +21,6 @@ from specialist.vi_ba.compose import (
   points_from_values,
 )
 from specialist.vi_ba.configs import Args, GpuMode
-from specialist.vi_ba.geometry import average_pose
 from specialist.vi_ba.landmark_cull import cull_outlier_landmarks
 from specialist.vi_ba.optimize import OptimizeResult, optimize_graph
 from specialist.vi_ba.single_tracker import PreparedTracker
@@ -36,11 +31,6 @@ __all__ = [
   "adopt_ba_refined_estimates",
   "solve_joint",
 ]
-
-# Within-take consistency thresholds: the post-solve anchor re-estimate should
-# agree with the pinned seed; larger motion flags weak sighting geometry.
-_ANCHOR_CONSISTENCY_TRANS = 5e-3
-_ANCHOR_CONSISTENCY_ROT = float(np.radians(0.2))
 
 # The first solve only ranks residuals for the cull.
 _PRECULL_MAX_ITERATIONS = 8
@@ -138,47 +128,6 @@ def _solve_with_cull_reoptimize(
   return result, landmark_keep
 
 
-def _secondary_anchor_seed(
-  trackers: list[PreparedTracker],
-  tag_id: int,
-  body_poses_by_tracker: dict[str, list[gtsam.Pose3]],
-) -> gtsam.Pose3 | None:
-  """Median of ``world_T_body(kf) ∘ body_T_lens ∘ cam_T_tag`` over every PnP
-  sighting, both lenses, against the poses in ``body_poses_by_tracker``.
-  Seeding from sightings keeps the pose in front of its observers, so the
-  behind-camera guard stays inactive. ``None`` when unsighted."""
-  candidates: list[gtsam.Pose3] = []
-  for t in trackers:
-    poses = body_poses_by_tracker[t.name]
-    obs = t.anchor_obs_by_tag.get(tag_id, {})
-    for kf in sorted(obs):
-      sides = obs[kf]
-      for ch in t.lenses:
-        cam_T_tag = sides.get(ch.side)
-        if cam_T_tag is None:
-          continue
-        candidates.append(poses[kf].compose(ch.setup.extrinsic).compose(cam_T_tag))
-  if not candidates:
-    return None
-  return average_pose(candidates)
-
-
-def _seed_secondary_anchors(
-  trackers: list[PreparedTracker], args: Args
-) -> dict[int, gtsam.Pose3]:
-  """Initial world pose per sighted non-global anchor, from the BFS-aligned prep
-  poses (the reference pins the gauge separately). Unsighted ids are skipped."""
-  prep_poses = {t.name: t.body_poses for t in trackers}
-  world: dict[int, gtsam.Pose3] = {}
-  for tag_id in args.anchor.enabled_tag_ids[1:]:
-    seed = _secondary_anchor_seed(trackers, tag_id, prep_poses)
-    if seed is None:
-      print(f"[anchor] tag {tag_id}: no PnP sighting; skipped")
-      continue
-    world[tag_id] = seed
-  return world
-
-
 def _solved_body_poses(
   trackers: list[PreparedTracker], keys: TrackerKeys, values: gtsam.Values
 ) -> dict[str, list[gtsam.Pose3]]:
@@ -189,43 +138,36 @@ def _solved_body_poses(
   }
 
 
-def _secondary_pose_move(
-  pinned: gtsam.Pose3, estimate: gtsam.Pose3
-) -> tuple[float, float]:
-  """Translation (m) and rotation (rad) separating ``pinned`` from ``estimate``."""
+def _anchor_pose_move(seed: gtsam.Pose3, estimate: gtsam.Pose3) -> tuple[float, float]:
+  """Translation (m) and rotation (rad) separating ``seed`` from ``estimate``."""
   dt = float(
-    np.linalg.norm(
-      np.asarray(estimate.translation()) - np.asarray(pinned.translation())
-    )
+    np.linalg.norm(np.asarray(estimate.translation()) - np.asarray(seed.translation()))
   )
   dr = float(
-    np.linalg.norm(gtsam.Rot3.Logmap(pinned.rotation().between(estimate.rotation())))
+    np.linalg.norm(gtsam.Rot3.Logmap(seed.rotation().between(estimate.rotation())))
   )
   return dt, dr
 
 
 @dataclass
 class ReferenceSolve:
-  """Everything the export needs from one reference's joint solve, kept so the
-  selected candidate is reused without re-solving."""
+  """Everything the export needs from the joint solve."""
 
   ref_tag_id: int
-  world_T_ref_anchor: gtsam.Pose3
   result: OptimizeResult
   landmark_keep: LandmarkKeep
-  secondary_anchor_world: dict[int, gtsam.Pose3]
+  anchor_world: dict[int, gtsam.Pose3]
   body_poses: dict[str, list[gtsam.Pose3]]
-  # Per secondary anchor, how far its post-solve re-estimate moved off its seed
-  # (metres, radians): the sighting-geometry consistency check.
-  secondary_moves: dict[int, tuple[float, float]]
+  # Per anchor, how far the solve moved it off its seed (metres, radians).
+  anchor_moves: dict[int, tuple[float, float]]
 
   @property
-  def worst_secondary_move(self) -> tuple[float, float]:
-    """The largest translation and rotation any secondary anchor moved, NaN
-    when the take has no secondary."""
-    if not self.secondary_moves:
+  def worst_anchor_move(self) -> tuple[float, float]:
+    """The largest translation and rotation any anchor moved off its seed,
+    over the anchors the datum does not hold."""
+    moves = [m for tag, m in self.anchor_moves.items() if tag != self.ref_tag_id]
+    if not moves:
       return float("nan"), float("nan")
-    moves = self.secondary_moves.values()
     return max(dt for dt, _ in moves), max(dr for _, dr in moves)
 
 
@@ -234,51 +176,29 @@ def _solve_joint_graph(
   keys: TrackerKeys,
   args: Args,
   cross_obs: list[CrossSighting],
-  world_T_ref_anchor: gtsam.Pose3,
+  anchor_seed: dict[int, gtsam.Pose3],
 ) -> ReferenceSolve:
-  """Solve the joint graph with the reference anchor pinned at ``world_T_ref_anchor``
-  and resolve every secondary anchor's world pose.
-
-  Solves once with the secondaries pinned at their prep-composed seeds, then
-  re-estimates each from the solved poses. The solve carries the re-estimates,
-  which are what gets exported, and how far each moved off its seed — the
-  consistency signal the run summary records."""
-  seed = _seed_secondary_anchors(trackers, args)
-  graph, values = assemble_joint_graph(
-    trackers,
-    keys,
-    args,
-    cross_obs,
-    tag_corners_in_frame(world_T_ref_anchor.matrix(), args.anchor.tag_size),
-    seed,
-  )
+  """Solve the joint graph and read every anchor's world pose back out of it."""
+  graph, values = assemble_joint_graph(trackers, keys, args, cross_obs, anchor_seed)
   result, landmark_keep = _solve_with_cull_reoptimize(
     graph, values, trackers, keys, args.solver.max_iterations, args.solver.gpu
   )
 
-  solved_poses = _solved_body_poses(trackers, keys, result.values)
-  resolved: dict[int, gtsam.Pose3] = {}
+  solved: dict[int, gtsam.Pose3] = {}
   moves: dict[int, tuple[float, float]] = {}
-  for tag_id in seed:
-    estimate = _secondary_anchor_seed(trackers, tag_id, solved_poses)
-    assert estimate is not None  # seeding required a sighting; obs never shrink
-    dt, dr = _secondary_pose_move(seed[tag_id], estimate)
-    print(
-      f"  [anchor] secondary anchor {tag_id}: post-solve re-estimate moved "
-      f"{dt * 1000:.1f}mm / {np.degrees(dr):.2f}deg"
-    )
-    if dt > _ANCHOR_CONSISTENCY_TRANS or dr > _ANCHOR_CONSISTENCY_ROT:
-      print(f"  [warn] [anchor] tag {tag_id} sighting geometry is weak this take")
-    resolved[tag_id] = estimate
+  for tag_id, seed in anchor_seed.items():
+    estimate = result.values.atPose3(keys.anchor_key(tag_id))
+    dt, dr = _anchor_pose_move(seed, estimate)
+    print(f"  [anchor] tag {tag_id} moved {dt * 1000:.1f}mm / {np.degrees(dr):.2f}deg")
+    solved[tag_id] = estimate
     moves[tag_id] = (dt, dr)
   return ReferenceSolve(
     ref_tag_id=int(args.anchor.enabled_tag_ids[0]),
-    world_T_ref_anchor=world_T_ref_anchor,
     result=result,
     landmark_keep=landmark_keep,
-    secondary_anchor_world=resolved,
-    body_poses=solved_poses,
-    secondary_moves=moves,
+    anchor_world=solved,
+    body_poses=_solved_body_poses(trackers, keys, result.values),
+    anchor_moves=moves,
   )
 
 
@@ -288,10 +208,10 @@ def solve_joint(
   args: Args,
   cross_obs: list[CrossSighting],
 ) -> ReferenceSolve:
-  """Solve the joint graph, with the first enabled tag pinning the world, and
+  """Solve the joint graph, with the first enabled tag naming the world, and
   return the solution to export."""
-  world_T_ref_anchor = align_to_shared_world(trackers, args.anchor.enabled_tag_ids)
-  return _solve_joint_graph(trackers, keys, args, cross_obs, world_T_ref_anchor)
+  seed = align_to_shared_world(trackers, args.anchor.enabled_tag_ids)
+  return _solve_joint_graph(trackers, keys, args, cross_obs, seed)
 
 
 def adopt_ba_refined_estimates(

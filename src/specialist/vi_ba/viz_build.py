@@ -345,14 +345,9 @@ def build_run_estimate(
   cross_obs: list[CrossSighting],
   urdf_joints: dict[str, RevoluteJoint],
 ) -> RunEstimate:
-  """Build every per-camera payload from one solved joint graph. The
-  reference anchor pins the world gauge; each secondary carries the re-estimate
-  that pinned the solve. Every timestamp stays on the session clock the base
-  recording defines."""
-  anchor_poses_world = {
-    solve.ref_tag_id: solve.world_T_ref_anchor,
-    **solve.secondary_anchor_world,
-  }
+  """Build every per-camera payload from one solved joint graph. Every timestamp
+  is on the session clock the base recording defines."""
+  anchor_poses_world = solve.anchor_world
   anchor_corners_by_tag = {
     tag_id: tag_corners_in_frame(pose.matrix(), args.anchor.tag_size)
     for tag_id, pose in anchor_poses_world.items()

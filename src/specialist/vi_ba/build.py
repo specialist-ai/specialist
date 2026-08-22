@@ -1,8 +1,7 @@
 """Assemble a dual-lens VI-BA ``NonlinearFactorGraph``: one ``Pose3`` per
 keyframe, one ``Point3`` per triangulated landmark (front/rear in disjoint
-namespaces), one MEI projection factor per observation. Consecutive
-keyframes are tied by IMU preintegration factors, with the gauge pinned by
-a tight prior on the first keyframe pose."""
+namespaces), one MEI projection factor per observation, and IMU
+preintegration factors between consecutive keyframes."""
 
 from __future__ import annotations
 
@@ -19,15 +18,15 @@ from specialist.vi_ba.anchor_detection import TagDetection
 from specialist.vi_ba.features import Rect
 
 try:
-  # Native C++ MEI reprojection factors (pose+point, base-tag, finger, and
-  # cross-tracker base + finger variants).
+  # Native C++ MEI reprojection factors (pose+point, anchor, base-tag, finger,
+  # and cross-tracker base + finger variants).
   from specialist.vi_ba._mei_factor_cpp import (
+    make_mei_anchor_tag_factor_cpp,
     make_mei_base_tag_factor_cpp,
     make_mei_cross_finger_factor_cpp,
     make_mei_cross_tag_factor_cpp,
     make_mei_factor_cpp,
     make_mei_finger_factor_cpp,
-    make_mei_world_point_factor_cpp,
   )
 except ImportError as _exc:  # pragma: no cover - extension is built by uv sync
   raise ImportError(
@@ -46,11 +45,11 @@ __all__ = [
   "add_mei_factor",
   "LensChannel",
   "LensSetup",
+  "add_mei_anchor_tag_factor",
   "add_mei_base_tag_factor",
   "add_mei_cross_finger_factor",
   "add_mei_cross_tag_factor",
   "add_mei_finger_factor",
-  "add_mei_world_point_factor",
   "build_vi_graph",
   "huber_pixel_noise",
 ]
@@ -66,11 +65,6 @@ def _as_vec3(v: Float64Array) -> Float64Array:
 
 def _as_point3(v: Float64Array) -> gtsam.Point3:
   return gtsam.Point3(*np.asarray(v, dtype=np.float64).reshape(3))
-
-
-def _gauge_noise() -> gtsam.noiseModel.Base:
-  """Tight gauge prior (σ=1e-4 on all six pose DoF) that pins the frame."""
-  return gtsam.noiseModel.Diagonal.Sigmas(np.full(6, 1e-4, dtype=np.float64))
 
 
 def _mei_intrinsics(params: MeiParams) -> tuple[float, ...]:
@@ -103,7 +97,7 @@ class LensChannel:
   per-keyframe tag detections and keypoints, and the surviving tracks with the
   landmarks they triangulate to."""
 
-  side: schema.Side  # the key anchor observations come back under
+  side: schema.Side
   setup: LensSetup
   tags: list[list[TagDetection]] = field(default_factory=list)
   keypoints: list[Float64Array] = field(default_factory=list)
@@ -149,26 +143,27 @@ def add_mei_factor(
   )
 
 
-def add_mei_world_point_factor(
+def add_mei_anchor_tag_factor(
   graph: gtsam.NonlinearFactorGraph,
   pose_key: int,
+  anchor_key: int,
   pixel: Float64Array,
   noise: gtsam.noiseModel.Base,
   lens: LensSetup,
-  p_world: Float64Array,
+  corner: Float64Array,
   obs_bearing: Float64Array,
 ) -> None:
-  """Push one native MEI reprojection factor, unary on the observing pose: the
-  world point ``p_world`` is a constant (an anchor tag corner), so it
-  reprojects as ``pose⁻¹ · p_world`` through ``lens`` onto ``pixel``.
-  ``obs_bearing`` is the lens-frame tag direction for the cheirality guard."""
+  """Push one native MEI reprojection factor, binary on the observing pose and
+  the anchor's world pose: the tag-frame ``corner`` reprojects as
+  ``pose⁻¹ · anchor · corner`` through ``lens`` onto ``pixel``."""
   graph.push_back(
-    make_mei_world_point_factor_cpp(
+    make_mei_anchor_tag_factor_cpp(
       pose_key,
+      anchor_key,
       _as_pixel(pixel),
       noise,
       lens.extrinsic,
-      _as_point3(p_world),
+      _as_point3(corner),
       *_mei_intrinsics(lens.params),
       _as_vec3(obs_bearing),
     )
@@ -336,8 +331,8 @@ def build_vi_graph(
 ) -> tuple[gtsam.NonlinearFactorGraph, gtsam.Values]:
   """Dual-lens visual-inertial graph: MEI projection factors plus
   ``preintegrated[i]`` covering ``(t_i, t_{i+1}]`` between consecutive
-  keyframes. Gauge is fixed by a tight prior on ``X(0)`` plus Gaussian
-  priors on ``V(0)`` / ``B(0)``."""
+  keyframes, with Gaussian priors on ``V(0)`` / ``B(0)`` and no pose gauge;
+  the caller grounds the poses."""
   n = len(body_poses)
   if n < 2:
     raise ValueError("build_vi_graph needs at least two keyframes")
@@ -351,7 +346,6 @@ def build_vi_graph(
     )
 
   pixel_noise = huber_pixel_noise(sigma)
-  gauge = _gauge_noise()
   vel_noise = gtsam.noiseModel.Isotropic.Sigma(3, velocity_prior_sigma)
   bias_noise = gtsam.noiseModel.Diagonal.Sigmas(
     np.asarray(
@@ -363,7 +357,6 @@ def build_vi_graph(
     values.insert(pose_key_fn(i), body_poses[i])
     values.insert(velocity_key_fn(i), np.asarray(velocities[i], dtype=np.float64))
     values.insert(bias_key_fn(i), biases[i])
-  graph.push_back(gtsam.PriorFactorPose3(pose_key_fn(0), body_poses[0], gauge))
   graph.push_back(
     gtsam.PriorFactorVector(
       velocity_key_fn(0), np.asarray(velocities[0], dtype=np.float64), vel_noise
