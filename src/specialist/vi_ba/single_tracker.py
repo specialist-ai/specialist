@@ -5,7 +5,7 @@ from __future__ import annotations
 import ctypes
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from typing import NamedTuple, TypeVar
+from typing import TypeVar
 
 import gtsam
 import numpy as np
@@ -48,7 +48,6 @@ from specialist.vi_ba.imu import (
   GRAVITY_WORLD,
   ImuSamples,
   find_stationary_windows,
-  keyframe_delta_rotations,
   make_preintegration_params,
   preintegrate_between_keyframes,
 )
@@ -208,27 +207,16 @@ class _LensPrep:
     )
 
 
-class _LensSide(NamedTuple):
-  """One lens's prep state and its gyro-derived rotation increments for anchor PnP."""
-
-  lens: _LensPrep
-  rotations: list[Float64Array]
-
-
 def _detect_anchor_obs(
   tag_id: int,
   tag_size: float,
-  lens_sides: tuple[_LensSide, ...],
+  lenses: tuple[_LensPrep, ...],
 ) -> dict[int, dict[str, gtsam.Pose3]]:
   """``{kf: {side: cam_T_tag}}`` for one anchor id over the given lenses, ungated."""
   obs: dict[int, dict[str, gtsam.Pose3]] = {}
-  for lens, rotations in lens_sides:
+  for lens in lenses:
     for kf, pose in anchor_pose_from_tags(
-      lens.tags,
-      tag_id,
-      tag_size,
-      lens.setup.params,
-      kf_rotations=rotations,
+      lens.tags, tag_id, tag_size, lens.setup.params
     ).items():
       obs.setdefault(kf, {})[lens.side] = pose
   return obs
@@ -590,12 +578,7 @@ def prepare_tracker(args: TrackerArgs, tags: GripperTags) -> PreparedTracker:
     gyro=raw_imu.gyro @ imu_to_body.T,
     accel=raw_imu.accel @ imu_to_body.T,
   )
-  body_deltas = keyframe_delta_rotations(imu, keyframe_times)
   del raw_imu
-
-  def lens_kf_rotations(lens: LensSetup) -> list[Float64Array]:
-    r_bl = lens.extrinsic.rotation().matrix()
-    return [r_bl.T @ d.T @ r_bl for d in body_deltas]
 
   front = _LensPrep(side="front", setup=front_lens, tags=front_tags_per_kf)
   rear = _LensPrep(
@@ -607,13 +590,8 @@ def prepare_tracker(args: TrackerArgs, tags: GripperTags) -> PreparedTracker:
       list(args.frontend.mask_rear_rects) if args.frontend.rear_landmarks else []
     ),
   )
-  rear_kf_rotations = lens_kf_rotations(rear_lens)
-  lens_sides = (
-    _LensSide(front, lens_kf_rotations(front_lens)),
-    _LensSide(rear, rear_kf_rotations),
-  )
   obs_by_tag = {
-    tag_id: _detect_anchor_obs(tag_id, args.anchor.tag_size, lens_sides)
+    tag_id: _detect_anchor_obs(tag_id, args.anchor.tag_size, (front, rear))
     for tag_id in args.anchor.enabled_tag_ids
   }
   prep_anchor_tag_id = _choose_prep_anchor(args.anchor.enabled_tag_ids, obs_by_tag)
@@ -763,7 +741,6 @@ def prepare_tracker(args: TrackerArgs, tags: GripperTags) -> PreparedTracker:
       rear_lens,
       args.gripper.tag_size,
       n_keyframes,
-      rear_kf_rotations,
       rear_tags_per_frame,
       rear_frame_times,
     )
