@@ -19,6 +19,13 @@ class CameraSummary:
   rear_rmse: float
   # The gripper base tag this camera was solved against.
   base_tag_id: int
+  # Rear-lens rotation off its factory block, radians.
+  seat_rotation: tuple[float, float, float]
+  # Sightings that measure that rotation: rear-lens corners of the solved
+  # anchors, and cross-tracker corners. With neither, the seat is the factory
+  # one.
+  seat_anchor_obs: int
+  seat_cross_obs: int
 
 
 @dataclass(frozen=True)

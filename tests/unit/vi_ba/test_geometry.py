@@ -6,6 +6,7 @@ import numpy as np
 from specialist_corpus.poses import quats_to_matrices
 
 from specialist.vi_ba.geometry import (
+  average_pose,
   consensus_pose,
   matrices_to_quats,
   quat_xyzw,
@@ -34,6 +35,55 @@ def test_consensus_refuses_a_split_pool() -> None:
   a = _pose(0.0, 0.0, 0.0, 0.0, 0.0, 1.0)
   b = _pose(0.8, -0.6, 0.4, 0.5, 0.5, 1.4)
   assert consensus_pose([a] * 10 + [b] * 10) is None
+
+
+def _twin_pool(n: int, outlier_fraction: float, seed: int) -> list[gtsam.Pose3]:
+  """A sighting pool where a large minority landed on the tag's 180-degree twin,
+  the way IPPE's two branches do on a near-frontal tag."""
+  rng = np.random.default_rng(seed)
+  truth = _pose(0.0, 0.0, 0.0, 0.0, 0.0, 1.0)
+  axis = np.array([0.3, 0.9, 0.2])
+  axis /= np.linalg.norm(axis)
+  twin = gtsam.Pose3(
+    gtsam.Rot3.Expmap(axis * np.deg2rad(178.0)), gtsam.Point3(0.2, -0.1, 1.1)
+  )
+  poses = []
+  for i in range(n):
+    base = twin if i < round(n * outlier_fraction) else truth
+    wobble = rng.normal(0, np.deg2rad(3.0), 3)
+    poses.append(
+      gtsam.Pose3(
+        base.rotation().retract(wobble), base.translation() + rng.normal(0, 2e-3, 3)
+      )
+    )
+  rng.shuffle(poses)
+  return poses
+
+
+def _rotation_error_deg(pose: gtsam.Pose3, truth: gtsam.Pose3) -> float:
+  between = truth.rotation().between(pose.rotation())
+  return float(np.rad2deg(np.linalg.norm(gtsam.Rot3.Logmap(between))))
+
+
+def test_consensus_keeps_the_majority_where_the_median_flips() -> None:
+  """With a large twin minority the plain median lands between the two
+  branches; the consensus keeps the majority."""
+  truth = _pose(0.0, 0.0, 0.0, 0.0, 0.0, 1.0)
+  poses = _twin_pool(20, 0.45, seed=2)
+  agreed = consensus_pose(poses)
+  assert agreed is not None
+  assert _rotation_error_deg(agreed, truth) < 1.5
+  assert _rotation_error_deg(average_pose(poses), truth) > 90.0
+
+
+def test_consensus_subsamples_a_large_pool() -> None:
+  """A pool past the cap on centres the search tries has its centres stepped
+  through it."""
+  truth = _pose(0.0, 0.0, 0.0, 0.0, 0.0, 1.0)
+  poses = _twin_pool(160, 0.45, seed=2)
+  agreed = consensus_pose(poses)
+  assert agreed is not None
+  assert _rotation_error_deg(agreed, truth) < 1.5
 
 
 def test_consensus_of_nothing_is_nothing() -> None:

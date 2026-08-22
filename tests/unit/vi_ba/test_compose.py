@@ -17,6 +17,8 @@ def test_tracker_keys_no_collision_across_trackers() -> None:
   assert keys.pose_key("alice", 0) != keys.bias_key("alice", 0)
   assert keys.front_landmark_key("alice", 0) != keys.rear_landmark_key("alice", 0)
   assert keys.front_landmark_key("alice", 0) != keys.front_landmark_key("bob", 0)
+  assert keys.seat_key("alice") != keys.seat_key("bob")
+  assert keys.seat_key("alice") != keys.base_tag_key("alice")
 
 
 def test_tracker_keys_unknown_tracker_raises() -> None:

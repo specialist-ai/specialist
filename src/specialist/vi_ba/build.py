@@ -18,15 +18,13 @@ from specialist.vi_ba.anchor_detection import TagDetection
 from specialist.vi_ba.features import Rect
 
 try:
-  # Native C++ MEI reprojection factors (pose+point, anchor, base-tag, finger,
-  # and cross-tracker base + finger variants).
   from specialist.vi_ba._mei_factor_cpp import (
     make_mei_anchor_tag_factor_cpp,
-    make_mei_base_tag_factor_cpp,
-    make_mei_cross_finger_factor_cpp,
-    make_mei_cross_tag_factor_cpp,
     make_mei_factor_cpp,
-    make_mei_finger_factor_cpp,
+    make_mei_seated_base_tag_factor_cpp,
+    make_mei_seated_cross_finger_factor_cpp,
+    make_mei_seated_cross_tag_factor_cpp,
+    make_mei_seated_finger_factor_cpp,
   )
 except ImportError as _exc:  # pragma: no cover - extension is built by uv sync
   raise ImportError(
@@ -46,10 +44,10 @@ __all__ = [
   "LensChannel",
   "LensSetup",
   "add_mei_anchor_tag_factor",
-  "add_mei_base_tag_factor",
-  "add_mei_cross_finger_factor",
-  "add_mei_cross_tag_factor",
-  "add_mei_finger_factor",
+  "add_mei_seated_base_tag_factor",
+  "add_mei_seated_cross_finger_factor",
+  "add_mei_seated_cross_tag_factor",
+  "add_mei_seated_finger_factor",
   "build_vi_graph",
   "huber_pixel_noise",
 ]
@@ -154,10 +152,12 @@ def add_mei_anchor_tag_factor(
   lens: LensSetup,
   corner: Float64Array,
   obs_bearing: Float64Array,
+  seat_key: int | None = None,
 ) -> None:
-  """Push one native MEI reprojection factor, binary on the observing pose and
-  the anchor's world pose: the tag-frame ``corner`` reprojects as
-  ``pose⁻¹ · anchor · corner`` through ``lens`` onto ``pixel``."""
+  """Push one native MEI reprojection factor on the observing pose and the
+  anchor's world pose: the tag-frame ``corner`` reprojects as
+  ``pose⁻¹ · anchor · corner`` through ``lens`` onto ``pixel``. ``seat_key``
+  makes the lens's seat rotation a Rot3 variable; its translation stays baked."""
   graph.push_back(
     make_mei_anchor_tag_factor_cpp(
       pose_key,
@@ -168,14 +168,42 @@ def add_mei_anchor_tag_factor(
       _as_point3(corner),
       *_mei_intrinsics(lens.params),
       _as_vec3(obs_bearing),
+      seat_key=seat_key,
     )
   )
 
 
-def add_mei_finger_factor(
+def add_mei_seated_base_tag_factor(
+  graph: gtsam.NonlinearFactorGraph,
+  base_tag_key: int,
+  seat_key: int,
+  pixel: Float64Array,
+  noise: gtsam.noiseModel.Base,
+  lens: LensSetup,
+  corner: Float64Array,
+  obs_bearing: Float64Array,
+) -> None:
+  """Push one native MEI factor on (body_T_base_tag, seat): the tag-frame
+  ``corner`` reprojects through the lens whose seat rotation sits at ``seat_key``."""
+  graph.push_back(
+    make_mei_seated_base_tag_factor_cpp(
+      base_tag_key,
+      seat_key,
+      _as_pixel(pixel),
+      noise,
+      lens.extrinsic,
+      _as_point3(corner),
+      *_mei_intrinsics(lens.params),
+      _as_vec3(obs_bearing),
+    )
+  )
+
+
+def add_mei_seated_finger_factor(
   graph: gtsam.NonlinearFactorGraph,
   theta_key: int,
   base_tag_key: int,
+  seat_key: int,
   pixel: Float64Array,
   noise: gtsam.noiseModel.Base,
   lens: LensSetup,
@@ -183,16 +211,13 @@ def add_mei_finger_factor(
   corner_in_pivot: Float64Array,
   obs_bearing: Float64Array,
 ) -> None:
-  """Push one native MEI finger-angle reprojection factor, binary on the scalar
-  joint angle ``theta_key`` and the base-tag pose ``base_tag_key``: the tag corner
-  rides a 1-DoF revolute joint (``base_T_joint`` pivot in the base-tag frame, +z
-  axis), so it reprojects as ``body_T_base_tag · base_T_joint · Rz(theta) ·
-  corner_in_pivot`` through ``lens`` onto ``pixel``. ``obs_bearing`` is the
-  lens-frame tag direction for the ξ>1 behind-camera cheirality guard."""
+  """Push one native MEI factor on (theta, body_T_base_tag, seat): the finger
+  corner swings about ``base_T_joint`` by ``theta`` before reprojecting."""
   graph.push_back(
-    make_mei_finger_factor_cpp(
+    make_mei_seated_finger_factor_cpp(
       theta_key,
       base_tag_key,
+      seat_key,
       _as_pixel(pixel),
       noise,
       lens.extrinsic,
@@ -204,53 +229,26 @@ def add_mei_finger_factor(
   )
 
 
-def add_mei_base_tag_factor(
-  graph: gtsam.NonlinearFactorGraph,
-  base_tag_key: int,
-  pixel: Float64Array,
-  noise: gtsam.noiseModel.Base,
-  lens: LensSetup,
-  corner: Float64Array,
-  obs_bearing: Float64Array,
-) -> None:
-  """Push one native MEI base-tag reprojection factor, unary on the base-tag pose
-  ``base_tag_key``: the tag corner is fixed in the base-tag frame, so it
-  reprojects as ``body_T_base_tag · corner`` through ``lens`` onto ``pixel``.
-  ``obs_bearing`` is the lens-frame tag direction for the cheirality guard."""
-  graph.push_back(
-    make_mei_base_tag_factor_cpp(
-      base_tag_key,
-      _as_pixel(pixel),
-      noise,
-      lens.extrinsic,
-      _as_point3(corner),
-      *_mei_intrinsics(lens.params),
-      _as_vec3(obs_bearing),
-    )
-  )
-
-
-def add_mei_cross_tag_factor(
+def add_mei_seated_cross_tag_factor(
   graph: gtsam.NonlinearFactorGraph,
   observer_key: int,
   owner_key: int,
   base_tag_key: int,
+  seat_key: int,
   pixel: Float64Array,
   noise: gtsam.noiseModel.Base,
   observer_lens: LensSetup,
   corner: Float64Array,
   obs_bearing: Float64Array,
 ) -> None:
-  """Push one native MEI cross-tracker reprojection factor, ternary on the
-  observer pose, owner pose, and owner's base-tag pose: owner W's base-tag corner
-  reprojects as ``X_O⁻¹ · X_W · body_T_base_tag · corner`` through the observer's
-  ``observer_lens`` onto ``pixel``. ``obs_bearing`` is the observer-lens tag
-  direction for the cheirality guard."""
+  """Push one native MEI factor on (observer, owner, body_T_base_tag, seat): the
+  owner's base-tag corner reprojects through the observer's seated lens."""
   graph.push_back(
-    make_mei_cross_tag_factor_cpp(
+    make_mei_seated_cross_tag_factor_cpp(
       observer_key,
       owner_key,
       base_tag_key,
+      seat_key,
       _as_pixel(pixel),
       noise,
       observer_lens.extrinsic,
@@ -261,12 +259,13 @@ def add_mei_cross_tag_factor(
   )
 
 
-def add_mei_cross_finger_factor(
+def add_mei_seated_cross_finger_factor(
   graph: gtsam.NonlinearFactorGraph,
   observer_key: int,
   owner_key: int,
   base_tag_key: int,
   theta_key: int,
+  seat_key: int,
   pixel: Float64Array,
   noise: gtsam.noiseModel.Base,
   observer_lens: LensSetup,
@@ -274,18 +273,15 @@ def add_mei_cross_finger_factor(
   corner_in_pivot: Float64Array,
   obs_bearing: Float64Array,
 ) -> None:
-  """Push one native MEI cross-tracker finger reprojection factor, quaternary on
-  the observer pose, owner pose, owner's base-tag pose, and owner's joint angle:
-  owner W's finger-tag corner reprojects as ``X_O⁻¹ · X_W · body_T_base_tag ·
-  base_T_joint · Rz(θ) · corner_in_pivot`` through ``observer_lens`` onto
-  ``pixel``. ``obs_bearing`` is the observer-lens tag direction for the
-  cheirality guard."""
+  """Push one native MEI factor on (observer, owner, body_T_base_tag, theta,
+  seat): the owner's finger corner reprojects through the observer's seated lens."""
   graph.push_back(
-    make_mei_cross_finger_factor_cpp(
+    make_mei_seated_cross_finger_factor_cpp(
       observer_key,
       owner_key,
       base_tag_key,
       theta_key,
+      seat_key,
       _as_pixel(pixel),
       noise,
       observer_lens.extrinsic,

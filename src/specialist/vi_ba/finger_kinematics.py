@@ -20,7 +20,7 @@ from dataclasses import dataclass
 import gtsam
 import numpy as np
 import numpy.typing as npt
-from specialist_camera import mei_project
+from specialist_camera import MeiParams, mei_project
 from specialist_corpus.fiducials import tag_corners_in_frame
 
 from specialist.vi_ba.anchor_detection import (
@@ -29,7 +29,7 @@ from specialist.vi_ba.anchor_detection import (
   tag_center_bearing,
 )
 from specialist.vi_ba.build import LensSetup
-from specialist.vi_ba.geometry import average_pose, rotate_about_z
+from specialist.vi_ba.geometry import average_pose, consensus_pose, rotate_about_z
 from specialist.vi_ba.tag_discovery import GripperTags
 from specialist.vi_ba.urdf_joints import FINGER_JOINTS, RevoluteJoint
 
@@ -185,9 +185,18 @@ def frame_finger_angles(
   return np.asarray(frames, dtype=np.int64), np.asarray(angles, dtype=np.float64)
 
 
+def _pool_pose(poses: list[gtsam.Pose3], what: str) -> gtsam.Pose3:
+  """The agreeing cluster's pose, or the plain median when the pool splits."""
+  agreed = consensus_pose(poses)
+  if agreed is not None:
+    return agreed
+  print(f"  [warn] [gripper] {what} sightings split; seeding on the median")
+  return average_pose(poses)
+
+
 def _joint_angles_per_kf(
   tags_per_kf: list[list[TagDetection]],
-  lens: LensSetup,
+  params: MeiParams,
   cam_T_base: gtsam.Pose3,
   finger_tag_id: int,
   tag_size: float,
@@ -198,7 +207,7 @@ def _joint_angles_per_kf(
   tag's pose averaged over its sightings."""
   out: list[float] = [float("nan")] * n_keyframes
   cam_T_finger_per_kf = anchor_pose_from_tags(
-    tags_per_kf[:n_keyframes], finger_tag_id, tag_size, lens.params
+    tags_per_kf[:n_keyframes], finger_tag_id, tag_size, params
   )
   for kf, cam_T_finger in cam_T_finger_per_kf.items():
     base_tag_T_finger = cam_T_base.between(cam_T_finger)
@@ -223,15 +232,12 @@ def recover_gripper_tags(
 ]:
   """Base-tag body pose, per-finger joint angles, and finger reprojection inputs.
 
-  ``tags`` names this tracker's own tags. ``body_T_base_tag`` is the mean of the
-  base tag's body-frame pose (``lens.extrinsic ∘ cam_T_tag``) over the rear
-  keyframes that see it.
-  ``joint_angles`` holds each configured finger's per-keyframe URDF
-  revolute-joint angle from PnP (the viz seed and the bundle's per-keyframe
-  fallback). ``finger_reproj`` carries the corner-reprojection inputs the joint
-  bundle refines the angles from, built from the URDF when one is given.
-  ``frame_angles`` holds the same joints' per-frame PnP angles on the finger
-  detection stride, for the finger transform streams.
+  ``body_T_base_tag`` is the base tag's body-frame pose (``lens.extrinsic ∘
+  cam_T_tag``) reduced over the rear keyframes that see it. ``joint_angles``
+  holds each finger's per-keyframe URDF revolute-joint angle from PnP,
+  ``finger_reproj`` the corner-reprojection inputs the bundle refines them from,
+  and ``frame_angles`` the same joints' per-frame PnP angles on the finger
+  detection stride.
   """
   base_tag_obs = anchor_pose_from_tags(
     tags_per_kf[:n_keyframes],
@@ -245,9 +251,9 @@ def recover_gripper_tags(
       f"across {n_keyframes} rear keyframes — its base-tag, finger, and "
       f"cross-tracker factors would all be silently disabled"
     )
-  cam_T_base = average_pose(list(base_tag_obs.values()))
-  body_T_base_tag = average_pose(
-    [lens.extrinsic.compose(p) for p in base_tag_obs.values()]
+  cam_T_base = _pool_pose(list(base_tag_obs.values()), "cam_T_base")
+  body_T_base_tag = _pool_pose(
+    [lens.extrinsic.compose(p) for p in base_tag_obs.values()], "body_T_base_tag"
   )
 
   joint_angles: dict[str, list[float]] = {}
@@ -258,7 +264,7 @@ def recover_gripper_tags(
       continue
     joint_angles[joint_name] = _joint_angles_per_kf(
       tags_per_kf,
-      lens,
+      lens.params,
       cam_T_base,
       finger_tag_id=finger_id,
       tag_size=tag_size,

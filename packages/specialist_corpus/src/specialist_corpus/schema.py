@@ -115,6 +115,11 @@ def lens(slot: str, side: str) -> str:
   return f"{camera(slot)}/{side}"
 
 
+def lens_seat(slot: str, side: str) -> str:
+  """The body -> lens rotation the bundle solved."""
+  return f"{camera(slot)}/{side}_seat"
+
+
 def video(slot: str, side: str) -> str:
   """A lens's encoded frames. A leaf: it carries no temporal children."""
   return f"{lens(slot, side)}/video"

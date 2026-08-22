@@ -471,6 +471,8 @@ class CameraEstimate:
   # The solved body -> base-tag transform (a BA variable), logged statically.
   body_T_base_tag: gtsam.Pose3
   base_tag_id: int
+  # The solved body -> rear-lens pose.
+  body_T_rear_lens: gtsam.Pose3
   # The series propagated between the keyframes, at the IMU's own sample times.
   highrate_times: Float64Array
   highrate_positions: Float64Array
@@ -655,6 +657,11 @@ def _camera_statics(layers: Layers, data: CameraEstimate) -> None:
     record_schema.base_tag(data.slot),
     _pose_columns(data.body_T_base_tag),
     data.base_tag_id,
+  )
+  _static(
+    layers.estimate,
+    record_schema.lens_seat(data.slot, "rear"),
+    _pose_columns(data.body_T_rear_lens),
   )
 
 
