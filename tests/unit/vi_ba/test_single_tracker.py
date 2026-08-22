@@ -16,7 +16,7 @@ from specialist.vi_ba.single_tracker import (
 )
 from specialist.vi_ba.tracks import add_loop_landmarks, run_lens_frontend
 from tests.frame_fixtures import translating_frames
-from tests.mei_fixtures import narrow_mei_params
+from tests.mei_fixtures import WIDE_CALIBRATED_RADIUS, narrow_mei_params
 
 
 def _cpu_frontend_cfg() -> FrontendCfg:
@@ -102,7 +102,9 @@ def test_anchor_metric_scale_recovers_scale() -> None:
     )
     for k in range(n)
   ]
-  lens = LensSetup(extrinsic=ext, params=narrow_mei_params())
+  lens = LensSetup(
+    extrinsic=ext, params=narrow_mei_params(), calibrated_radius=WIDE_CALIBRATED_RADIUS
+  )
   scale = _anchor_metric_scale(vo_body, anchor_obs, lens)
   assert scale is not None
   assert abs(scale - 1.0 / c) < 1e-9
@@ -110,7 +112,11 @@ def test_anchor_metric_scale_recovers_scale() -> None:
 
 def test_anchor_metric_scale_none_when_degenerate() -> None:
   """Fewer than 3 anchored keyframes or a zero-spread trajectory yields ``None``."""
-  lens = LensSetup(extrinsic=gtsam.Pose3(), params=narrow_mei_params())
+  lens = LensSetup(
+    extrinsic=gtsam.Pose3(),
+    params=narrow_mei_params(),
+    calibrated_radius=WIDE_CALIBRATED_RADIUS,
+  )
   two = {k: gtsam.Pose3() for k in range(2)}
   assert _anchor_metric_scale([gtsam.Pose3()] * 2, two, lens) is None
   # Three anchored views but the VO is stationary → zero spread → None.
@@ -125,7 +131,9 @@ def test_anchor_metric_scale_none_when_degenerate() -> None:
 def test_add_loop_landmarks_merges_revisit_into_bundle() -> None:
   params = narrow_mei_params()
   ext = gtsam.Pose3()
-  lens = LensSetup(extrinsic=ext, params=params)
+  lens = LensSetup(
+    extrinsic=ext, params=params, calibrated_radius=WIDE_CALIBRATED_RADIUS
+  )
   n = 6
   body_poses = [gtsam.Pose3() for _ in range(n)]
   # two baselined keyframes (parallax) that both see the point -> a revisit pair
@@ -160,7 +168,9 @@ def test_add_loop_landmarks_merges_revisit_into_bundle() -> None:
 
 def test_add_loop_landmarks_empty_is_noop() -> None:
   params = narrow_mei_params()
-  lens = LensSetup(extrinsic=gtsam.Pose3(), params=params)
+  lens = LensSetup(
+    extrinsic=gtsam.Pose3(), params=params, calibrated_radius=WIDE_CALIBRATED_RADIUS
+  )
   front_points: dict[int, np.ndarray] = {}
   front_kept = {5: {0: np.array([1.0, 1.0])}}
   loop_pts = add_loop_landmarks(
@@ -181,7 +191,9 @@ def test_add_loop_landmarks_reliable_views_resist_drift() -> None:
   """With ``anchor_kfs`` the landmark triangulates from well-localized views alone."""
   params = narrow_mei_params()
   ext = gtsam.Pose3()
-  lens = LensSetup(extrinsic=ext, params=params)
+  lens = LensSetup(
+    extrinsic=ext, params=params, calibrated_radius=WIDE_CALIBRATED_RADIUS
+  )
   n = 6
   body_poses = [gtsam.Pose3() for _ in range(n)]
   body_poses[1] = gtsam.Pose3(gtsam.Rot3(), gtsam.Point3(0.0, 0.0, 0.0))

@@ -37,6 +37,10 @@ def synthetic_tag_detection(
   return TagDetection(tag_id=tag_id, center=px.mean(0), corners=px)
 
 
+# Past every synthetic projection, so each sighting carries the corner-noise floor.
+WIDE_CALIBRATED_RADIUS = 1000.0
+
+
 def pinhole_mei_params() -> MeiParams:
   return MeiParams(
     fx=500.0,

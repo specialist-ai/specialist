@@ -80,10 +80,12 @@ def _mei_intrinsics(params: MeiParams) -> tuple[float, ...]:
 
 @dataclass(frozen=True)
 class LensSetup:
-  """Fixed per-lens inputs: body→lens extrinsic + MEI intrinsics."""
+  """Fixed per-lens inputs: body→lens extrinsic, MEI intrinsics, and the radius
+  (px) past which a corner's noise model grows."""
 
   extrinsic: gtsam.Pose3
   params: MeiParams
+  calibrated_radius: float
 
 
 @dataclass

@@ -15,6 +15,7 @@ from specialist.vi_ba.imu import (
 )
 from specialist.vi_ba.optimize import optimize_graph
 from tests.mei_fixtures import (
+  WIDE_CALIBRATED_RADIUS,
   front_landmark_key,
   pinhole_mei_params,
   pinned_visual_graph,
@@ -56,7 +57,9 @@ def test_build_graph_minimum_two_poses_one_landmark() -> None:
   pix_a = project_point(poses[0], extrinsic, xyz, params)
   pix_b = project_point(poses[1], extrinsic, xyz, params)
 
-  front_setup = LensSetup(extrinsic=extrinsic, params=params)
+  front_setup = LensSetup(
+    extrinsic=extrinsic, params=params, calibrated_radius=WIDE_CALIBRATED_RADIUS
+  )
   front_tracks = {7: {0: pix_a, 1: pix_b}}
   front_points = {7: xyz}
 
@@ -89,7 +92,9 @@ def test_build_graph_dual_lens_uses_disjoint_landmark_keys() -> None:
     }
   }
 
-  lens = LensSetup(extrinsic=extrinsic, params=params)
+  lens = LensSetup(
+    extrinsic=extrinsic, params=params, calibrated_radius=WIDE_CALIBRATED_RADIUS
+  )
   graph, values = pinned_visual_graph(
     poses, lens, front_tracks, {0: xyz_front}, rear_tracks, {0: xyz_rear}
   )
@@ -111,7 +116,12 @@ def test_build_graph_weak_priors_on_intermediate_keyframes() -> None:
     gtsam.Pose3(gtsam.Rot3(), gtsam.Point3(0.3, 0.0, 0.0)),
   ]
   graph, _ = pinned_visual_graph(
-    poses, LensSetup(extrinsic=extrinsic, params=params), {}, {}
+    poses,
+    LensSetup(
+      extrinsic=extrinsic, params=params, calibrated_radius=WIDE_CALIBRATED_RADIUS
+    ),
+    {},
+    {},
   )
   # 2 tight priors + 2 weak priors (frames 1, 2) = 4 total.
   assert graph.size() == 4
@@ -143,7 +153,9 @@ def test_optimize_graph_converges_from_small_perturbation() -> None:
   ]
   graph, values = pinned_visual_graph(
     init_poses,
-    LensSetup(extrinsic=extrinsic, params=params),
+    LensSetup(
+      extrinsic=extrinsic, params=params, calibrated_radius=WIDE_CALIBRATED_RADIUS
+    ),
     front_tracks,
     front_points,
   )
@@ -158,7 +170,14 @@ def test_optimize_graph_rejects_non_finite_initial_error_before_solving(
 ) -> None:
   poses = [gtsam.Pose3(), gtsam.Pose3(gtsam.Rot3(), gtsam.Point3(np.nan, 0.0, 0.0))]
   graph, values = pinned_visual_graph(
-    poses, LensSetup(extrinsic=gtsam.Pose3(), params=pinhole_mei_params()), {}, {}
+    poses,
+    LensSetup(
+      extrinsic=gtsam.Pose3(),
+      params=pinhole_mei_params(),
+      calibrated_radius=WIDE_CALIBRATED_RADIUS,
+    ),
+    {},
+    {},
   )
   assert not np.isfinite(graph.error(values))
 
@@ -202,7 +221,13 @@ def test_build_vi_graph_adds_velocity_bias_imu_factors() -> None:
   pim = [_stationary_pim()]
 
   graph, values = _imu_only_graph(
-    poses, vel, bias, pim, LensSetup(extrinsic=extrinsic, params=params)
+    poses,
+    vel,
+    bias,
+    pim,
+    LensSetup(
+      extrinsic=extrinsic, params=params, calibrated_radius=WIDE_CALIBRATED_RADIUS
+    ),
   )
   # 2 initial priors (V0, B0) + 1 IMU factor = 3 factors; no projection.
   assert graph.size() == 3
@@ -222,7 +247,13 @@ def test_build_vi_graph_wrong_pim_count_raises() -> None:
   pim = [_stationary_pim()]
   with pytest.raises(ValueError, match="N-1"):
     _imu_only_graph(
-      poses, vel, bias, pim, LensSetup(extrinsic=extrinsic, params=params)
+      poses,
+      vel,
+      bias,
+      pim,
+      LensSetup(
+        extrinsic=extrinsic, params=params, calibrated_radius=WIDE_CALIBRATED_RADIUS
+      ),
     )
 
 
@@ -238,7 +269,13 @@ def test_build_vi_graph_stationary_lm_converges() -> None:
   ]
   pim = [_stationary_pim()]
   graph, values = _imu_only_graph(
-    poses, vel, bias, pim, LensSetup(extrinsic=extrinsic, params=params)
+    poses,
+    vel,
+    bias,
+    pim,
+    LensSetup(
+      extrinsic=extrinsic, params=params, calibrated_radius=WIDE_CALIBRATED_RADIUS
+    ),
   )
   graph.push_back(
     gtsam.PriorFactorPose3(X(0), poses[0], gtsam.noiseModel.Isotropic.Sigma(6, 1e-4))
