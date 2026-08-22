@@ -52,7 +52,6 @@ def _factor_observation_lines(
   cross_obs_for_observer: list[CrossSighting],
   anchor_corners_by_tag: dict[int, Float64Array],
   base_tag_corners_world: dict[str, list[Float64Array]],
-  max_half_angle: float,
 ) -> tuple[list[Float64Array], list[Float64Array]]:
   """Per-keyframe ``(n, 2, 3)`` line endpoints for every factor that fires at
   the observer's keyframe: the observing lens centre to each sighted anchor's
@@ -60,7 +59,7 @@ def _factor_observation_lines(
   tracker."""
   lenses_by_kf: dict[int, list[tuple[LensSetup, Float64Array]]] = {}
   for tag_id, corners_world in anchor_corners_by_tag.items():
-    for ch, kf, _det in anchor_sightings(observer, tag_id, max_half_angle):
+    for ch, kf, _det in anchor_sightings(observer, tag_id):
       lenses_by_kf.setdefault(kf, []).append((ch.setup, corners_world))
   anchor_lines: list[Float64Array] = []
   cross_lines: list[Float64Array] = []
@@ -264,7 +263,6 @@ def _build_camera_estimate(
     cross_obs,
     anchor_corners_by_tag,
     base_tag_corners_world,
-    args.anchor.max_half_angle,
   )
   camera = CameraEstimate(
     slot=tracker.name,

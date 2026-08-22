@@ -39,6 +39,11 @@ def synthetic_tag_detection(
   return TagDetection(tag_id=tag_id, center=px.mean(0), corners=px)
 
 
+# Past every radius these synthetic scenes project to, so a sighting carries the
+# corner-noise floor unless a test calibrates its lens deliberately.
+WIDE_CALIBRATED_RADIUS = 1000.0
+
+
 def pinhole_params() -> MeiParams:
   return MeiParams(
     fx=500.0,

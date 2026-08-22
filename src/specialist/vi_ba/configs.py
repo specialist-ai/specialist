@@ -89,12 +89,9 @@ class AnchorCfg:
 
   tag_size: float = 0.1
 
-  # The anchor enters the bundle by reprojecting the tag's four known-metric
-  # corners (a fixed-spacing calibration target), which pins absolute scale.
-  corner_reproj_sigma: float = 1.5
-  # Drop anchor sightings past this bearing half-angle (rad); the fisheye
-  # calibration is least constrained at the extreme edge.
-  max_half_angle: float = float(np.deg2rad(75.0))
+  # On-axis corner-reprojection noise floor (px); sightings widen from it with
+  # corner radius.
+  corner_reproj_sigma: float = 1.05
 
   @property
   def enabled_tag_ids(self) -> tuple[int, ...]:

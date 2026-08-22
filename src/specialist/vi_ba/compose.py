@@ -21,13 +21,13 @@ from functools import partial
 import gtsam
 import numpy as np
 import numpy.typing as npt
+from specialist_camera import MeiParams
 from specialist_corpus.fiducials import tag_corners_local
 
 from specialist.vi_ba.anchor_detection import (
   TagDetection,
   estimate_camera_to_tag_pose,
   tag_center_bearing,
-  tag_half_angle,
 )
 from specialist.vi_ba.build import (
   LensChannel,
@@ -83,6 +83,9 @@ _BASE_TAG_PRIOR_SIGMA_TRANS = 0.05
 # Cross-tracker sighting σ (px), weighted apart from the per-arm base-tag
 # factors.
 _CROSS_REPROJ_SIGMA = 3.0
+# Anchor corner noise growth past the lens's calibrated radius, in px per unit
+# of fractional overshoot; the floor is ``AnchorCfg.corner_reproj_sigma``.
+_SIGMA_PER_RADIUS = 40.0
 # The datum holds yaw and position; the horizontal rotations are left to the IMU.
 _DATUM_SIGMA = 1e-4
 _DATUM_FREE_SIGMA = 1e3
@@ -338,6 +341,34 @@ def _finger_symmetry_factor(
   return gtsam.LinearContainerFactor(jacobian, lin_point)
 
 
+def anchor_corner_sigma(
+  max_radius: float, calibrated_radius: float, base_sigma: float
+) -> float:
+  """Corner-reprojection sigma (px) for a sighting whose furthest corner sits
+  at ``max_radius`` from the principal point: the noise floor and the growth
+  past the lens's calibrated radius, added in quadrature."""
+  over = max(0.0, max_radius / calibrated_radius - 1.0)
+  return float(np.hypot(base_sigma, _SIGMA_PER_RADIUS * over))
+
+
+def sighting_max_radius(corners: Float64Array, params: MeiParams) -> float:
+  """How far the sighting's furthest corner sits from the principal point."""
+  pixels = np.asarray(corners, dtype=np.float64)
+  return float(np.hypot(pixels[:, 0] - params.cx, pixels[:, 1] - params.cy).max())
+
+
+def corner_noise(
+  corners: Float64Array, setup: LensSetup, base_sigma: float
+) -> gtsam.noiseModel.Base:
+  """The robust noise model one tag sighting's four corner factors carry, priced
+  by the radius the sighting sits at."""
+  return huber_pixel_noise(
+    anchor_corner_sigma(
+      sighting_max_radius(corners, setup.params), setup.calibrated_radius, base_sigma
+    )
+  )
+
+
 def anchor_datum_factor(
   anchor_key: int, world_T_anchor: gtsam.Pose3
 ) -> gtsam.PriorFactorPose3:
@@ -358,18 +389,16 @@ def anchor_datum_factor(
 def anchor_sightings(
   tracker: PreparedTracker,
   anchor_tag_id: int,
-  max_half_angle: float,
 ) -> list[tuple[LensChannel, int, TagDetection]]:
-  """Per ``(lens channel, keyframe)`` anchor-tag detection within
-  ``max_half_angle`` of the optical axis. The corner reprojection factors and
-  the viz lines both consume this, so they cover exactly the same keyframes."""
+  """Per-keyframe anchor-tag detections in both lenses. The corner
+  reprojection factors and the viz lines both consume this, so they cover
+  exactly the same keyframes."""
   return [
     (ch, kf, det)
     for ch in tracker.lenses
     for kf, dets in enumerate(ch.tags)
     for det in dets
     if int(det.tag_id) == anchor_tag_id
-    and tag_half_angle(det, ch.setup.params) <= max_half_angle
   ]
 
 
@@ -382,26 +411,26 @@ def anchored_keyframes(tracker: PreparedTracker) -> set[int]:
 def _add_corner_factors_for_anchor(
   trackers: list[PreparedTracker],
   keys: TrackerKeys,
-  corner_noise: gtsam.noiseModel.Base,
+  base_sigma: float,
   tag_id: int,
   tag_size: float,
-  max_half_angle: float,
   graph: gtsam.NonlinearFactorGraph,
 ) -> int:
   """Corner-reprojection factors for one anchor, every sighting by any tracker
-  and lens, with the detection-center ray as the cheirality bearing. Returns
-  the sighting count."""
+  and lens, with the detection-center ray as the cheirality bearing and a noise
+  model scaled to each sighting's corner radius. Returns the sighting count."""
   corners = tag_corners_local(tag_size)
   anchor_key = keys.anchor_key(tag_id)
   n_sightings = 0
   for t in trackers:
-    for ch, kf, det in anchor_sightings(t, tag_id, max_half_angle):
+    for ch, kf, det in anchor_sightings(t, tag_id):
       n_sightings += 1
       pose_key = keys.pose_key(t.name, kf)
       bearing = tag_center_bearing(det, ch.setup.params)
+      sighting_noise = corner_noise(det.corners, ch.setup, base_sigma)
       for corner, pixel in zip(corners, det.corners, strict=True):
         add_mei_anchor_tag_factor(
-          graph, pose_key, anchor_key, pixel, corner_noise, ch.setup, corner, bearing
+          graph, pose_key, anchor_key, pixel, sighting_noise, ch.setup, corner, bearing
         )
   return n_sightings
 
@@ -446,19 +475,13 @@ def _add_anchor_factors(
   """Every anchor as one rigid pose variable seeded from the initializer, with
   the graph's single datum on the reference and the sightings holding the
   rest."""
-  corner_noise = huber_pixel_noise(args.anchor.corner_reproj_sigma)
+  base_sigma = args.anchor.corner_reproj_sigma
   reference = int(args.anchor.enabled_tag_ids[0])
   for tag_id, world_T_tag in anchor_world.items():
     key = keys.anchor_key(tag_id)
     values.insert(key, world_T_tag)
     n = _add_corner_factors_for_anchor(
-      trackers,
-      keys,
-      corner_noise,
-      tag_id,
-      args.anchor.tag_size,
-      args.anchor.max_half_angle,
-      graph,
+      trackers, keys, base_sigma, tag_id, args.anchor.tag_size, graph
     )
     print(f"[graph] anchor {tag_id} corner reprojection: {n} sightings")
   for tag_id in args.anchor.enabled_tag_ids:
@@ -467,7 +490,7 @@ def _add_anchor_factors(
     rear = sum(
       1
       for t in trackers
-      for ch, _kf, _det in anchor_sightings(t, int(tag_id), args.anchor.max_half_angle)
+      for ch, _kf, _det in anchor_sightings(t, int(tag_id))
       if ch.side == "rear"
     )
     print(
@@ -491,8 +514,6 @@ def _add_gripper_factors(
   prior from PnP. Each finger's scalar joint angle θ co-optimizes with it, tied
   equal-and-opposite by a soft prior, so at a keyframe with only one finger
   visible the other's θ is inferred."""
-  finger_noise = huber_pixel_noise(_FINGER_REPROJ_SIGMA)
-  base_tag_noise = huber_pixel_noise(_BASE_TAG_REPROJ_SIGMA)
   base_tag_prior_noise = gtsam.noiseModel.Diagonal.Sigmas(
     np.array([_BASE_TAG_PRIOR_SIGMA_ROT] * 3 + [_BASE_TAG_PRIOR_SIGMA_TRANS] * 3)
   )
@@ -516,6 +537,7 @@ def _add_gripper_factors(
       if det is None:
         continue
       bearing = tag_center_bearing(det, t.rear.setup.params)
+      base_tag_noise = corner_noise(det.corners, t.rear.setup, _BASE_TAG_REPROJ_SIGMA)
       for j in range(4):
         add_mei_base_tag_factor(
           graph,
@@ -537,6 +559,7 @@ def _add_gripper_factors(
           continue
         tkey = keys.theta_key(t.name, finger_idx, kf)
         values.insert(tkey, float(obs.theta_seed))
+        finger_noise = corner_noise(obs.pixels, t.rear.setup, _FINGER_REPROJ_SIGMA)
         for j in range(4):
           add_mei_finger_factor(
             graph,
@@ -579,7 +602,6 @@ def _add_cross_tracker_factors(
   tag adds W's joint angle θ (a quaternary factor), so the cross view also
   constrains the angle; that needs W's θ variable at the keyframe (from its own
   observation or the symmetry inference)."""
-  base_tag_noise = huber_pixel_noise(_CROSS_REPROJ_SIGMA)
   base_tag_corners = tag_corners_local(args.gripper.tag_size)
   tracker_by_name = {t.name: t for t in trackers}
   base_count = finger_count = 0
@@ -589,6 +611,7 @@ def _add_cross_tracker_factors(
     obs_key = keys.pose_key(sighting.observer, sighting.keyframe)
     owner_key = keys.pose_key(sighting.owner, sighting.keyframe)
     owner_bt_key = keys.base_tag_key(sighting.owner)
+    base_tag_noise = corner_noise(sighting.corners, sighting.lens, _CROSS_REPROJ_SIGMA)
     if sighting.finger is None:
       for j in range(4):
         add_mei_cross_tag_factor(

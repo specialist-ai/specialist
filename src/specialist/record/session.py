@@ -26,6 +26,11 @@ from specialist.vi_ba.imu import ImuSamples
 Float64Array = npt.NDArray[np.float64]
 Int64Array = npt.NDArray[np.int64]
 
+# Radius past which an anchor corner's noise model grows, as a fraction of the
+# decoded per-lens width. The factory block carries no such field, so every lens
+# takes the same fraction.
+_CALIBRATED_RADIUS_FRAC = 1000.0 / 2880.0
+
 __all__ = [
   "SessionRecording",
   "covered_rows",
@@ -141,7 +146,11 @@ class SessionRecording:
 
   def _lens_setup(self, slot: str, side: Side, decoded_width: int) -> LensSetup:
     lens = lens_from_row(self._entity_row(schema.lens(slot, side)), decoded_width, side)
-    return LensSetup(extrinsic=gtsam.Pose3(lens.body_from_lens), params=lens.params)
+    return LensSetup(
+      extrinsic=gtsam.Pose3(lens.body_from_lens),
+      params=lens.params,
+      calibrated_radius=_CALIBRATED_RADIUS_FRAC * decoded_width,
+    )
 
   def imu(self, slot: str) -> ImuSamples:
     """Raw-axis IMU samples as stored: t (s), gyro (rad/s), accel (m/s^2)."""

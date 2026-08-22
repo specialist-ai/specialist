@@ -11,7 +11,11 @@ from specialist.vi_ba.anchor_detection import TagDetection
 from specialist.vi_ba.build import LensSetup
 from specialist.vi_ba.finger_kinematics import build_finger_reproj
 from specialist.vi_ba.urdf_joints import RevoluteJoint
-from tests.mei_fixtures import synthetic_tag_detection, wide_omni_params
+from tests.mei_fixtures import (
+  WIDE_CALIBRATED_RADIUS,
+  synthetic_tag_detection,
+  wide_omni_params,
+)
 
 _PARAMS = wide_omni_params()
 _TAG = 0.05
@@ -28,7 +32,9 @@ def _detect(pose_cam_T_tag: gtsam.Pose3, tag_id: int) -> TagDetection:
 
 
 def test_seeds_theta_and_reprojects() -> None:
-  lens = LensSetup(extrinsic=gtsam.Pose3(), params=_PARAMS)  # lens == body
+  lens = LensSetup(
+    extrinsic=gtsam.Pose3(), params=_PARAMS, calibrated_radius=WIDE_CALIBRATED_RADIUS
+  )  # lens == body
   joint = RevoluteJoint(
     base_T_joint=_JOINT, lower=-0.7, upper=0.7, joint_T_tag0=_JOINT_T_TAG0
   )

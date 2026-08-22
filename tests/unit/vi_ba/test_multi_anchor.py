@@ -13,13 +13,18 @@ from specialist_corpus.fiducials import tag_corners_in_frame
 from specialist.vi_ba.anchor_detection import (
   TagDetection,
   non_anchor_tag_masks,
+  tag_center_bearing,
 )
-from specialist.vi_ba.build import LensChannel, LensSetup
+from specialist.vi_ba.build import LensChannel, LensSetup, add_mei_anchor_tag_factor
 from specialist.vi_ba.compose import (
   TrackerKeys,
   _bfs_world_alignments,
   align_to_shared_world,
+  anchor_corner_sigma,
+  anchor_sightings,
   anchored_keyframes,
+  corner_noise,
+  sighting_max_radius,
 )
 from specialist.vi_ba.configs import (
   AnchorCfg,
@@ -36,7 +41,7 @@ from specialist.vi_ba.single_tracker import (
 )
 from specialist.vi_ba.symbols import LANDMARK_CHAR
 from specialist.vi_ba.tag_discovery import GripperTags
-from tests.mei_fixtures import narrow_omni_params
+from tests.mei_fixtures import WIDE_CALIBRATED_RADIUS, narrow_omni_params
 
 
 def _pose(rx: float, ry: float, rz: float, x: float, y: float, z: float) -> gtsam.Pose3:
@@ -134,7 +139,9 @@ def _dummy_tracker(
   biases: list[gtsam.imuBias.ConstantBias] | None = None,
   preintegrated: list[gtsam.PreintegratedCombinedMeasurements] | None = None,
   front_tags_per_kf: list[list[TagDetection]] | None = None,
+  rear_tags_per_kf: list[list[TagDetection]] | None = None,
   velocities: list[np.ndarray] | None = None,
+  calibrated_radius: float = WIDE_CALIBRATED_RADIUS,
 ) -> PreparedTracker:
   n = len(body_poses)
   return PreparedTracker(
@@ -154,15 +161,25 @@ def _dummy_tracker(
     preintegrated=preintegrated or [],
     front=LensChannel(
       side="front",
-      setup=LensSetup(extrinsic=front_ext, params=narrow_omni_params()),
+      setup=LensSetup(
+        extrinsic=front_ext,
+        params=narrow_omni_params(),
+        calibrated_radius=calibrated_radius,
+      ),
       tags=(
         front_tags_per_kf if front_tags_per_kf is not None else [[] for _ in range(n)]
       ),
     ),
     rear=LensChannel(
       side="rear",
-      setup=LensSetup(extrinsic=rear_ext, params=narrow_omni_params()),
-      tags=[[] for _ in range(n)],
+      setup=LensSetup(
+        extrinsic=rear_ext,
+        params=narrow_omni_params(),
+        calibrated_radius=calibrated_radius,
+      ),
+      tags=(
+        rear_tags_per_kf if rear_tags_per_kf is not None else [[] for _ in range(n)]
+      ),
     ),
     anchor_obs_by_tag=(
       {prep_anchor_tag_id: anchor_obs_per_kf} if anchor_obs_per_kf else {}
@@ -514,3 +531,89 @@ def test_anchored_keyframes_union_over_all_anchors() -> None:
     anchor_obs_per_kf={0: gtsam.Pose3(), 1: gtsam.Pose3()},
   )
   assert anchored_keyframes(tracker) == {0, 1, 2}
+
+
+def test_anchor_corner_sigma_grows_past_the_calibrated_radius() -> None:
+  """Inside the lens's calibrated radius a corner carries the sigma floor;
+  past it the sigma climbs."""
+  assert anchor_corner_sigma(0.0, 1000.0, 1.05) == pytest.approx(1.05)
+  assert anchor_corner_sigma(1000.0, 1000.0, 1.05) == pytest.approx(1.05)
+  assert anchor_corner_sigma(1100.0, 1000.0, 1.05) == pytest.approx(4.1, rel=0.05)
+  assert anchor_corner_sigma(1200.0, 1000.0, 1.05) == pytest.approx(8.1, rel=0.05)
+
+
+def test_anchor_sightings_cover_both_lenses() -> None:
+  """Front and rear sightings both count: front through the factory chain,
+  rear through the solved seat."""
+  tracker = _dummy_tracker(
+    "a",
+    [gtsam.Pose3()],
+    {},
+    gtsam.Pose3(),
+    gtsam.Pose3(),
+    front_tags_per_kf=[[_tag(1, 60.0, 120.0)]],
+  )
+  tracker.rear.tags = [[_tag(1, 60.0, 120.0), _tag(1, 180.0, 120.0)]]
+  kept = anchor_sightings(tracker, 1)
+  assert len(kept) == 3
+  assert {ch.side for ch, _kf, _det in kept} == {"front", "rear"}
+
+
+def test_corner_noise_whitens_by_the_sighting_radius() -> None:
+  """A sighting past the calibrated radius carries a wider sigma than a
+  central one."""
+  frontal_det = _project_tag(
+    gtsam.Pose3(), narrow_omni_params(), _pose(0.0, 0.0, 0.0, 0.0, 0.0, 1.0), 1, 0.1
+  )
+  # Calibrated exactly to the frontal sighting, so it sits at the floor and
+  # anything further out is past the radius.
+  params = narrow_omni_params()
+  lens = LensSetup(
+    extrinsic=gtsam.Pose3(),
+    params=params,
+    calibrated_radius=sighting_max_radius(frontal_det.corners, params),
+  )
+  angle = np.deg2rad(80.0)
+  scene = {
+    1: _pose(0.0, 0.0, 0.0, 0.0, 0.0, 1.0),
+    2: _pose(0.0, 0.0, 0.0, float(np.sin(angle)), 0.0, float(np.cos(angle))),
+  }
+  keys = TrackerKeys(["a"])
+  key = keys.pose_key("a", 0)
+  values = gtsam.Values()
+  values.insert(key, gtsam.Pose3().retract(np.full(6, 1e-3)))
+
+  def sigma_of(tag_id: int) -> float:
+    """The sigma one corner factor whitens by: its cost at a small offset is
+    ``0.5 * (residual / sigma)**2``, inside the robust kernel's quadratic
+    region."""
+    world_T_tag = scene[tag_id]
+    det = _project_tag(gtsam.Pose3(), params, world_T_tag, tag_id, 0.1)
+    corner_world = tag_corners_in_frame(world_T_tag.matrix(), 0.1)[0]
+    corner_local = np.asarray(world_T_tag.transformTo(gtsam.Point3(*corner_world)))
+    anchor_key = keys.anchor_key(tag_id)
+    values.insert(anchor_key, world_T_tag)
+    graph = gtsam.NonlinearFactorGraph()
+    add_mei_anchor_tag_factor(
+      graph,
+      key,
+      anchor_key,
+      det.corners[0],
+      corner_noise(det.corners, lens, 0.9),
+      lens,
+      corner_local,
+      tag_center_bearing(det, params),
+    )
+    predicted = mei_project(
+      np.asarray(values.atPose3(key).transformTo(corner_world))[None, :], params
+    )[0]
+    residual = float(np.linalg.norm(predicted - det.corners[0]))
+    return residual / float(np.sqrt(2.0 * graph.at(0).error(values)))
+
+  assert sigma_of(1) == pytest.approx(0.9, rel=1e-6)
+  oblique = _project_tag(gtsam.Pose3(), params, scene[2], 2, 0.1)
+  expected = anchor_corner_sigma(
+    sighting_max_radius(oblique.corners, params), lens.calibrated_radius, 0.9
+  )
+  assert expected > 0.9
+  assert sigma_of(2) == pytest.approx(expected, rel=1e-6)

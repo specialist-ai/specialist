@@ -5,6 +5,7 @@ from __future__ import annotations
 import numpy as np
 
 from specialist.vi_ba.finger_kinematics import pin_angles_to_keyframes
+from tests.mei_fixtures import WIDE_CALIBRATED_RADIUS
 
 
 def test_pinned_series_passes_through_the_keyframe_angles() -> None:
@@ -59,7 +60,9 @@ def test_frame_angles_recover_a_dense_synthetic_motion() -> None:
   joint = RevoluteJoint(
     base_T_joint=joint_pose, lower=-0.7, upper=0.7, joint_T_tag0=joint_T_tag0
   )
-  lens = LensSetup(extrinsic=gtsam.Pose3(), params=params)
+  lens = LensSetup(
+    extrinsic=gtsam.Pose3(), params=params, calibrated_radius=WIDE_CALIBRATED_RADIUS
+  )
 
   true = np.concatenate([np.linspace(-0.1, 0.5, 9), [np.nan], np.linspace(0.5, 0.2, 5)])
   dets: list[list] = []
