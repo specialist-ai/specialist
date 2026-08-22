@@ -333,10 +333,7 @@ def build_run_estimate(
   urdf_joints: dict[str, RevoluteJoint],
 ) -> RunEstimate:
   """Each camera's payload from one solved graph, on the base recording's clock."""
-  anchor_poses_world = {
-    solve.ref_tag_id: solve.world_T_ref_anchor,
-    **solve.secondary_anchor_world,
-  }
+  anchor_poses_world = solve.anchor_world
   anchor_corners_by_tag = {
     tag_id: tag_corners_in_frame(pose.matrix(), args.anchor.tag_size)
     for tag_id, pose in anchor_poses_world.items()

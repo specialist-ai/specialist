@@ -204,8 +204,8 @@ def test_build_vi_graph_adds_velocity_bias_imu_factors() -> None:
   graph, values = _imu_only_graph(
     poses, vel, bias, pim, LensSetup(extrinsic=extrinsic, params=params)
   )
-  # 3 initial priors (X0, V0, B0) + 1 IMU factor = 4 factors; no projection.
-  assert graph.size() == 4
+  # 2 initial priors (V0, B0) + 1 IMU factor = 3 factors; no projection.
+  assert graph.size() == 3
   for i in range(2):
     assert values.exists(X(i))
     assert values.exists(V(i))
@@ -239,6 +239,9 @@ def test_build_vi_graph_stationary_lm_converges() -> None:
   pim = [_stationary_pim()]
   graph, values = _imu_only_graph(
     poses, vel, bias, pim, LensSetup(extrinsic=extrinsic, params=params)
+  )
+  graph.push_back(
+    gtsam.PriorFactorPose3(X(0), poses[0], gtsam.noiseModel.Isotropic.Sigma(6, 1e-4))
   )
   initial_err = graph.error(values)
   result = optimize_graph(graph, values, max_iterations=20)

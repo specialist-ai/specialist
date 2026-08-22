@@ -42,7 +42,7 @@ from specialist.vi_ba.features import (
   parallel_map,
 )
 from specialist.vi_ba.finger_kinematics import FingerReproj, recover_gripper_tags
-from specialist.vi_ba.geometry import translation
+from specialist.vi_ba.geometry import average_pose, consensus_pose, translation
 from specialist.vi_ba.imu import (
   GRAVITY,
   GRAVITY_WORLD,
@@ -148,8 +148,9 @@ class PreparedTracker:
   preintegrated: list[gtsam.PreintegratedCombinedMeasurements]
   front: LensChannel
   rear: LensChannel
-  # ``{tag_id: {kf: {side: cam_T_tag}}}``.
-  anchor_obs_by_tag: dict[int, dict[int, dict[str, gtsam.Pose3]]]
+  # Front-lens anchor PnP, ``{tag_id: {kf: cam_T_tag}}``.
+  anchor_obs_by_tag: dict[int, dict[int, gtsam.Pose3]]
+  # Each sighted anchor's pose in this tracker's local world.
   anchor_locals_by_tag: dict[int, gtsam.Pose3]
   body_T_base_tag: gtsam.Pose3
   # URDF joint name -> per-keyframe angle about the joint z-axis, NaN where unseen.
@@ -210,21 +211,15 @@ class _LensPrep:
 def _detect_anchor_obs(
   tag_id: int,
   tag_size: float,
-  lenses: tuple[_LensPrep, ...],
-) -> dict[int, dict[str, gtsam.Pose3]]:
-  """``{kf: {side: cam_T_tag}}`` for one anchor id over the given lenses, ungated."""
-  obs: dict[int, dict[str, gtsam.Pose3]] = {}
-  for lens in lenses:
-    for kf, pose in anchor_pose_from_tags(
-      lens.tags, tag_id, tag_size, lens.setup.params
-    ).items():
-      obs.setdefault(kf, {})[lens.side] = pose
-  return obs
+  front: _LensPrep,
+) -> dict[int, gtsam.Pose3]:
+  """``{kf: cam_T_tag}`` for one anchor id from the front lens alone, ungated."""
+  return anchor_pose_from_tags(front.tags, tag_id, tag_size, front.setup.params)
 
 
 def _choose_prep_anchor(
   tag_ids: tuple[int, ...],
-  obs_by_tag: dict[int, dict[int, dict[str, gtsam.Pose3]]],
+  obs_by_tag: dict[int, dict[int, gtsam.Pose3]],
 ) -> int:
   """The id sighted at most keyframes; a tie goes to the earlier ``tag_ids`` entry."""
   if not tag_ids:
@@ -232,29 +227,13 @@ def _choose_prep_anchor(
   return max(tag_ids, key=lambda tid: len(obs_by_tag[tid]))
 
 
-def _first_sighting_local(
-  obs: dict[int, dict[str, gtsam.Pose3]],
-  front_lens: LensSetup,
-  rear_lens: LensSetup,
-  body_poses: list[gtsam.Pose3],
-) -> gtsam.Pose3:
-  """An anchor's local-world pose from its first sighting, front lens preferred."""
-  first_kf = min(obs)
-  lens, cam_T_tag = _side_lens_and_pose(obs[first_kf], front_lens, rear_lens)
-  return body_poses[first_kf].compose(lens.extrinsic).compose(cam_T_tag)
-
-
 def _anchor_pose_seed(
-  anchor_obs_per_kf: dict[int, dict[str, gtsam.Pose3]],
+  anchor_obs_per_kf: dict[int, gtsam.Pose3],
   front_extrinsic: gtsam.Pose3,
   n_keyframes: int,
 ) -> list[gtsam.Pose3] | None:
   """Anchor-PnP body poses, gaps filled; ``None`` when too few keyframes see it."""
-  cam_poses = {
-    kf: sides["front"].inverse()
-    for kf, sides in anchor_obs_per_kf.items()
-    if "front" in sides
-  }
+  cam_poses = {kf: pose.inverse() for kf, pose in anchor_obs_per_kf.items()}
   if not _enough_registered(len(cam_poses), n_keyframes):
     return None
   return body_poses_from_camera_poses(
@@ -264,16 +243,14 @@ def _anchor_pose_seed(
 
 def _anchor_metric_scale(
   body_poses_unscaled: list[gtsam.Pose3],
-  anchor_obs_per_kf: dict[int, dict[str, gtsam.Pose3]],
+  anchor_obs_per_kf: dict[int, gtsam.Pose3],
   front_lens: LensSetup,
-  rear_lens: LensSetup,
 ) -> float | None:
   """Metric scale: anchor-implied over visual body-position spread, or ``None``."""
   vo: list[Float64Array] = []
   anc: list[Float64Array] = []
-  for kf, sides in anchor_obs_per_kf.items():
-    lens, cam_T_tag = _side_lens_and_pose(sides, front_lens, rear_lens)
-    body_in_tag = lens.extrinsic.compose(cam_T_tag).inverse()
+  for kf, cam_T_tag in anchor_obs_per_kf.items():
+    body_in_tag = front_lens.extrinsic.compose(cam_T_tag).inverse()
     anc.append(translation(body_in_tag))
     vo.append(translation(body_poses_unscaled[kf]))
   if len(vo) < 3:
@@ -285,15 +262,6 @@ def _anchor_metric_scale(
   if vo_spread < 1e-9:
     return None
   return anc_spread / vo_spread
-
-
-def _side_lens_and_pose(
-  sides: dict[str, gtsam.Pose3], front_lens: LensSetup, rear_lens: LensSetup
-) -> tuple[LensSetup, gtsam.Pose3]:
-  """The anchor observation's lens and ``cam_T_tag``, front lens preferred."""
-  if "front" in sides:
-    return front_lens, sides["front"]
-  return rear_lens, sides["rear"]
 
 
 def _imu_and_initial_gravity(
@@ -336,7 +304,7 @@ def _seed_body_poses(
   front: _LensPrep,
   rear: _LensPrep,
   n_keyframes: int,
-  anchor_obs_per_kf: dict[int, dict[str, gtsam.Pose3]],
+  anchor_obs_per_kf: dict[int, gtsam.Pose3],
   cfg: FrontendCfg,
 ) -> tuple[list[gtsam.Pose3], bool]:
   """The pre-alignment body-pose seed and whether it came from the anchor."""
@@ -354,7 +322,7 @@ def _seed_body_poses(
 
   anchor_seed = _anchor_pose_seed(anchor_obs_per_kf, front.setup.extrinsic, n_keyframes)
   if anchor_seed is not None:
-    n_anchor_kf = sum("front" in sides for sides in anchor_obs_per_kf.values())
+    n_anchor_kf = len(anchor_obs_per_kf)
     print(
       f"  [{name}/vo] starved ({len(sfm_cams)}/{n_keyframes}); "
       f"anchor-pose init from {n_anchor_kf} anchor keyframes"
@@ -591,7 +559,7 @@ def prepare_tracker(args: TrackerArgs, tags: GripperTags) -> PreparedTracker:
     ),
   )
   obs_by_tag = {
-    tag_id: _detect_anchor_obs(tag_id, args.anchor.tag_size, (front, rear))
+    tag_id: _detect_anchor_obs(tag_id, args.anchor.tag_size, front)
     for tag_id in args.anchor.enabled_tag_ids
   }
   prep_anchor_tag_id = _choose_prep_anchor(args.anchor.enabled_tag_ids, obs_by_tag)
@@ -657,7 +625,7 @@ def prepare_tracker(args: TrackerArgs, tags: GripperTags) -> PreparedTracker:
 
   # Scale: 1.0 for an anchor seed, else from a visible anchor, else floated on the IMU.
   anchor_scale = _anchor_metric_scale(
-    body_poses_prealign, anchor_obs_per_kf, front_lens, rear_lens
+    body_poses_prealign, anchor_obs_per_kf, front_lens
   )
   body_poses, velocities, pim, prealign_to_world = _align_visual_inertial(
     name,
@@ -669,12 +637,22 @@ def prepare_tracker(args: TrackerArgs, tags: GripperTags) -> PreparedTracker:
     fixed_scale=1.0 if anchor_seed_used else anchor_scale,
   )
 
-  # Each sighted anchor's pose in this tracker's local world, for the shared-world BFS.
-  anchor_locals_by_tag: dict[int, gtsam.Pose3] = {
-    tag_id: _first_sighting_local(obs, front_lens, rear_lens, body_poses)
-    for tag_id, obs in obs_by_tag.items()
-    if obs
-  }
+  # Each sighted anchor's pose in this tracker's local world.
+  anchor_locals_by_tag: dict[int, gtsam.Pose3] = {}
+  for tag_id, obs in obs_by_tag.items():
+    if not obs:
+      continue
+    candidates = [
+      body_poses[kf].compose(front_lens.extrinsic).compose(cam_T_tag)
+      for kf, cam_T_tag in obs.items()
+    ]
+    agreed = consensus_pose(candidates)
+    if agreed is None:
+      print(
+        f"  [warn] [{name}/anchor] tag {tag_id} sightings split; seeding on the median"
+      )
+      agreed = average_pose(candidates)
+    anchor_locals_by_tag[tag_id] = agreed
 
   loop_tracks: dict[int, dict[int, Float64Array]] = {}
   if anchor_obs_per_kf and args.frontend.loop_closure:

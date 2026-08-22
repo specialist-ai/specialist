@@ -9,7 +9,7 @@ from functools import partial
 import gtsam
 import numpy as np
 import numpy.typing as npt
-from specialist_dataset.fiducials import tag_corners_in_frame, tag_corners_local
+from specialist_dataset.fiducials import tag_corners_local
 
 from specialist.vi_ba.anchor_detection import (
   TagDetection,
@@ -20,12 +20,11 @@ from specialist.vi_ba.anchor_detection import (
 from specialist.vi_ba.build import (
   LensChannel,
   LensSetup,
+  add_mei_anchor_tag_factor,
   add_mei_base_tag_factor,
   add_mei_cross_finger_factor,
   add_mei_cross_tag_factor,
-  add_mei_factor,
   add_mei_finger_factor,
-  add_mei_world_point_factor,
   build_vi_graph,
   huber_pixel_noise,
 )
@@ -58,7 +57,7 @@ _POSE_CHAR = "p"
 _VEL_CHAR = "v"
 _BIAS_CHAR = "b"
 _ANGLE_CHAR = "a"
-_SEC_CORNER_CHAR = "n"
+_ANCHOR_CHAR = "A"
 
 # Finger corner σ (px) and the symmetry prior σ (rad) on θ_left + θ_right.
 _FINGER_REPROJ_SIGMA = 1.5
@@ -69,13 +68,16 @@ _BASE_TAG_PRIOR_SIGMA_ROT = 0.3
 _BASE_TAG_PRIOR_SIGMA_TRANS = 0.05
 # Cross-tracker corner σ (px).
 _CROSS_REPROJ_SIGMA = 3.0
+# The datum holds yaw and position; the horizontal rotations are left to the IMU.
+_DATUM_SIGMA = 1e-4
+_DATUM_FREE_SIGMA = 1e3
 
 _MAX_KEYFRAMES_PER_TRACKER = 100_000
 _MAX_LANDMARKS_PER_TRACKER = 1_000_000
 
 
 class TrackerKeys:
-  """Collision-free GTSAM keys per tracker; anchor corners are constants, keyless."""
+  """Collision-free GTSAM keys per tracker; anchor keys use the tag id alone."""
 
   def __init__(
     self,
@@ -132,9 +134,9 @@ class TrackerKeys:
       gtsam.symbol(char, (self.tracker_index(name) * 2 + half) * width + index)
     )
 
-  def secondary_corner_key(self, tag_id: int, corner: int) -> int:
-    """Key for one freed secondary-anchor corner; tags own disjoint 4-slots."""
-    return int(gtsam.symbol(_SEC_CORNER_CHAR, tag_id * 4 + corner))
+  def anchor_key(self, tag_id: int) -> int:
+    """Key for a wall tag's world pose, shared by every tracker that sights it."""
+    return int(gtsam.symbol(_ANCHOR_CHAR, tag_id))
 
   def base_tag_key(self, name: str) -> int:
     """Key for the tracker's static base-tag pose in its body frame."""
@@ -143,9 +145,11 @@ class TrackerKeys:
 
 def _bfs_world_alignments(
   anchor_locals_by_tracker: dict[str, dict[int, gtsam.Pose3]],
+  sightings_by_tracker: dict[str, dict[int, int]],
   anchor_tag_ids: tuple[int, ...],
 ) -> tuple[dict[str, gtsam.Pose3], dict[int, gtsam.Pose3]]:
-  """Tracker alignments and anchor poses by BFS; raise on an unreachable tracker."""
+  """Each tracker's world alignment and anchor world poses by BFS over co-visibility
+  from the first anchor; raise when a tracker cannot reach it."""
   ref_tag_id = anchor_tag_ids[0]
   ref = next(
     (
@@ -169,11 +173,7 @@ def _bfs_world_alignments(
       )
       if via is None:
         continue
-      align = world_T_anchor[via].compose(locals_[via].inverse())
-      aligns[name] = align
-      for tag_id, local in locals_.items():
-        if tag_id not in world_T_anchor:
-          world_T_anchor[tag_id] = align.compose(local)
+      aligns[name] = world_T_anchor[via].compose(locals_[via].inverse())
       aligned_now.append(name)
     if not aligned_now:
       raise RuntimeError(
@@ -181,16 +181,41 @@ def _bfs_world_alignments(
         f"(established anchors: {sorted(world_T_anchor)}); the tracker-anchor "
         f"co-visibility graph is disconnected"
       )
+    for tag_id in {t for n in aligned_now for t in anchor_locals_by_tracker[n]}:
+      if tag_id in world_T_anchor:
+        continue
+      best = max(
+        (n for n in aligned_now if tag_id in anchor_locals_by_tracker[n]),
+        key=lambda n: sightings_by_tracker[n].get(tag_id, 0),
+      )
+      world_T_anchor[tag_id] = aligns[best].compose(
+        anchor_locals_by_tracker[best][tag_id]
+      )
     pending = [n for n in pending if n not in aligned_now]
   return aligns, world_T_anchor
 
 
 def align_to_shared_world(
   trackers: list[PreparedTracker], anchor_tag_ids: tuple[int, ...]
-) -> gtsam.Pose3:
-  """Move every tracker into the reference anchor's world; return its world pose."""
+) -> dict[int, gtsam.Pose3]:
+  """Move every tracker into the world whose origin and x heading are the reference
+  anchor's, returning each sighted anchor's world pose."""
   locals_by_tracker = {t.name: t.anchor_locals_by_tag for t in trackers}
-  aligns, world_T_anchor = _bfs_world_alignments(locals_by_tracker, anchor_tag_ids)
+  sightings_by_tracker = {
+    t.name: {tag_id: len(obs) for tag_id, obs in t.anchor_obs_by_tag.items()}
+    for t in trackers
+  }
+  aligns, world_T_anchor = _bfs_world_alignments(
+    locals_by_tracker, sightings_by_tracker, anchor_tag_ids
+  )
+  ref = world_T_anchor[anchor_tag_ids[0]]
+  x_axis = ref.rotation().matrix()[:, 0]
+  yaw = gtsam.Rot3.Rz(-float(np.arctan2(x_axis[1], x_axis[0])))
+  canon = gtsam.Pose3(yaw, yaw.rotate(gtsam.Point3(*-np.asarray(ref.translation()))))
+  aligns = {name: canon.compose(align) for name, align in aligns.items()}
+  world_T_anchor = {
+    tag_id: canon.compose(pose) for tag_id, pose in world_T_anchor.items()
+  }
   for t in trackers:
     align = aligns[t.name]
     align_R = align.rotation().matrix()
@@ -199,7 +224,7 @@ def align_to_shared_world(
     t.velocities = [align_R @ v for v in t.velocities]
     for ch in t.lenses:
       ch.points = {tid: align_R @ p + align_t for tid, p in ch.points.items()}
-  return world_T_anchor[anchor_tag_ids[0]]
+  return world_T_anchor
 
 
 @dataclass(frozen=True)
@@ -271,6 +296,22 @@ def _finger_symmetry_factor(
   return gtsam.LinearContainerFactor(jacobian, lin_point)
 
 
+def anchor_datum_factor(
+  anchor_key: int, world_T_anchor: gtsam.Pose3
+) -> gtsam.PriorFactorPose3:
+  """The graph's datum: a prior on the anchor's position and yaw, with tilt free."""
+  rotation = world_T_anchor.rotation().matrix()
+  up = np.array([0.0, 0.0, 1.0])
+  free = np.eye(3) - np.outer(up, up)
+  world_cov = _DATUM_FREE_SIGMA**2 * free + _DATUM_SIGMA**2 * np.outer(up, up)
+  cov = np.zeros((6, 6))
+  cov[:3, :3] = rotation.T @ world_cov @ rotation
+  cov[3:, 3:] = _DATUM_SIGMA**2 * np.eye(3)
+  return gtsam.PriorFactorPose3(
+    anchor_key, world_T_anchor, gtsam.noiseModel.Gaussian.Covariance(cov)
+  )
+
+
 def anchor_sightings(
   tracker: PreparedTracker,
   anchor_tag_id: int,
@@ -287,21 +328,6 @@ def anchor_sightings(
   ]
 
 
-def _sighting_bearing(
-  obs: dict[int, dict[str, gtsam.Pose3]],
-  kf: int,
-  side: str,
-  det: TagDetection,
-  lens: LensSetup,
-) -> Float64Array:
-  """Cheirality bearing: the PnP tag position, else the detection-center ray."""
-  cam_T_tag = obs.get(kf, {}).get(side)
-  if cam_T_tag is None:
-    return tag_center_bearing(det, lens.params)
-  bearing = np.asarray(cam_T_tag.translation(), dtype=np.float64)
-  return bearing / np.linalg.norm(bearing)
-
-
 def anchored_keyframes(tracker: PreparedTracker) -> set[int]:
   """Keyframes with a PnP sighting of any configured anchor."""
   return set().union(*tracker.anchor_obs_by_tag.values())
@@ -312,29 +338,23 @@ def _add_corner_factors_for_anchor(
   keys: TrackerKeys,
   corner_noise: gtsam.noiseModel.Base,
   tag_id: int,
-  corners_world: Float64Array,
-  pnp_bearings: bool,
-  corner_keys: list[int] | None,
+  tag_size: float,
   max_half_angle: float,
   graph: gtsam.NonlinearFactorGraph,
 ) -> int:
-  """Add corner factors for sightings within ``max_half_angle``; return their count."""
+  """Add corner factors per sighting within ``max_half_angle``; return the count."""
+  corners = tag_corners_local(tag_size)
+  anchor_key = keys.anchor_key(tag_id)
   n_sightings = 0
   for t in trackers:
-    obs = t.anchor_obs_by_tag.get(tag_id, {}) if pnp_bearings else {}
     for ch, kf, det in anchor_sightings(t, tag_id, max_half_angle):
       n_sightings += 1
       pose_key = keys.pose_key(t.name, kf)
-      bearing = _sighting_bearing(obs, kf, ch.side, det, ch.setup)
-      for j, pixel in enumerate(det.corners):
-        if corner_keys is not None:
-          add_mei_factor(
-            graph, pose_key, corner_keys[j], pixel, corner_noise, ch.setup, bearing
-          )
-        else:
-          add_mei_world_point_factor(
-            graph, pose_key, pixel, corner_noise, ch.setup, corners_world[j], bearing
-          )
+      bearing = tag_center_bearing(det, ch.setup.params)
+      for corner, pixel in zip(corners, det.corners, strict=True):
+        add_mei_anchor_tag_factor(
+          graph, pose_key, anchor_key, pixel, corner_noise, ch.setup, corner, bearing
+        )
   return n_sightings
 
 
@@ -345,7 +365,6 @@ def _add_vi_subgraphs(
   graph: gtsam.NonlinearFactorGraph,
   values: gtsam.Values,
 ) -> None:
-  """One VI subgraph per tracker: poses, velocities, biases, landmarks and factors."""
   for t in trackers:
     build_vi_graph(
       body_poses=t.body_poses,
@@ -366,53 +385,45 @@ def _add_vi_subgraphs(
     )
 
 
-def _add_all_anchor_corner_factors(
+def _add_anchor_factors(
   trackers: list[PreparedTracker],
   keys: TrackerKeys,
   args: Args,
-  anchor_corners_world: Float64Array,
-  secondary_anchor_world: dict[int, gtsam.Pose3],
+  anchor_world: dict[int, gtsam.Pose3],
   graph: gtsam.NonlinearFactorGraph,
   values: gtsam.Values,
 ) -> None:
-  """Add corner factors for the reference anchor and each seeded secondary anchor."""
+  """Add each anchor's pose and corner factors, plus the datum on the reference."""
   corner_noise = huber_pixel_noise(args.anchor.corner_reproj_sigma)
-  n_ref = _add_corner_factors_for_anchor(
-    trackers,
-    keys,
-    corner_noise,
-    int(args.anchor.enabled_tag_ids[0]),
-    anchor_corners_world,
-    pnp_bearings=True,
-    corner_keys=None,
-    max_half_angle=args.anchor.max_half_angle,
-    graph=graph,
-  )
-  print(f"[graph] anchor corner reprojection: {n_ref} sightings")
-  sec_prior = gtsam.noiseModel.Isotropic.Sigma(
-    3, args.anchor.secondary_corner_prior_sigma
-  )
-  for tag_id, world_T_tag in secondary_anchor_world.items():
-    seed_corners = tag_corners_in_frame(world_T_tag.matrix(), args.anchor.tag_size)
-    corner_keys: list[int] | None = None
-    if args.anchor.free_secondary:
-      # Secondary corners are graph variables held near the seed by a loose prior.
-      corner_keys = [keys.secondary_corner_key(tag_id, j) for j in range(4)]
-      for key, xyz in zip(corner_keys, seed_corners, strict=True):
-        values.insert(key, xyz)
-        graph.add(gtsam.PriorFactorPoint3(key, xyz, sec_prior))
-    n_sec = _add_corner_factors_for_anchor(
+  reference = int(args.anchor.enabled_tag_ids[0])
+  for tag_id, world_T_tag in anchor_world.items():
+    key = keys.anchor_key(tag_id)
+    values.insert(key, world_T_tag)
+    n = _add_corner_factors_for_anchor(
       trackers,
       keys,
       corner_noise,
       tag_id,
-      seed_corners,
-      pnp_bearings=False,
-      corner_keys=corner_keys,
-      max_half_angle=args.anchor.max_half_angle,
-      graph=graph,
+      args.anchor.tag_size,
+      args.anchor.max_half_angle,
+      graph,
     )
-    print(f"[graph] secondary anchor {tag_id} corner reprojection: {n_sec} sightings")
+    print(f"[graph] anchor {tag_id} corner reprojection: {n} sightings")
+  for tag_id in args.anchor.enabled_tag_ids:
+    if int(tag_id) in anchor_world:
+      continue
+    rear = sum(
+      1
+      for t in trackers
+      for ch, _kf, _det in anchor_sightings(t, int(tag_id), args.anchor.max_half_angle)
+      if ch.side == "rear"
+    )
+    print(
+      f"  [warn] [graph] anchor {tag_id} has no world pose and carries no "
+      f"factors: prep resolves an anchor in the front lens alone, and this one "
+      f"was sighted there by no tracker ({rear} rear sightings unused)"
+    )
+  graph.add(anchor_datum_factor(keys.anchor_key(reference), anchor_world[reference]))
 
 
 def _add_gripper_factors(
@@ -605,16 +616,13 @@ def assemble_joint_graph(
   keys: TrackerKeys,
   args: Args,
   cross_obs: list[CrossSighting],
-  anchor_corners_world: Float64Array,
-  secondary_anchor_world: dict[int, gtsam.Pose3],
+  anchor_world: dict[int, gtsam.Pose3],
 ) -> tuple[gtsam.NonlinearFactorGraph, gtsam.Values]:
-  """Build the joint factor graph over every tracker and anchor."""
+  """Build the joint factor graph and initial values over every tracker and anchor."""
   graph = gtsam.NonlinearFactorGraph()
   values = gtsam.Values()
   _add_vi_subgraphs(trackers, keys, args, graph, values)
-  _add_all_anchor_corner_factors(
-    trackers, keys, args, anchor_corners_world, secondary_anchor_world, graph, values
-  )
+  _add_anchor_factors(trackers, keys, args, anchor_world, graph, values)
   base_tags, fingers = _add_gripper_factors(trackers, keys, args, graph, values)
   cross_base, cross_finger = _add_cross_tracker_factors(
     trackers, keys, args, cross_obs, graph, values
