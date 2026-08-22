@@ -14,7 +14,7 @@ import gtsam
 import numpy as np
 import numpy.typing as npt
 from pupil_apriltags import Detector
-from specialist_camera import MeiParams, mei_unproject
+from specialist_camera import MeiParams, mei_project, mei_unproject
 from specialist_corpus.fiducials import TAG_FAMILY, tag_corners_local
 
 from specialist.vi_ba.features import Rect, cpu_budget
@@ -176,13 +176,12 @@ def estimate_camera_to_tag_pose(
   corners_px: Float64Array,
   tag_size: float,
   params: MeiParams,
-  prev_cam_T_tag: gtsam.Pose3 | None = None,
 ) -> gtsam.Pose3 | None:
   """Camera → tag SE(3) from MEI-unprojected corners + planar IPPE PnP.
 
-  ``SOLVEPNP_IPPE`` returns both reflectional candidates; ``prev_cam_T_tag``
-  (the caller's gyro-propagated prior) selects between them, so the choice
-  stays valid through fast rotation.
+  ``SOLVEPNP_IPPE`` returns both reflectional candidates; cheirality drops the
+  back-facing one and the corner reprojection RMS ranks the survivors. Returns
+  ``None`` for a sighting with no finite pose.
   """
   bearings = mei_unproject(corners_px.astype(np.float64), params)
   if not np.all(np.isfinite(bearings)) or np.any(bearings[:, 2] <= 1e-3):
@@ -191,16 +190,17 @@ def estimate_camera_to_tag_pose(
   obj = tag_corners_local(tag_size).reshape(-1, 1, 3)
   k = np.eye(3)
   dist = np.zeros(4)
-  n_sols, rvecs, tvecs, _ = cv2.solvePnPGeneric(
+  _, rvecs, tvecs, _ = cv2.solvePnPGeneric(
     obj, normalized, k, dist, flags=cv2.SOLVEPNP_IPPE
   )
-  if n_sols == 0:
-    return None
   poses: list[gtsam.Pose3] = []
   for rvec, tvec in zip(rvecs, tvecs, strict=True):
     rmat, _ = cv2.Rodrigues(rvec)
     t = np.asarray(tvec, dtype=np.float64).reshape(3)
-    poses.append(gtsam.Pose3(gtsam.Rot3(rmat), gtsam.Point3(*t)))
+    if np.all(np.isfinite(rmat)) and np.all(np.isfinite(t)):
+      poses.append(gtsam.Pose3(gtsam.Rot3(rmat), gtsam.Point3(*t)))
+  if not poses:
+    return None
   # Bootstrap cheirality: tag +z must point toward the camera (R[:, 2] · t < 0).
   cheir = [
     p
@@ -209,14 +209,15 @@ def estimate_camera_to_tag_pose(
   ]
   if cheir:
     poses = cheir
-  if prev_cam_T_tag is None or len(poses) == 1:
+  if len(poses) == 1:
     return poses[0]
-  return min(
-    poses,
-    key=lambda p: float(
-      np.linalg.norm(gtsam.Rot3.Logmap(prev_cam_T_tag.rotation().between(p.rotation())))
-    ),
+  local = tag_corners_local(tag_size)
+  points = np.concatenate(
+    [(p.rotation().matrix() @ local.T).T + np.asarray(p.translation()) for p in poses]
   )
+  pixels = mei_project(points, params).reshape(len(poses), 4, 2)
+  rms = np.sqrt(np.mean(np.sum((pixels - corners_px) ** 2, axis=2), axis=1))
+  return poses[int(np.argmin(rms))]
 
 
 def anchor_pose_from_tags(
@@ -224,46 +225,18 @@ def anchor_pose_from_tags(
   tag_id: int,
   tag_size: float,
   params: MeiParams,
-  kf_rotations: list[Float64Array],
 ) -> dict[int, gtsam.Pose3]:
-  """``{kf_idx: camera→tag SE(3)}`` from pre-detected tag lists, threading
-  a gyro-propagated prior to disambiguate IPPE temporally.
-
-  ``kf_rotations[k]`` (one 3x3 per keyframe, gyro-derived) maps camera-frame
-  vectors at keyframe ``k-1`` into keyframe ``k``; the threaded prior is
-  rotated through the increments accumulated since its sighting."""
+  """``{kf_idx: camera→tag SE(3)}`` from pre-detected tag lists."""
   out: dict[int, gtsam.Pose3] = {}
-  prev: gtsam.Pose3 | None = None
-  prev_kf = 0
   for kf, tags in enumerate(tags_per_kf):
-    prior = _rotate_prior(prev, kf_rotations, prev_kf, kf) if prev is not None else None
     for det in tags:
       if det.tag_id != tag_id:
         continue
-      pose = estimate_camera_to_tag_pose(
-        det.corners, tag_size, params, prev_cam_T_tag=prior
-      )
+      pose = estimate_camera_to_tag_pose(det.corners, tag_size, params)
       if pose is not None:
         out[kf] = pose
-        prev = pose
-        prev_kf = kf
         break
   return out
-
-
-def _rotate_prior(
-  prev: gtsam.Pose3,
-  kf_rotations: list[Float64Array],
-  prev_kf: int,
-  kf: int,
-) -> gtsam.Pose3:
-  """Predict a ``cam_T_tag`` prior at keyframe ``kf`` from the pose sighted at
-  ``prev_kf``: a pure camera rotation ``ΔR`` maps ``(R, t)`` to
-  ``(ΔR·R, ΔR·t)``, with ``ΔR`` composed from the per-keyframe increments."""
-  acc = np.eye(3)
-  for j in range(prev_kf + 1, kf + 1):
-    acc = kf_rotations[j] @ acc
-  return gtsam.Pose3(gtsam.Rot3(acc), gtsam.Point3(0, 0, 0)).compose(prev)
 
 
 def detect_all_tags(

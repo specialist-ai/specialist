@@ -1,9 +1,10 @@
 """Tests for ``vi_ba.anchor_detection.estimate_camera_to_tag_pose``.
 
-The two-fold reflectional ambiguity of planar 4-point PnP causes
-``cv2.SOLVEPNP_IPPE_SQUARE`` to flip between solutions when the camera is
-near-perpendicular to the tag. The estimator accepts a ``prev_cam_T_tag``
-prior so callers can disambiguate by temporal continuity.
+Planar 4-point PnP carries a two-fold reflectional ambiguity, and
+``cv2.SOLVEPNP_IPPE`` solves on the normalized plane where the twins fit almost
+equally. Reprojecting each candidate through the full MEI model separates them,
+so the estimator ranks by corner reprojection RMS and every sighting stands on
+its own frame.
 """
 
 from __future__ import annotations
@@ -113,29 +114,8 @@ def test_recovers_metric_distance_at_typical_handheld_range() -> None:
   )
 
 
-def test_temporal_prior_picks_solution_close_to_prior() -> None:
-  """When IPPE returns two solutions, prefer the one closer in rotation to
-  the supplied prior."""
-  params = _params()
-  tag_size = 0.10
-  cam_T_tag = _camera_facing_tag_pose((1.0, 0.5, 0.0), 0.10, 0.20)
-  corners = _project_tag(cam_T_tag, tag_size, params)
-  solutions = _ippe_solutions(corners, tag_size, params)
-  if len(solutions) < 2:
-    pytest.skip("IPPE returned a single solution for this geometry")
-
-  for prior in solutions:
-    chosen = estimate_camera_to_tag_pose(
-      corners, tag_size, params, prev_cam_T_tag=prior
-    )
-    assert chosen is not None
-    other = next(s for s in solutions if s is not prior)
-    assert _rot_geodesic(chosen, prior) <= _rot_geodesic(chosen, other)
-
-
-def test_prior_does_not_break_well_conditioned_views() -> None:
-  """For a well-tilted view IPPE's lowest-reproj solution matches truth; a
-  bad prior must not derail it past truth."""
+def test_well_conditioned_views_recover_truth() -> None:
+  """For a well-tilted view the lowest-reprojection solution matches truth."""
   params = _params()
   tag_size = 0.10
   cam_T_tag = _camera_facing_tag_pose((1.0, 0.5, 0.2), 0.5, 0.30)
@@ -162,48 +142,29 @@ def _flip_scenario() -> tuple[
   return params, tag_size, cam1_T_tag, cam2_T_tag, corners1, corners2, delta
 
 
-def test_stale_prior_flips_under_fast_rotation() -> None:
-  """The failure being guarded against: with only the stale frame-1 pose as
-  prior, fast rotation makes the estimator pick the reflected twin."""
-  params, tag_size, cam1_T_tag, cam2_T_tag, _, corners2, _ = _flip_scenario()
+def test_reprojection_ranking_picks_the_true_twin() -> None:
+  """The corner reprojection RMS through the full MEI model picks the true
+  IPPE solution from the frame alone."""
+  params, tag_size, _cam1_T_tag, cam2_T_tag, _, corners2, _ = _flip_scenario()
   if len(_ippe_solutions(corners2, tag_size, params)) < 2:
     pytest.skip("IPPE returned a single solution for this geometry")
-  naive = estimate_camera_to_tag_pose(
-    corners2, tag_size, params, prev_cam_T_tag=cam1_T_tag
-  )
-  assert naive is not None
-  assert _rot_geodesic(naive, cam2_T_tag) > 0.3
-
-
-def test_rotated_prior_keeps_true_twin_under_fast_rotation() -> None:
-  """Propagating the prior by the inter-frame camera rotation keeps the
-  selection on the true solution through the same fast rotation."""
-  params, tag_size, cam1_T_tag, cam2_T_tag, _, corners2, delta = _flip_scenario()
-  rotated_prior = gtsam.Pose3(gtsam.Rot3(delta), gtsam.Point3(0, 0, 0)).compose(
-    cam1_T_tag
-  )
-  est = estimate_camera_to_tag_pose(
-    corners2, tag_size, params, prev_cam_T_tag=rotated_prior
-  )
+  est = estimate_camera_to_tag_pose(corners2, tag_size, params)
   assert est is not None
   assert _rot_geodesic(est, cam2_T_tag) < 0.05
 
 
-def test_anchor_chain_propagates_prior_through_kf_rotations() -> None:
-  """``anchor_pose_from_tags`` with per-keyframe camera rotation increments
-  survives a fast rotation between sightings, including across a keyframe
-  with no sighting (increments accumulate)."""
-  params, tag_size, cam1_T_tag, cam2_T_tag, corners1, corners2, delta = _flip_scenario()
-  half = gtsam.Rot3.Rx(0.45).matrix()  # the fast rotation split over two keyframes
+def test_anchor_chain_resolves_each_frame_on_its_own() -> None:
+  """``anchor_pose_from_tags`` survives a fast rotation between sightings with
+  no temporal state at all, including across a keyframe with no sighting."""
+  params, tag_size, cam1_T_tag, cam2_T_tag, corners1, corners2, _ = _flip_scenario()
   tags_per_kf = [
     [TagDetection(tag_id=1, center=corners1.mean(0), corners=corners1)],
     [],
     [TagDetection(tag_id=1, center=corners2.mean(0), corners=corners2)],
   ]
-  out = anchor_pose_from_tags(
-    tags_per_kf, 1, tag_size, params, kf_rotations=[np.eye(3), half, half]
-  )
+  out = anchor_pose_from_tags(tags_per_kf, 1, tag_size, params)
   assert set(out) == {0, 2}
+  assert _rot_geodesic(out[0], cam1_T_tag) < 0.05
   assert _rot_geodesic(out[2], cam2_T_tag) < 0.05
 
 
@@ -277,3 +238,23 @@ def test_detector_pool_never_exceeds_the_cores_the_process_has(
   assert anchor_detection._detect_threads() == 4
   monkeypatch.setattr(anchor_detection, "cpu_budget", lambda: 384)
   assert anchor_detection._detect_threads() == anchor_detection._DETECT_THREADS
+
+
+def test_pnp_never_returns_a_non_finite_pose() -> None:
+  """The estimator declines rather than return a non-finite pose, which IPPE
+  hands back on near-degenerate quads."""
+  params = _params()
+  world_T_tag = gtsam.Pose3(gtsam.Rot3(), gtsam.Point3(0.0, 0.0, 1.2))
+  for k in range(24):
+    body = gtsam.Pose3(
+      gtsam.Rot3.Rodrigues(0.02 * k, 0.01 * k, 0.0),
+      gtsam.Point3(0.01 * k, 0.0, 0.0),
+    )
+    pixels = mei_project(
+      tag_corners_in_frame(body.inverse().compose(world_T_tag).matrix(), 0.1),
+      params,
+    )
+    if not np.all(np.isfinite(pixels)):
+      continue
+    pose = estimate_camera_to_tag_pose(pixels, 0.1, params)
+    assert pose is None or np.all(np.isfinite(pose.matrix())), k

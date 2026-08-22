@@ -185,24 +185,6 @@ def frame_finger_angles(
   return np.asarray(frames, dtype=np.int64), np.asarray(angles, dtype=np.float64)
 
 
-def _per_kf_cam_T_tag(
-  tags_per_kf: list[list[TagDetection]],
-  lens: LensSetup,
-  tag_id: int,
-  tag_size: float,
-  n_keyframes: int,
-  kf_rotations: list[Float64Array],
-) -> list[gtsam.Pose3 | None]:
-  """Per-keyframe ``cam_T_tag`` for one tag id as an index-aligned list;
-  IPPE disambiguated by the gyro-rotated prior."""
-  out: list[gtsam.Pose3 | None] = [None] * n_keyframes
-  for kf, p in anchor_pose_from_tags(
-    tags_per_kf[:n_keyframes], tag_id, tag_size, lens.params, kf_rotations
-  ).items():
-    out[kf] = p
-  return out
-
-
 def _joint_angles_per_kf(
   tags_per_kf: list[list[TagDetection]],
   lens: LensSetup,
@@ -210,20 +192,15 @@ def _joint_angles_per_kf(
   finger_tag_id: int,
   tag_size: float,
   n_keyframes: int,
-  kf_rotations: list[Float64Array],
 ) -> list[float]:
   """``Logmap(base_tag_T_finger)[2]`` per keyframe — the signed rotation about
-  the URDF revolute-joint axis (``+z`` by URDF convention). ``cam_T_base`` is
-  the rigidly mounted base tag's camera pose, averaged once over its sighted
-  keyframes; the finger tag's ``cam_T_tag`` is recovered per kf."""
-  cam_T_finger_per_kf = _per_kf_cam_T_tag(
-    tags_per_kf, lens, finger_tag_id, tag_size, n_keyframes, kf_rotations
-  )
+  the URDF revolute-joint axis (``+z`` by URDF convention), against the base
+  tag's pose averaged over its sightings."""
   out: list[float] = [float("nan")] * n_keyframes
-  for kf in range(n_keyframes):
-    cam_T_finger = cam_T_finger_per_kf[kf]
-    if cam_T_finger is None:
-      continue
+  cam_T_finger_per_kf = anchor_pose_from_tags(
+    tags_per_kf[:n_keyframes], finger_tag_id, tag_size, lens.params
+  )
+  for kf, cam_T_finger in cam_T_finger_per_kf.items():
     base_tag_T_finger = cam_T_base.between(cam_T_finger)
     out[kf] = float(gtsam.Rot3.Logmap(base_tag_T_finger.rotation())[2])
   return out
@@ -236,7 +213,6 @@ def recover_gripper_tags(
   lens: LensSetup,
   tag_size: float,
   n_keyframes: int,
-  kf_rotations: list[Float64Array],
   tags_per_frame: list[list[TagDetection]],
   frame_times: Float64Array,
 ) -> tuple[
@@ -262,7 +238,6 @@ def recover_gripper_tags(
     tag_id=tags.base,
     tag_size=tag_size,
     params=lens.params,
-    kf_rotations=kf_rotations,
   )
   if not base_tag_obs:
     raise ValueError(
@@ -270,10 +245,10 @@ def recover_gripper_tags(
       f"across {n_keyframes} rear keyframes — its base-tag, finger, and "
       f"cross-tracker factors would all be silently disabled"
     )
+  cam_T_base = average_pose(list(base_tag_obs.values()))
   body_T_base_tag = average_pose(
-    [lens.extrinsic.compose(p) for p in base_tag_obs.values()], "mean"
+    [lens.extrinsic.compose(p) for p in base_tag_obs.values()]
   )
-  cam_T_base = average_pose(list(base_tag_obs.values()), "mean")
 
   joint_angles: dict[str, list[float]] = {}
   finger_reproj: dict[str, FingerReproj] = {}
@@ -284,11 +259,10 @@ def recover_gripper_tags(
     joint_angles[joint_name] = _joint_angles_per_kf(
       tags_per_kf,
       lens,
-      cam_T_base=cam_T_base,
+      cam_T_base,
       finger_tag_id=finger_id,
       tag_size=tag_size,
       n_keyframes=n_keyframes,
-      kf_rotations=kf_rotations,
     )
     joint = joints[joint_name]
     reproj = build_finger_reproj(

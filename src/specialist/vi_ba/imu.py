@@ -28,7 +28,6 @@ __all__ = [
   "ImuSamples",
   "find_stationary_windows",
   "integrate_samples",
-  "keyframe_delta_rotations",
   "make_preintegration_params",
   "preintegrate_between_keyframes",
   "slice_samples_at_keyframes",
@@ -114,29 +113,6 @@ def make_preintegration_params(
   params.setBiasOmegaCovariance(np.eye(3) * gyro_walk**2)
   params.setBiasAccOmegaInit(np.eye(6) * _INITIAL_BIAS_SIGMA**2)
   return params
-
-
-def keyframe_delta_rotations(
-  samples: ImuSamples,
-  keyframe_times: Float64Array,
-) -> list[Float64Array]:
-  """Per-keyframe body attitude increments integrated from the gyro.
-
-  Entry ``k`` composes the gyro rotations over ``(t_{k-1}, t_k]`` so that
-  ``R_world_body(t_k) ≈ R_world_body(t_{k-1}) @ delta[k]``; entry 0 is the
-  identity. Zero-order hold over consecutive-sample intervals, matching
-  ``integrate_samples``. Windows without at least two samples come back as
-  the identity.
-  """
-  deltas: list[Float64Array] = [np.eye(3)]
-  for window in slice_samples_at_keyframes(samples, keyframe_times):
-    delta = np.eye(3)
-    for j in range(len(window) - 1):
-      dt = float(window.t[j + 1] - window.t[j])
-      if dt > 0.0:
-        delta = delta @ gtsam.Rot3.Expmap(window.gyro[j] * dt).matrix()
-    deltas.append(delta)
-  return deltas
 
 
 def slice_samples_at_keyframes(
