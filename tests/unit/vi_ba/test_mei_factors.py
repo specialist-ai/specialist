@@ -27,7 +27,7 @@ pytestmark = pytest.mark.skipif(
 Float64Array = npt.NDArray[np.float64]
 
 # Distinct keys per variable role, so one Values serves any factor arity.
-_POSE, _LM, _OBS, _OWN, _BT, _THETA = 0, 1, 2, 3, 4, 5
+_POSE, _LM, _OBS, _OWN, _BT, _THETA, _SEAT = 0, 1, 2, 3, 4, 5, 6
 
 
 def _real_params() -> MeiParams:
@@ -85,10 +85,11 @@ def _maker(
   keys: tuple[int, ...],
   geometry: tuple[object, ...],
   params: MeiParams,
+  **extra: int,
 ) -> Callable[[Float64Array, Float64Array], gtsam.NonlinearFactor]:
   """Native factories take keys, pixel, noise, geometry, intrinsics, then bearing."""
   return lambda pixel, bearing: factory(
-    *keys, pixel, unit_pixel_noise(), *geometry, *astuple(params), bearing
+    *keys, pixel, unit_pixel_noise(), *geometry, *astuple(params), bearing, **extra
   )
 
 
@@ -128,7 +129,7 @@ class _Case:
   residual_atol: float
   # A pixel shift that moves the Jacobian check off the optimum.
   offset: Float64Array = field(default_factory=lambda: np.array([2.0, -3.0]))
-  step: float = 1e-6
+  step: float = 1e-4
 
   @property
   def columns(self) -> int:
@@ -164,60 +165,6 @@ def _mei_case(name: str, extrinsic: gtsam.Pose3, params: MeiParams) -> _Case:
   )
 
 
-def _base_tag_case() -> _Case:
-  params = distorted_mei_params(xi=1.95)
-  extrinsic, btag, c = _small_extrinsic(), _base_tag_pose(), _tag_corner()
-  return _Case(
-    name="base tag",
-    params=params,
-    make=_maker(
-      _mei_factor_cpp.make_mei_base_tag_factor_cpp, (_BT,), (extrinsic, c), params
-    ),
-    blocks=((_BT, "pose", 6),),
-    configurations=(
-      (
-        "frontal",
-        _values(bt=btag),
-        _into_lens(extrinsic, _through(btag, c)),
-      ),
-    ),
-    residual_atol=1e-7,
-    offset=np.array([2.5, -1.5]),
-  )
-
-
-def _finger_case() -> _Case:
-  """The binary finger factor swept over the joint's travel."""
-  params = distorted_mei_params(xi=1.95)
-  extrinsic, btag, btj, c = (
-    _small_extrinsic(),
-    _base_tag_pose(),
-    _base_t_joint(),
-    _finger_corner(),
-  )
-  return _Case(
-    name="finger",
-    params=params,
-    make=_maker(
-      _mei_factor_cpp.make_mei_finger_factor_cpp,
-      (_THETA, _BT),
-      (extrinsic, btj, c),
-      params,
-    ),
-    blocks=((_THETA, "scalar", 1), (_BT, "pose", 6)),
-    configurations=tuple(
-      (
-        f"theta={theta}",
-        _values(theta=float(theta), bt=btag),
-        _into_lens(extrinsic, _through(btag, _through(btj, _pivoted(c, theta)))),
-      )
-      for theta in (-0.6, -0.25, 0.0, 0.15, 0.3, 0.4, 0.75)
-    ),
-    residual_atol=1e-7,
-    offset=np.array([3.0, -2.0]),
-  )
-
-
 def _cross_lens_point(
   x_o: gtsam.Pose3,
   x_w: gtsam.Pose3,
@@ -247,82 +194,199 @@ def _anchor_tag_case() -> _Case:
       params,
     ),
     blocks=((_POSE, "pose", 6), (_OWN, "pose", 6)),
-    configurations=(
+    # Swept out to the rim, where the corner noise is priced widest.
+    configurations=tuple(
       (
-        "frontal",
-        _values(pose=body, own=anchor),
+        label,
+        _values(pose=body, own=gtsam.Pose3(anchor.rotation(), gtsam.Point3(*xyz))),
         _into_lens(
           extrinsic,
-          np.asarray(body.transformTo(gtsam.Point3(*_through(anchor, c)))),
+          np.asarray(
+            body.transformTo(
+              gtsam.Point3(
+                *_through(gtsam.Pose3(anchor.rotation(), gtsam.Point3(*xyz)), c)
+              )
+            )
+          ),
         ),
-      ),
+      )
+      for label, xyz in (
+        ("frontal", (0.3, 0.1, 1.0)),
+        ("~50° off axis", (1.2, 0.3, 0.9)),
+        ("~80° off axis", (1.8, 0.1, 0.3)),
+        ("past 90° half-angle", (1.2, 0.0, -0.1)),
+      )
     ),
     residual_atol=1e-6,
     offset=np.array([2.0, -1.5]),
   )
 
 
-def _cross_cases() -> tuple[_Case, _Case]:
-  # Light distortion with a moderate super-fisheye xi.
-  params = distorted_mei_params(xi=1.6)
-  extrinsic, btag = _small_extrinsic(), _base_tag_pose()
+def _seated_cases() -> tuple[_Case, ...]:
+  """The seated variants, each with a 3-column Rot3 seat block as its last variable."""
+  params = distorted_mei_params(xi=1.95)
+  seat, btag, btj = _small_extrinsic(), _base_tag_pose(), _base_t_joint()
+  seat_rot = seat.rotation()
+  body = gtsam.Pose3(gtsam.Rot3.RzRyRx(0.07, -0.04, 0.11), gtsam.Point3(0.2, 0.1, 0.0))
+  anchor = gtsam.Pose3(gtsam.Rot3.RzRyRx(0.2, 0.1, -0.05), gtsam.Point3(0.3, 0.1, 1.0))
   x_o = gtsam.Pose3(gtsam.Rot3.RzRyRx(0.1, -0.05, 0.08), gtsam.Point3(0.05, -0.02, 0.0))
-  # Owner ~0.6 m in front of the observer so its tag is visible.
   x_w = gtsam.Pose3(gtsam.Rot3.RzRyRx(-0.1, 0.15, 0.05), gtsam.Point3(0.1, 0.05, 0.6))
-  btj, theta = _base_t_joint(), 0.3
+  theta = 0.3
   offset = np.array([2.0, -1.5])
-  tag = _Case(
-    name="cross tag",
-    params=params,
-    make=_maker(
-      _mei_factor_cpp.make_mei_cross_tag_factor_cpp,
-      (_OBS, _OWN, _BT),
-      (extrinsic, _tag_corner()),
-      params,
-    ),
-    blocks=((_OBS, "pose", 6), (_OWN, "pose", 6), (_BT, "pose", 6)),
-    configurations=(
-      (
-        "frontal",
-        _values(obs=x_o, own=x_w, bt=btag),
-        _cross_lens_point(x_o, x_w, btag, extrinsic, _tag_corner()),
-      ),
-    ),
-    residual_atol=1e-6,
-    offset=offset,
+
+  # The stitched-convention seat; the base tag reprojects through its 90-degree roll.
+  rear = _rear_extrinsic()
+  rear_lens_xyz = np.array([0.2, -0.1, 0.7])
+  bt_rot = gtsam.Rot3.RzRyRx(0.1, 0.2, -0.15)
+  rear_btag = gtsam.Pose3(
+    bt_rot,
+    gtsam.Point3(*(_through(rear, rear_lens_xyz) - bt_rot.matrix() @ _tag_corner())),
   )
-  finger = _Case(
-    name="cross finger",
-    params=params,
-    make=_maker(
-      _mei_factor_cpp.make_mei_cross_finger_factor_cpp,
-      (_OBS, _OWN, _BT, _THETA),
-      (extrinsic, btj, _finger_corner()),
-      params,
-    ),
-    blocks=(
-      (_OBS, "pose", 6),
-      (_OWN, "pose", 6),
-      (_BT, "pose", 6),
-      (_THETA, "scalar", 1),
-    ),
-    configurations=(
-      (
-        "frontal",
-        _values(obs=x_o, own=x_w, bt=btag, theta=theta),
-        _cross_lens_point(
-          x_o,
-          x_w,
-          btag,
-          extrinsic,
-          _through(btj, _pivoted(_finger_corner(), theta)),
+
+  return (
+    _Case(
+      name="seated anchor tag",
+      params=params,
+      make=_maker(
+        _mei_factor_cpp.make_mei_anchor_tag_factor_cpp,
+        (_POSE, _OWN),
+        (seat, _tag_corner()),
+        params,
+        seat_key=_SEAT,
+      ),
+      blocks=((_POSE, "pose", 6), (_OWN, "pose", 6), (_SEAT, "rot", 3)),
+      configurations=(
+        (
+          "frontal",
+          _values(pose=body, own=anchor, seat=seat_rot),
+          _into_lens(
+            seat,
+            np.asarray(
+              body.transformTo(gtsam.Point3(*_through(anchor, _tag_corner())))
+            ),
+          ),
         ),
       ),
+      residual_atol=1e-6,
+      offset=offset,
     ),
-    residual_atol=1e-6,
-    offset=offset,
+    _Case(
+      name="seated base tag",
+      params=params,
+      make=_maker(
+        _mei_factor_cpp.make_mei_seated_base_tag_factor_cpp,
+        (_BT, _SEAT),
+        (seat, _tag_corner()),
+        params,
+      ),
+      blocks=((_BT, "pose", 6), (_SEAT, "rot", 3)),
+      configurations=(
+        (
+          "frontal",
+          _values(bt=btag, seat=seat_rot),
+          _into_lens(seat, _through(btag, _tag_corner())),
+        ),
+      ),
+      residual_atol=1e-7,
+      offset=offset,
+    ),
+    _Case(
+      name="seated base tag rear seat",
+      params=params,
+      make=_maker(
+        _mei_factor_cpp.make_mei_seated_base_tag_factor_cpp,
+        (_BT, _SEAT),
+        (rear, _tag_corner()),
+        params,
+      ),
+      blocks=((_BT, "pose", 6), (_SEAT, "rot", 3)),
+      configurations=(
+        ("frontal", _values(bt=rear_btag, seat=rear.rotation()), rear_lens_xyz),
+      ),
+      residual_atol=1e-7,
+      offset=offset,
+    ),
+    _Case(
+      name="seated finger",
+      params=params,
+      make=_maker(
+        _mei_factor_cpp.make_mei_seated_finger_factor_cpp,
+        (_THETA, _BT, _SEAT),
+        (seat, btj, _finger_corner()),
+        params,
+      ),
+      blocks=((_THETA, "scalar", 1), (_BT, "pose", 6), (_SEAT, "rot", 3)),
+      configurations=tuple(
+        (
+          f"theta={sweep}",
+          _values(theta=float(sweep), bt=btag, seat=seat_rot),
+          _into_lens(
+            seat, _through(btag, _through(btj, _pivoted(_finger_corner(), sweep)))
+          ),
+        )
+        for sweep in (-0.6, -0.25, 0.0, 0.15, 0.3, 0.4, 0.75)
+      ),
+      residual_atol=1e-7,
+      offset=offset,
+    ),
+    _Case(
+      name="seated cross tag",
+      params=params,
+      make=_maker(
+        _mei_factor_cpp.make_mei_seated_cross_tag_factor_cpp,
+        (_OBS, _OWN, _BT, _SEAT),
+        (seat, _tag_corner()),
+        params,
+      ),
+      blocks=(
+        (_OBS, "pose", 6),
+        (_OWN, "pose", 6),
+        (_BT, "pose", 6),
+        (_SEAT, "rot", 3),
+      ),
+      configurations=(
+        (
+          "frontal",
+          _values(obs=x_o, own=x_w, bt=btag, seat=seat_rot),
+          _cross_lens_point(x_o, x_w, btag, seat, _tag_corner()),
+        ),
+      ),
+      residual_atol=1e-6,
+      offset=offset,
+    ),
+    _Case(
+      name="seated cross finger",
+      params=params,
+      make=_maker(
+        _mei_factor_cpp.make_mei_seated_cross_finger_factor_cpp,
+        (_OBS, _OWN, _BT, _THETA, _SEAT),
+        (seat, btj, _finger_corner()),
+        params,
+      ),
+      blocks=(
+        (_OBS, "pose", 6),
+        (_OWN, "pose", 6),
+        (_BT, "pose", 6),
+        (_THETA, "scalar", 1),
+        (_SEAT, "rot", 3),
+      ),
+      configurations=(
+        (
+          "frontal",
+          _values(obs=x_o, own=x_w, bt=btag, theta=theta, seat=seat_rot),
+          _cross_lens_point(
+            x_o,
+            x_w,
+            btag,
+            seat,
+            _through(btj, _pivoted(_finger_corner(), theta)),
+          ),
+        ),
+      ),
+      residual_atol=1e-6,
+      offset=offset,
+    ),
   )
-  return tag, finger
 
 
 def _cases() -> tuple[_Case, ...]:
@@ -332,9 +396,7 @@ def _cases() -> tuple[_Case, ...]:
     _mei_case("mei front", gtsam.Pose3(), _real_params()),
     _mei_case("mei rear extrinsic", _rear_extrinsic(), _real_params()),
     _anchor_tag_case(),
-    _base_tag_case(),
-    _finger_case(),
-    *_cross_cases(),
+    *_seated_cases(),
   )
 
 
@@ -358,6 +420,10 @@ def _stepped(
     delta = np.zeros(6)
     delta[axis] = h
     out.update(key, values.atPose3(key).retract(delta))
+  elif kind == "rot":
+    delta = np.zeros(3)
+    delta[axis] = h
+    out.update(key, values.atRot3(key).retract(delta))
   elif kind == "point":
     delta = np.zeros(3)
     delta[axis] = h
@@ -400,7 +466,7 @@ def test_analytic_jacobians_match_a_central_finite_difference(case: _Case) -> No
     a, _ = factor.linearize(values).jacobian()
     assert a.shape == (2, case.columns), f"{label}: unexpected shape {a.shape}"
     fd = _finite_difference(factor, case, values)
-    assert np.allclose(a, fd, atol=1e-4), f"{label}: analytic={a}, fd={fd}"
+    assert np.allclose(a, fd, atol=1e-6), f"{label}: analytic={a}, fd={fd}"
 
 
 @_parametrized
@@ -429,7 +495,7 @@ def test_a_perturbed_pose_moves_the_residual_far_past_the_pixel_noise() -> None:
 
 
 def test_a_perturbed_finger_angle_moves_the_residual_far_past_the_pixel_noise() -> None:
-  case = _BY_NAME["finger"]
+  case = _BY_NAME["seated finger"]
   _label, values, p_lens = case.configurations[4]  # theta = 0.3
   factor = case.make(_pixel_for(case, p_lens), np.zeros(3))
   moved = _stepped(values, _THETA, "scalar", 0, 0.2)

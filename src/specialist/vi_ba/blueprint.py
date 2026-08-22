@@ -88,6 +88,7 @@ def _triad_overrides(
     axes[f"/{schema.base_tag(slot)}"] = rr.TransformAxes3D(TAG_AXIS)
     for side in schema.SIDES:
       axes[f"/{schema.lens(slot, side)}"] = rr.TransformAxes3D(_LENS_AXIS)
+    axes[f"/{schema.lens_seat(slot, 'rear')}"] = rr.TransformAxes3D(_LENS_AXIS)
     for finger in ("left_finger", "right_finger"):
       axes[f"/{schema.gripper_part(slot, finger)}"] = rr.TransformAxes3D(TAG_AXIS)
       axes[f"/{schema.joint_tag(slot, finger)}"] = rr.TransformAxes3D(TAG_AXIS)

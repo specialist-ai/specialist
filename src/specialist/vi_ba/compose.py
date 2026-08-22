@@ -21,10 +21,10 @@ from specialist.vi_ba.build import (
   LensChannel,
   LensSetup,
   add_mei_anchor_tag_factor,
-  add_mei_base_tag_factor,
-  add_mei_cross_finger_factor,
-  add_mei_cross_tag_factor,
-  add_mei_finger_factor,
+  add_mei_seated_base_tag_factor,
+  add_mei_seated_cross_finger_factor,
+  add_mei_seated_cross_tag_factor,
+  add_mei_seated_finger_factor,
   build_vi_graph,
   huber_pixel_noise,
 )
@@ -50,6 +50,7 @@ __all__ = [
   "assemble_joint_graph",
   "cross_sightings",
   "points_from_values",
+  "seat_evidence",
 ]
 
 _BASE_TAG_CHAR = "G"
@@ -57,15 +58,16 @@ _POSE_CHAR = "p"
 _VEL_CHAR = "v"
 _BIAS_CHAR = "b"
 _ANGLE_CHAR = "a"
+_SEAT_CHAR = "E"
 _ANCHOR_CHAR = "A"
 
 # Finger corner σ (px) and the symmetry prior σ (rad) on θ_left + θ_right.
 _FINGER_REPROJ_SIGMA = 1.5
 _FINGER_SYMMETRY_SIGMA = 0.05
-# Base-tag pose sigmas: corner reprojection (px) and loose PnP-seeded prior (rad, m).
+# Base-tag corner σ (px) and its PnP-seeded pose prior σ (rad, m).
 _BASE_TAG_REPROJ_SIGMA = 1.5
-_BASE_TAG_PRIOR_SIGMA_ROT = 0.3
-_BASE_TAG_PRIOR_SIGMA_TRANS = 0.05
+_BASE_TAG_PRIOR_SIGMA_ROT = 1.0
+_BASE_TAG_PRIOR_SIGMA_TRANS = 0.3
 # Cross-tracker corner σ (px).
 _CROSS_REPROJ_SIGMA = 3.0
 # Anchor corner σ growth (px) per unit fractional overshoot of the calibrated radius.
@@ -73,6 +75,8 @@ _SIGMA_PER_RADIUS = 40.0
 # The datum holds yaw and position; the horizontal rotations are left to the IMU.
 _DATUM_SIGMA = 1e-4
 _DATUM_FREE_SIGMA = 1e3
+# Loose rear-seat rotation prior σ (rad): factory seats err by several degrees.
+_SEAT_PRIOR_SIGMA_ROT = 0.2
 
 _MAX_KEYFRAMES_PER_TRACKER = 100_000
 _MAX_LANDMARKS_PER_TRACKER = 1_000_000
@@ -143,6 +147,10 @@ class TrackerKeys:
   def base_tag_key(self, name: str) -> int:
     """Key for the tracker's static base-tag pose in its body frame."""
     return int(gtsam.symbol(_BASE_TAG_CHAR, self.tracker_index(name)))
+
+  def seat_key(self, name: str) -> int:
+    """Key for the tracker's static rear-lens seat rotation."""
+    return int(gtsam.symbol(_SEAT_CHAR, self.tracker_index(name)))
 
 
 def _bfs_world_alignments(
@@ -246,7 +254,8 @@ def cross_sightings(
   trackers: list[PreparedTracker],
   base_tag_size: float,
 ) -> list[CrossSighting]:
-  """Every other-tracker sighting of a PnP-passing base tag or a modelled finger tag."""
+  """Every sighting of a tracker's base or finger tag in another tracker's rear lens;
+  raise when two keyframe grids disagree."""
   sightings: list[CrossSighting] = []
   for owner in trackers:
     # The base tag, plus each finger tag with URDF joint kinematics.
@@ -259,29 +268,29 @@ def cross_sightings(
       if observer is owner:
         continue
       n = min(observer.n_keyframes, owner.n_keyframes)
-      for ch in observer.lenses:
-        for kf in range(n):
-          for det in ch.tags[kf]:
-            tag_id = int(det.tag_id)
-            if tag_id not in targets:
-              continue
-            finger = targets[tag_id]
-            if finger is None and (
-              estimate_camera_to_tag_pose(det.corners, base_tag_size, ch.setup.params)
-              is None
-            ):
-              continue  # base-tag PnP gate: drop degenerate / behind-camera
-            sightings.append(
-              CrossSighting(
-                observer=observer.name,
-                owner=owner.name,
-                keyframe=kf,
-                lens=ch.setup,
-                corners=det.corners,
-                bearing=tag_center_bearing(det, ch.setup.params),
-                finger=finger,
-              )
+      ch = observer.rear
+      for kf in range(n):
+        for det in ch.tags[kf]:
+          tag_id = int(det.tag_id)
+          if tag_id not in targets:
+            continue
+          finger = targets[tag_id]
+          if finger is None and (
+            estimate_camera_to_tag_pose(det.corners, base_tag_size, ch.setup.params)
+            is None
+          ):
+            continue  # base-tag PnP gate: drop degenerate / behind-camera
+          sightings.append(
+            CrossSighting(
+              observer=observer.name,
+              owner=owner.name,
+              keyframe=kf,
+              lens=ch.setup,
+              corners=det.corners,
+              bearing=tag_center_bearing(det, ch.setup.params),
+              finger=finger,
             )
+          )
   return sightings
 
 
@@ -376,9 +385,18 @@ def _add_corner_factors_for_anchor(
       pose_key = keys.pose_key(t.name, kf)
       bearing = tag_center_bearing(det, ch.setup.params)
       sighting_noise = corner_noise(det.corners, ch.setup, base_sigma)
+      seat_key = keys.seat_key(t.name) if ch.side == "rear" else None
       for corner, pixel in zip(corners, det.corners, strict=True):
         add_mei_anchor_tag_factor(
-          graph, pose_key, anchor_key, pixel, sighting_noise, ch.setup, corner, bearing
+          graph,
+          pose_key,
+          anchor_key,
+          pixel,
+          sighting_noise,
+          ch.setup,
+          corner,
+          bearing,
+          seat_key=seat_key,
         )
   return n_sightings
 
@@ -445,6 +463,37 @@ def _add_anchor_factors(
   graph.add(anchor_datum_factor(keys.anchor_key(reference), anchor_world[reference]))
 
 
+def _add_seat_variables(
+  trackers: list[PreparedTracker],
+  keys: TrackerKeys,
+  graph: gtsam.NonlinearFactorGraph,
+  values: gtsam.Values,
+) -> None:
+  """One rear-seat rotation variable per tracker, with a prior at its factory value."""
+  noise = gtsam.noiseModel.Isotropic.Sigma(3, _SEAT_PRIOR_SIGMA_ROT)
+  for t in trackers:
+    key = keys.seat_key(t.name)
+    rot = t.rear.setup.extrinsic.rotation()
+    values.insert(key, rot)
+    graph.add(gtsam.PriorFactorRot3(key, rot, noise))
+
+
+def seat_evidence(
+  tracker: PreparedTracker,
+  solved_anchor_ids: Iterable[int],
+  cross_obs: list[CrossSighting],
+) -> tuple[int, int]:
+  """``(anchor, cross)`` counts of the rear-lens sightings that measure its seat."""
+  anchors = sum(
+    1
+    for tag_id in solved_anchor_ids
+    for ch, _kf, _det in anchor_sightings(tracker, int(tag_id))
+    if ch.side == "rear"
+  )
+  cross = sum(1 for s in cross_obs if s.observer == tracker.name)
+  return anchors, cross
+
+
 def _add_gripper_factors(
   trackers: list[PreparedTracker],
   keys: TrackerKeys,
@@ -470,7 +519,7 @@ def _add_gripper_factors(
     bt_key = keys.base_tag_key(t.name)
     values.insert(bt_key, t.body_T_base_tag)
     graph.add(gtsam.PriorFactorPose3(bt_key, t.body_T_base_tag, base_tag_prior_noise))
-    # Base-tag corners reproject through body_T_base_tag into this tracker's rear lens.
+    # The base tag reprojects via body_T_base_tag and the seat into its own rear lens.
     for dets in t.rear.tags:
       det = next((d for d in dets if int(d.tag_id) == t.tags.base), None)
       if det is None:
@@ -478,9 +527,10 @@ def _add_gripper_factors(
       bearing = tag_center_bearing(det, t.rear.setup.params)
       base_tag_noise = corner_noise(det.corners, t.rear.setup, _BASE_TAG_REPROJ_SIGMA)
       for j in range(4):
-        add_mei_base_tag_factor(
+        add_mei_seated_base_tag_factor(
           graph,
           bt_key,
+          keys.seat_key(t.name),
           det.corners[j],
           base_tag_noise,
           t.rear.setup,
@@ -500,10 +550,11 @@ def _add_gripper_factors(
         values.insert(tkey, float(obs.theta_seed))
         finger_noise = corner_noise(obs.pixels, t.rear.setup, _FINGER_REPROJ_SIGMA)
         for j in range(4):
-          add_mei_finger_factor(
+          add_mei_seated_finger_factor(
             graph,
             tkey,
             bt_key,
+            keys.seat_key(t.name),
             obs.pixels[j],
             finger_noise,
             t.rear.setup,
@@ -535,7 +586,8 @@ def _add_cross_tracker_factors(
   graph: gtsam.NonlinearFactorGraph,
   values: gtsam.Values,
 ) -> tuple[int, int]:
-  """Add cross-tracker base and finger factors where the owner's variables exist."""
+  """Add each cross sighting's corner factors on the owner variables that
+  ``_add_gripper_factors`` inserted; return the base and finger factor counts."""
   base_tag_corners = tag_corners_local(args.gripper.tag_size)
   tracker_by_name = {t.name: t for t in trackers}
   base_count = finger_count = 0
@@ -545,14 +597,16 @@ def _add_cross_tracker_factors(
     obs_key = keys.pose_key(sighting.observer, sighting.keyframe)
     owner_key = keys.pose_key(sighting.owner, sighting.keyframe)
     owner_bt_key = keys.base_tag_key(sighting.owner)
+    seat_key = keys.seat_key(sighting.observer)
     base_tag_noise = corner_noise(sighting.corners, sighting.lens, _CROSS_REPROJ_SIGMA)
     if sighting.finger is None:
       for j in range(4):
-        add_mei_cross_tag_factor(
+        add_mei_seated_cross_tag_factor(
           graph,
           obs_key,
           owner_key,
           owner_bt_key,
+          seat_key,
           sighting.corners[j],
           base_tag_noise,
           sighting.lens,
@@ -567,12 +621,13 @@ def _add_cross_tracker_factors(
       reproj = tracker_by_name[sighting.owner].finger_reproj[finger_name]
       theta_key = keys.theta_key(sighting.owner, sighting.finger, sighting.keyframe)
       for j in range(4):
-        add_mei_cross_finger_factor(
+        add_mei_seated_cross_finger_factor(
           graph,
           obs_key,
           owner_key,
           owner_bt_key,
           theta_key,
+          seat_key,
           sighting.corners[j],
           base_tag_noise,
           sighting.lens,
@@ -641,6 +696,7 @@ def assemble_joint_graph(
   graph = gtsam.NonlinearFactorGraph()
   values = gtsam.Values()
   _add_vi_subgraphs(trackers, keys, args, graph, values)
+  _add_seat_variables(trackers, keys, graph, values)
   _add_anchor_factors(trackers, keys, args, anchor_world, graph, values)
   base_tags, fingers = _add_gripper_factors(trackers, keys, args, graph, values)
   cross_base, cross_finger = _add_cross_tracker_factors(
@@ -662,6 +718,9 @@ def assemble_joint_graph(
     print(
       f"[graph] unanchored-stretch velocity smoothness priors: {velocities_smoothed}"
     )
+  for t in trackers:
+    anchors, cross = seat_evidence(t, anchor_world, cross_obs)
+    print(f"[graph] {t.name} rear-seat evidence: {anchors} anchor, {cross} cross")
   return graph, values
 
 

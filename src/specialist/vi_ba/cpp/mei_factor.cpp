@@ -1,19 +1,4 @@
-// MEI (unified-sphere + Brown-Conrady incl. k3) reprojection factors with
-// analytical Jacobians. Every factor reprojects an AprilTag corner through one
-// shared lens kernel (MeiCorner) and differs only in how the corner reaches the
-// body frame; the two finger factors also share a RevoluteCorner joint kernel:
-//   * MeiFactorCpp            — binary on (body_pose, world_landmark).
-//   * MeiAnchorTagFactorCpp   — binary on (body_pose, world_T_anchor); a wall
-//                               tag whose pose the bundle solves for.
-//   * MeiFingerFactorCpp      — binary on (theta, body_T_base_tag); a finger tag
-//                               on a 1-DoF joint off the base tag.
-//   * MeiBaseTagFactorCpp     — unary on body_T_base_tag; the base tag.
-//   * MeiCrossTagFactorCpp    — ternary on (observer_pose, owner_pose,
-//                               body_T_base_tag); owner's base tag seen by another.
-//   * MeiCrossFingerFactorCpp — quaternary, adds the owner's joint angle theta.
-// The forward projection mirrors mei_project in specialist_camera; the
-// analytical Jacobian is native-only, validated against finite differences of it.
-// Built by specialist.vi_ba._buildext and loaded by build.py.
+// MEI reprojection factors with analytical Jacobians, mirroring mei_project.
 
 #include <gtsam/base/VectorSpace.h>
 #include <gtsam/geometry/Point3.h>
@@ -23,10 +8,12 @@
 
 #include <pybind11/eigen.h>
 #include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
 
 #include <Eigen/Dense>
 #include <cmath>
 #include <memory>
+#include <optional>
 
 namespace py = pybind11;
 using namespace gtsam;
@@ -123,6 +110,22 @@ struct MeiCorner {
     j_mei_r_lb = j_mei * R_lb;
     return true;
   }
+
+  bool reproject_seated(const Rot3& seat, const Vector3& p_body,
+                        Vector2& residual, Matrix23& j_body,
+                        Matrix23& j_seat) const {
+    const Matrix3 R_sb = seat.matrix().transpose();
+    const Vector3 p_lens = R_sb * (p_body - t_bl);
+    Vector2 pixel_pred;
+    Matrix23 j_mei;
+    if (!mei_project_jac(p_lens, fx, fy, cx, cy, k1, k2, k3, p1, p2, xi,
+                         obs_bearing, pixel_pred, j_mei))
+      return false;
+    residual = pixel_pred - pixel;
+    j_body = j_mei * R_sb;
+    j_seat = j_mei * skew(p_lens);
+    return true;
+  }
 };
 
 // The finger factors' revolute joint: q = base_T_joint . Rz(theta) . c and dq/dtheta.
@@ -177,34 +180,49 @@ class MeiFactorCpp : public NoiseModelFactorN<Pose3, Point3> {
   }
 };
 
-// Binary on (body_pose X, world_T_anchor A): a wall tag whose pose is a
-// variable, so p_lens = lens_T_body . X^-1 . A . c
-class MeiAnchorTagFactorCpp : public NoiseModelFactorN<Pose3, Pose3> {
-  using Base = NoiseModelFactorN<Pose3, Pose3>;
+// On (X, world_T_anchor A[, seat Rot3]): p_lens = lens_T_body . X^-1 . A . c
+class MeiAnchorTagFactorCpp : public NoiseModelFactor {
   MeiCorner lens_;
   Vector3 c_;  // anchor corner in the tag frame
 
  public:
-  MeiAnchorTagFactorCpp(Key poseKey, Key anchorKey, const SharedNoiseModel& model,
-                        MeiCorner lens, const Vector3& c)
-      : Base(model, poseKey, anchorKey), lens_(std::move(lens)), c_(c) {}
+  MeiAnchorTagFactorCpp(Key poseKey, Key anchorKey, std::optional<Key> seatKey,
+                        const SharedNoiseModel& model, MeiCorner lens,
+                        const Vector3& c)
+      : NoiseModelFactor(model, seatKey ? KeyVector{poseKey, anchorKey, *seatKey}
+                                        : KeyVector{poseKey, anchorKey}),
+        lens_(std::move(lens)),
+        c_(c) {}
 
-  Vector evaluateError(const Pose3& X, const Pose3& A, OptionalMatrixType H1,
-                       OptionalMatrixType H2) const override {
+  Vector unwhitenedError(const Values& x,
+                         OptionalMatrixVecType H = nullptr) const override {
+    const Pose3& X = x.at<Pose3>(keys_[0]);
+    const Pose3& A = x.at<Pose3>(keys_[1]);
     const Matrix3 R_A = A.rotation().matrix();
     const Vector3 p_world = R_A * c_ + A.translation();
     const Matrix3 R_bw = X.rotation().matrix().transpose();
     const Vector3 p_body = R_bw * (p_world - X.translation());
+    const bool seated = keys_.size() == 3;
 
     Vector2 residual;
-    Matrix23 j_mei_r_lb;
-    if (!lens_.reproject(p_body, residual, j_mei_r_lb)) {
-      if (H1) *H1 = Matrix::Zero(2, 6);
-      if (H2) *H2 = Matrix::Zero(2, 6);
+    Matrix23 j_body, j_seat;
+    const bool active =
+        seated ? lens_.reproject_seated(x.at<Rot3>(keys_[2]), p_body, residual,
+                                        j_body, j_seat)
+               : lens_.reproject(p_body, residual, j_body);
+    if (!active) {
+      if (H) {
+        (*H)[0] = Matrix::Zero(2, 6);
+        (*H)[1] = Matrix::Zero(2, 6);
+        if (seated) (*H)[2] = Matrix::Zero(2, 3);
+      }
       return Vector2::Zero();
     }
-    if (H1) *H1 = pose_to_jac(j_mei_r_lb, p_body);
-    if (H2) *H2 = pose_from_jac(j_mei_r_lb * R_bw, R_A, c_);
+    if (H) {
+      (*H)[0] = pose_to_jac(j_body, p_body);
+      (*H)[1] = pose_from_jac(j_body * R_bw, R_A, c_);
+      if (seated) (*H)[2] = j_seat;
+    }
     return residual;
   }
 
@@ -213,180 +231,191 @@ class MeiAnchorTagFactorCpp : public NoiseModelFactorN<Pose3, Pose3> {
   }
 };
 
-// Binary on (theta, body_T_base_tag): a finger tag on a 1-DoF revolute joint
-// (rotation theta about the joint's +z axis) whose pivot is fixed in the base-tag
-// frame (base_T_joint, from the URDF). Camera and tag share the rigid body, so
-//   p_body = body_T_base_tag . base_T_joint . Rz(theta) . c
-class MeiFingerFactorCpp : public NoiseModelFactorN<double, Pose3> {
-  using Base = NoiseModelFactorN<double, Pose3>;
+// Seated variants: the lens seat is a Rot3 variable with its factory translation.
+
+// Binary on (body_T_base_tag, seat rotation).
+class MeiSeatedBaseTagFactorCpp : public NoiseModelFactorN<Pose3, Rot3> {
+  using Base = NoiseModelFactorN<Pose3, Rot3>;
+  MeiCorner lens_;
+  Vector3 c_;
+
+ public:
+  MeiSeatedBaseTagFactorCpp(Key baseTagKey, Key seatKey,
+                            const SharedNoiseModel& model, MeiCorner lens,
+                            const Vector3& c)
+      : Base(model, baseTagKey, seatKey),
+        lens_(std::move(lens)),
+        c_(c) {}
+
+  Vector evaluateError(const Pose3& body_T_base_tag, const Rot3& seat,
+                       OptionalMatrixType H1,
+                       OptionalMatrixType H2) const override {
+    const Matrix3 R_bt = body_T_base_tag.rotation().matrix();
+    const Vector3 p_body = R_bt * c_ + body_T_base_tag.translation();
+
+    Vector2 residual;
+    Matrix23 j_body, j_seat;
+    if (!lens_.reproject_seated(seat, p_body, residual, j_body, j_seat)) {
+      if (H1) *H1 = Matrix::Zero(2, 6);
+      if (H2) *H2 = Matrix::Zero(2, 3);
+      return Vector2::Zero();
+    }
+    if (H1) *H1 = pose_from_jac(j_body, R_bt, c_);
+    if (H2) *H2 = j_seat;
+    return residual;
+  }
+
+  gtsam::NonlinearFactor::shared_ptr clone() const override {
+    return std::make_shared<MeiSeatedBaseTagFactorCpp>(*this);
+  }
+};
+
+// Ternary on (theta, body_T_base_tag, seat rotation).
+class MeiSeatedFingerFactorCpp : public NoiseModelFactorN<double, Pose3, Rot3> {
+  using Base = NoiseModelFactorN<double, Pose3, Rot3>;
   MeiCorner lens_;
   RevoluteCorner joint_;
 
  public:
-  MeiFingerFactorCpp(Key thetaKey, Key baseTagKey, const SharedNoiseModel& model,
-                     MeiCorner lens, RevoluteCorner joint)
-      : Base(model, thetaKey, baseTagKey),
+  MeiSeatedFingerFactorCpp(Key thetaKey, Key baseTagKey, Key seatKey,
+                           const SharedNoiseModel& model, MeiCorner lens,
+                           RevoluteCorner joint)
+      : Base(model, thetaKey, baseTagKey, seatKey),
         lens_(std::move(lens)),
         joint_(std::move(joint)) {}
 
   Vector evaluateError(const double& theta, const Pose3& body_T_base_tag,
-                       OptionalMatrixType H1,
-                       OptionalMatrixType H2) const override {
+                       const Rot3& seat, OptionalMatrixType H1,
+                       OptionalMatrixType H2,
+                       OptionalMatrixType H3) const override {
     Vector3 q, dq_dtheta;
     joint_.corner(theta, q, dq_dtheta);
     const Matrix3 R_bt = body_T_base_tag.rotation().matrix();
     const Vector3 p_body = R_bt * q + body_T_base_tag.translation();
 
     Vector2 residual;
-    Matrix23 j_mei_r_lb;
-    if (!lens_.reproject(p_body, residual, j_mei_r_lb)) {
+    Matrix23 j_body, j_seat;
+    if (!lens_.reproject_seated(seat, p_body, residual, j_body, j_seat)) {
       if (H1) *H1 = Matrix::Zero(2, 1);
       if (H2) *H2 = Matrix::Zero(2, 6);
+      if (H3) *H3 = Matrix::Zero(2, 3);
       return Vector2::Zero();
     }
-    if (H1) *H1 = j_mei_r_lb * (R_bt * dq_dtheta);  // joint angle
-    if (H2) *H2 = pose_from_jac(j_mei_r_lb, R_bt, q);
+    if (H1) *H1 = j_body * (R_bt * dq_dtheta);
+    if (H2) *H2 = pose_from_jac(j_body, R_bt, q);
+    if (H3) *H3 = j_seat;
     return residual;
   }
 
   gtsam::NonlinearFactor::shared_ptr clone() const override {
-    return std::make_shared<MeiFingerFactorCpp>(*this);
+    return std::make_shared<MeiSeatedFingerFactorCpp>(*this);
   }
 };
 
-// Unary on body_T_base_tag: the base tag's corner is fixed in the base-tag frame,
-// so p_body = body_T_base_tag . c.
-class MeiBaseTagFactorCpp : public NoiseModelFactorN<Pose3> {
-  using Base = NoiseModelFactorN<Pose3>;
+// Quaternary on (observer X_O, owner X_W, owner body_T_base_tag, observer seat).
+class MeiSeatedCrossTagFactorCpp
+    : public NoiseModelFactorN<Pose3, Pose3, Pose3, Rot3> {
+  using Base = NoiseModelFactorN<Pose3, Pose3, Pose3, Rot3>;
   MeiCorner lens_;
-  Vector3 c_;  // tag corner in the base-tag frame
+  Vector3 c_;
 
  public:
-  MeiBaseTagFactorCpp(Key baseTagKey, const SharedNoiseModel& model,
-                      MeiCorner lens, const Vector3& c)
-      : Base(model, baseTagKey), lens_(std::move(lens)), c_(c) {}
-
-  Vector evaluateError(const Pose3& body_T_base_tag,
-                       OptionalMatrixType H1) const override {
-    const Matrix3 R_bt = body_T_base_tag.rotation().matrix();
-    const Vector3 p_body = R_bt * c_ + body_T_base_tag.translation();
-
-    Vector2 residual;
-    Matrix23 j_mei_r_lb;
-    if (!lens_.reproject(p_body, residual, j_mei_r_lb)) {
-      if (H1) *H1 = Matrix::Zero(2, 6);
-      return Vector2::Zero();
-    }
-    if (H1) *H1 = pose_from_jac(j_mei_r_lb, R_bt, c_);
-    return residual;
-  }
-
-  gtsam::NonlinearFactor::shared_ptr clone() const override {
-    return std::make_shared<MeiBaseTagFactorCpp>(*this);
-  }
-};
-
-// Ternary on (observer_pose X_O, owner_pose X_W, body_T_base_tag): observer O's
-// lens sees owner W's base tag, so
-//   p_lensO = lensO_T_bodyO . X_O^-1 . X_W . body_T_base_tag . c
-class MeiCrossTagFactorCpp : public NoiseModelFactorN<Pose3, Pose3, Pose3> {
-  using Base = NoiseModelFactorN<Pose3, Pose3, Pose3>;
-  MeiCorner lens_;
-  Vector3 c_;  // base tag corner in the base-tag frame
-
- public:
-  MeiCrossTagFactorCpp(Key observerKey, Key ownerKey, Key baseTagKey,
-                       const SharedNoiseModel& model, MeiCorner lens,
-                       const Vector3& c)
-      : Base(model, observerKey, ownerKey, baseTagKey),
+  MeiSeatedCrossTagFactorCpp(Key observerKey, Key ownerKey, Key baseTagKey,
+                             Key seatKey, const SharedNoiseModel& model,
+                             MeiCorner lens, const Vector3& c)
+      : Base(model, observerKey, ownerKey, baseTagKey, seatKey),
         lens_(std::move(lens)),
         c_(c) {}
 
   Vector evaluateError(const Pose3& X_O, const Pose3& X_W,
-                       const Pose3& body_T_base_tag, OptionalMatrixType H1,
-                       OptionalMatrixType H2,
-                       OptionalMatrixType H3) const override {
+                       const Pose3& body_T_base_tag, const Rot3& seat,
+                       OptionalMatrixType H1, OptionalMatrixType H2,
+                       OptionalMatrixType H3,
+                       OptionalMatrixType H4) const override {
     const Matrix3 R_bt = body_T_base_tag.rotation().matrix();
-    const Vector3 m = R_bt * c_ + body_T_base_tag.translation();  // owner body
+    const Vector3 m = R_bt * c_ + body_T_base_tag.translation();
     const Matrix3 R_W = X_W.rotation().matrix();
     const Vector3 p_world = R_W * m + X_W.translation();
     const Matrix3 R_bwO = X_O.rotation().matrix().transpose();
     const Vector3 p_bodyO = R_bwO * (p_world - X_O.translation());
 
     Vector2 residual;
-    Matrix23 j_mei_r_lb;
-    if (!lens_.reproject(p_bodyO, residual, j_mei_r_lb)) {
+    Matrix23 j_body, j_seat;
+    if (!lens_.reproject_seated(seat, p_bodyO, residual, j_body, j_seat)) {
       if (H1) *H1 = Matrix::Zero(2, 6);
       if (H2) *H2 = Matrix::Zero(2, 6);
       if (H3) *H3 = Matrix::Zero(2, 6);
+      if (H4) *H4 = Matrix::Zero(2, 3);
       return Vector2::Zero();
     }
-    if (H1) *H1 = pose_to_jac(j_mei_r_lb, p_bodyO);  // observer pose
+    if (H1) *H1 = pose_to_jac(j_body, p_bodyO);
     if (H2 || H3) {
-      const Matrix23 j_world = j_mei_r_lb * R_bwO;
-      if (H2) *H2 = pose_from_jac(j_world, R_W, m);  // owner pose
-      if (H3) *H3 = pose_from_jac(j_world * R_W, R_bt, c_);  // base-tag pose
+      const Matrix23 j_world = j_body * R_bwO;
+      if (H2) *H2 = pose_from_jac(j_world, R_W, m);
+      if (H3) *H3 = pose_from_jac(j_world * R_W, R_bt, c_);
     }
+    if (H4) *H4 = j_seat;
     return residual;
   }
 
   gtsam::NonlinearFactor::shared_ptr clone() const override {
-    return std::make_shared<MeiCrossTagFactorCpp>(*this);
+    return std::make_shared<MeiSeatedCrossTagFactorCpp>(*this);
   }
 };
 
-// Quaternary on (X_O, X_W, body_T_base_tag, theta): observer O's lens sees owner
-// W's finger tag, which rides W's revolute joint:
-//   p_lensO = lensO_T_bodyO . X_O^-1 . X_W . body_T_base_tag . base_T_joint
-//             . Rz(theta) . c
-class MeiCrossFingerFactorCpp
-    : public NoiseModelFactorN<Pose3, Pose3, Pose3, double> {
-  using Base = NoiseModelFactorN<Pose3, Pose3, Pose3, double>;
+// Five keys: the seated cross-tag chain plus the owner's joint angle theta.
+class MeiSeatedCrossFingerFactorCpp
+    : public NoiseModelFactorN<Pose3, Pose3, Pose3, double, Rot3> {
+  using Base = NoiseModelFactorN<Pose3, Pose3, Pose3, double, Rot3>;
   MeiCorner lens_;
   RevoluteCorner joint_;
 
  public:
-  MeiCrossFingerFactorCpp(Key observerKey, Key ownerKey, Key baseTagKey,
-                          Key thetaKey, const SharedNoiseModel& model,
-                          MeiCorner lens, RevoluteCorner joint)
-      : Base(model, observerKey, ownerKey, baseTagKey, thetaKey),
+  MeiSeatedCrossFingerFactorCpp(Key observerKey, Key ownerKey, Key baseTagKey,
+                                Key thetaKey, Key seatKey,
+                                const SharedNoiseModel& model, MeiCorner lens,
+                                RevoluteCorner joint)
+      : Base(model, observerKey, ownerKey, baseTagKey, thetaKey, seatKey),
         lens_(std::move(lens)),
         joint_(std::move(joint)) {}
 
   Vector evaluateError(const Pose3& X_O, const Pose3& X_W,
                        const Pose3& body_T_base_tag, const double& theta,
-                       OptionalMatrixType H1, OptionalMatrixType H2,
-                       OptionalMatrixType H3,
-                       OptionalMatrixType H4) const override {
+                       const Rot3& seat, OptionalMatrixType H1,
+                       OptionalMatrixType H2, OptionalMatrixType H3,
+                       OptionalMatrixType H4,
+                       OptionalMatrixType H5) const override {
     Vector3 q, dq_dtheta;
     joint_.corner(theta, q, dq_dtheta);
     const Matrix3 R_bt = body_T_base_tag.rotation().matrix();
-    const Vector3 m = R_bt * q + body_T_base_tag.translation();  // owner body
+    const Vector3 m = R_bt * q + body_T_base_tag.translation();
     const Matrix3 R_W = X_W.rotation().matrix();
     const Vector3 p_world = R_W * m + X_W.translation();
     const Matrix3 R_bwO = X_O.rotation().matrix().transpose();
     const Vector3 p_bodyO = R_bwO * (p_world - X_O.translation());
 
     Vector2 residual;
-    Matrix23 j_mei_r_lb;
-    if (!lens_.reproject(p_bodyO, residual, j_mei_r_lb)) {
+    Matrix23 j_body, j_seat;
+    if (!lens_.reproject_seated(seat, p_bodyO, residual, j_body, j_seat)) {
       if (H1) *H1 = Matrix::Zero(2, 6);
       if (H2) *H2 = Matrix::Zero(2, 6);
       if (H3) *H3 = Matrix::Zero(2, 6);
       if (H4) *H4 = Matrix::Zero(2, 1);
+      if (H5) *H5 = Matrix::Zero(2, 3);
       return Vector2::Zero();
     }
-    if (H1) *H1 = pose_to_jac(j_mei_r_lb, p_bodyO);  // observer pose
-    const Matrix23 j_world = j_mei_r_lb * R_bwO;
-    if (H2) *H2 = pose_from_jac(j_world, R_W, m);  // owner pose
-    const Matrix23 j_m = j_world * R_W;  // w.r.t. m (owner-body corner)
-    if (H3) *H3 = pose_from_jac(j_m, R_bt, q);  // base-tag pose
-    if (H4) *H4 = (j_m * R_bt) * dq_dtheta;  // joint angle
+    const Matrix23 j_world = j_body * R_bwO;
+    const Matrix23 j_owner = j_world * R_W;
+    if (H1) *H1 = pose_to_jac(j_body, p_bodyO);
+    if (H2) *H2 = pose_from_jac(j_world, R_W, m);
+    if (H3) *H3 = pose_from_jac(j_owner, R_bt, q);
+    if (H4) *H4 = j_owner * (R_bt * dq_dtheta);
+    if (H5) *H5 = j_seat;
     return residual;
   }
 
   gtsam::NonlinearFactor::shared_ptr clone() const override {
-    return std::make_shared<MeiCrossFingerFactorCpp>(*this);
+    return std::make_shared<MeiSeatedCrossFingerFactorCpp>(*this);
   }
 };
 
@@ -402,54 +431,54 @@ static NoiseModelFactor::shared_ptr make_mei_factor_cpp(
                 obs_bearing));
 }
 
-static NoiseModelFactor::shared_ptr make_mei_finger_factor_cpp(
-    size_t thetaKey, size_t baseTagKey, const Vector2& pixel,
+static NoiseModelFactor::shared_ptr make_mei_seated_base_tag_factor_cpp(
+    size_t baseTagKey, size_t seatKey, const Vector2& pixel,
+    const SharedNoiseModel& model, const Pose3& extrinsic, const Vector3& c,
+    double fx, double fy, double cx, double cy, double k1, double k2, double k3,
+    double p1, double p2, double xi, const Vector3& obs_bearing) {
+  return std::make_shared<MeiSeatedBaseTagFactorCpp>(
+      baseTagKey, seatKey, model,
+      MeiCorner(extrinsic, fx, fy, cx, cy, k1, k2, k3, p1, p2, xi, pixel,
+                obs_bearing),
+      c);
+}
+
+static NoiseModelFactor::shared_ptr make_mei_seated_finger_factor_cpp(
+    size_t thetaKey, size_t baseTagKey, size_t seatKey, const Vector2& pixel,
     const SharedNoiseModel& model, const Pose3& extrinsic,
-    const Pose3& base_T_joint, const Vector3& c, double fx, double fy, double cx,
-    double cy, double k1, double k2, double k3, double p1, double p2, double xi,
-    const Vector3& obs_bearing) {
-  return std::make_shared<MeiFingerFactorCpp>(
-      thetaKey, baseTagKey, model,
+    const Pose3& base_T_joint, const Vector3& c, double fx, double fy,
+    double cx, double cy, double k1, double k2, double k3, double p1, double p2,
+    double xi, const Vector3& obs_bearing) {
+  return std::make_shared<MeiSeatedFingerFactorCpp>(
+      thetaKey, baseTagKey, seatKey, model,
       MeiCorner(extrinsic, fx, fy, cx, cy, k1, k2, k3, p1, p2, xi, pixel,
                 obs_bearing),
       RevoluteCorner(base_T_joint, c));
 }
 
-static NoiseModelFactor::shared_ptr make_mei_base_tag_factor_cpp(
-    size_t baseTagKey, const Vector2& pixel, const SharedNoiseModel& model,
-    const Pose3& extrinsic, const Vector3& c, double fx, double fy, double cx,
-    double cy, double k1, double k2, double k3, double p1, double p2, double xi,
+static NoiseModelFactor::shared_ptr make_mei_seated_cross_tag_factor_cpp(
+    size_t observerKey, size_t ownerKey, size_t baseTagKey, size_t seatKey,
+    const Vector2& pixel, const SharedNoiseModel& model, const Pose3& extrinsic,
+    const Vector3& c, double fx, double fy, double cx, double cy, double k1,
+    double k2, double k3, double p1, double p2, double xi,
     const Vector3& obs_bearing) {
-  return std::make_shared<MeiBaseTagFactorCpp>(
-      baseTagKey, model,
+  return std::make_shared<MeiSeatedCrossTagFactorCpp>(
+      observerKey, ownerKey, baseTagKey, seatKey, model,
       MeiCorner(extrinsic, fx, fy, cx, cy, k1, k2, k3, p1, p2, xi, pixel,
                 obs_bearing),
       c);
 }
 
-static NoiseModelFactor::shared_ptr make_mei_cross_tag_factor_cpp(
-    size_t observerKey, size_t ownerKey, size_t baseTagKey, const Vector2& pixel,
-    const SharedNoiseModel& model, const Pose3& observer_extrinsic,
-    const Vector3& c, double fx, double fy, double cx, double cy, double k1,
-    double k2, double k3, double p1, double p2, double xi,
-    const Vector3& obs_bearing) {
-  return std::make_shared<MeiCrossTagFactorCpp>(
-      observerKey, ownerKey, baseTagKey, model,
-      MeiCorner(observer_extrinsic, fx, fy, cx, cy, k1, k2, k3, p1, p2, xi,
-                pixel, obs_bearing),
-      c);
-}
-
-static NoiseModelFactor::shared_ptr make_mei_cross_finger_factor_cpp(
+static NoiseModelFactor::shared_ptr make_mei_seated_cross_finger_factor_cpp(
     size_t observerKey, size_t ownerKey, size_t baseTagKey, size_t thetaKey,
-    const Vector2& pixel, const SharedNoiseModel& model,
-    const Pose3& observer_extrinsic, const Pose3& base_T_joint, const Vector3& c,
+    size_t seatKey, const Vector2& pixel, const SharedNoiseModel& model,
+    const Pose3& extrinsic, const Pose3& base_T_joint, const Vector3& c,
     double fx, double fy, double cx, double cy, double k1, double k2, double k3,
     double p1, double p2, double xi, const Vector3& obs_bearing) {
-  return std::make_shared<MeiCrossFingerFactorCpp>(
-      observerKey, ownerKey, baseTagKey, thetaKey, model,
-      MeiCorner(observer_extrinsic, fx, fy, cx, cy, k1, k2, k3, p1, p2, xi,
-                pixel, obs_bearing),
+  return std::make_shared<MeiSeatedCrossFingerFactorCpp>(
+      observerKey, ownerKey, baseTagKey, thetaKey, seatKey, model,
+      MeiCorner(extrinsic, fx, fy, cx, cy, k1, k2, k3, p1, p2, xi, pixel,
+                obs_bearing),
       RevoluteCorner(base_T_joint, c));
 }
 
@@ -457,9 +486,10 @@ static NoiseModelFactor::shared_ptr make_mei_anchor_tag_factor_cpp(
     size_t poseKey, size_t anchorKey, const Vector2& pixel,
     const SharedNoiseModel& model, const Pose3& extrinsic, const Vector3& c,
     double fx, double fy, double cx, double cy, double k1, double k2, double k3,
-    double p1, double p2, double xi, const Vector3& obs_bearing) {
+    double p1, double p2, double xi,
+    const Vector3& obs_bearing, std::optional<size_t> seatKey) {
   return std::make_shared<MeiAnchorTagFactorCpp>(
-      poseKey, anchorKey, model,
+      poseKey, anchorKey, seatKey, model,
       MeiCorner(extrinsic, fx, fy, cx, cy, k1, k2, k3, p1, p2, xi, pixel,
                 obs_bearing),
       c);
@@ -472,28 +502,33 @@ PYBIND11_MODULE(_mei_factor_cpp, m) {
         py::arg("extrinsic"), py::arg("fx"), py::arg("fy"), py::arg("cx"),
         py::arg("cy"), py::arg("k1"), py::arg("k2"), py::arg("k3"),
         py::arg("p1"), py::arg("p2"), py::arg("xi"), py::arg("obs_bearing"));
-  m.def("make_mei_finger_factor_cpp", &make_mei_finger_factor_cpp,
-        py::arg("theta_key"), py::arg("base_tag_key"), py::arg("pixel"),
-        py::arg("noise"), py::arg("extrinsic"), py::arg("base_T_joint"),
-        py::arg("c"), py::arg("fx"), py::arg("fy"), py::arg("cx"),
-        py::arg("cy"), py::arg("k1"), py::arg("k2"), py::arg("k3"),
-        py::arg("p1"), py::arg("p2"), py::arg("xi"), py::arg("obs_bearing"));
-  m.def("make_mei_base_tag_factor_cpp", &make_mei_base_tag_factor_cpp,
-        py::arg("base_tag_key"), py::arg("pixel"), py::arg("noise"),
+  m.def("make_mei_seated_base_tag_factor_cpp",
+        &make_mei_seated_base_tag_factor_cpp, py::arg("base_tag_key"),
+        py::arg("seat_key"), py::arg("pixel"), py::arg("noise"),
         py::arg("extrinsic"), py::arg("c"), py::arg("fx"), py::arg("fy"),
         py::arg("cx"), py::arg("cy"), py::arg("k1"), py::arg("k2"),
         py::arg("k3"), py::arg("p1"), py::arg("p2"), py::arg("xi"),
         py::arg("obs_bearing"));
-  m.def("make_mei_cross_tag_factor_cpp", &make_mei_cross_tag_factor_cpp,
-        py::arg("observer_key"), py::arg("owner_key"), py::arg("base_tag_key"),
-        py::arg("pixel"), py::arg("noise"), py::arg("observer_extrinsic"),
-        py::arg("c"), py::arg("fx"), py::arg("fy"), py::arg("cx"), py::arg("cy"),
+  m.def("make_mei_seated_finger_factor_cpp", &make_mei_seated_finger_factor_cpp,
+        py::arg("theta_key"), py::arg("base_tag_key"), py::arg("seat_key"),
+        py::arg("pixel"), py::arg("noise"), py::arg("extrinsic"),
+        py::arg("base_T_joint"), py::arg("c"), py::arg("fx"), py::arg("fy"),
+        py::arg("cx"), py::arg("cy"), py::arg("k1"), py::arg("k2"),
+        py::arg("k3"), py::arg("p1"), py::arg("p2"), py::arg("xi"),
+        py::arg("obs_bearing"));
+  m.def("make_mei_seated_cross_tag_factor_cpp",
+        &make_mei_seated_cross_tag_factor_cpp, py::arg("observer_key"),
+        py::arg("owner_key"), py::arg("base_tag_key"), py::arg("seat_key"),
+        py::arg("pixel"), py::arg("noise"), py::arg("extrinsic"), py::arg("c"),
+        py::arg("fx"), py::arg("fy"), py::arg("cx"), py::arg("cy"),
         py::arg("k1"), py::arg("k2"), py::arg("k3"), py::arg("p1"),
-        py::arg("p2"), py::arg("xi"), py::arg("obs_bearing"));
-  m.def("make_mei_cross_finger_factor_cpp", &make_mei_cross_finger_factor_cpp,
-        py::arg("observer_key"), py::arg("owner_key"), py::arg("base_tag_key"),
-        py::arg("theta_key"), py::arg("pixel"), py::arg("noise"),
-        py::arg("observer_extrinsic"), py::arg("base_T_joint"), py::arg("c"),
+        py::arg("p2"), py::arg("xi"), 
+        py::arg("obs_bearing"));
+  m.def("make_mei_seated_cross_finger_factor_cpp",
+        &make_mei_seated_cross_finger_factor_cpp, py::arg("observer_key"),
+        py::arg("owner_key"), py::arg("base_tag_key"), py::arg("theta_key"),
+        py::arg("seat_key"), py::arg("pixel"), py::arg("noise"),
+        py::arg("extrinsic"), py::arg("base_T_joint"), py::arg("c"),
         py::arg("fx"), py::arg("fy"), py::arg("cx"), py::arg("cy"),
         py::arg("k1"), py::arg("k2"), py::arg("k3"), py::arg("p1"),
         py::arg("p2"), py::arg("xi"), py::arg("obs_bearing"));
@@ -502,5 +537,6 @@ PYBIND11_MODULE(_mei_factor_cpp, m) {
         py::arg("noise"), py::arg("extrinsic"), py::arg("c"), py::arg("fx"),
         py::arg("fy"), py::arg("cx"), py::arg("cy"), py::arg("k1"),
         py::arg("k2"), py::arg("k3"), py::arg("p1"), py::arg("p2"),
-        py::arg("xi"), py::arg("obs_bearing"));
+        py::arg("xi"),  py::arg("obs_bearing"),
+        py::arg("seat_key") = py::none());
 }

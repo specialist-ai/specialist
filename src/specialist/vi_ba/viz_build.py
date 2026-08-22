@@ -22,6 +22,7 @@ from specialist.vi_ba.compose import (
   anchor_sightings,
   anchored_keyframes,
   points_from_values,
+  seat_evidence,
 )
 from specialist.vi_ba.configs import Args
 from specialist.vi_ba.finger_kinematics import pin_angles_to_keyframes
@@ -179,6 +180,14 @@ def _build_camera_estimate(
   """One camera's estimate and summary line from the solved values."""
   lenses: dict[str, LensEstimate] = {}
   lens_rmse: dict[str, list[float]] = {}
+  seat = result.values.atRot3(keys.seat_key(tracker.name))
+  factory = tracker.rear.setup.extrinsic.rotation()
+  body_T_rear_lens = gtsam.Pose3(seat, tracker.rear.setup.extrinsic.translation())
+  seat_rotation = gtsam.Rot3.Logmap(factory.between(seat))
+  print(
+    f"  [{tracker.name}/viz] rear seat correction: "
+    f"{np.degrees(np.linalg.norm(seat_rotation)):.2f} deg"
+  )
   for channel, landmark_key, keep in (
     (tracker.front, keys.front_landmark_key, lens_keeps[0]),
     (tracker.rear, keys.rear_landmark_key, lens_keeps[1]),
@@ -207,6 +216,9 @@ def _build_camera_estimate(
   front_rmse = _rms(lens_rmse["front"])
   rear_rmse = _rms(lens_rmse["rear"])
   bbox_diagonal = bounding_box_diagonal(poses)
+  seat_anchor_obs, seat_cross_obs = seat_evidence(
+    tracker, anchor_corners_by_tag, cross_obs
+  )
   summary = CameraSummary(
     slot=tracker.name,
     n_keyframes=tracker.n_keyframes,
@@ -214,6 +226,13 @@ def _build_camera_estimate(
     front_rmse=front_rmse,
     rear_rmse=rear_rmse,
     base_tag_id=tracker.tags.base,
+    seat_rotation=(
+      float(seat_rotation[0]),
+      float(seat_rotation[1]),
+      float(seat_rotation[2]),
+    ),
+    seat_anchor_obs=seat_anchor_obs,
+    seat_cross_obs=seat_cross_obs,
   )
   rear_note = f" rear_rmse={rear_rmse:.2f}px" if np.isfinite(rear_rmse) else ""
   print(
@@ -275,6 +294,7 @@ def _build_camera_estimate(
     joint_frame_angles=joint_frame_angles,
     body_T_base_tag=tracker.body_T_base_tag,
     base_tag_id=tracker.tags.base,
+    body_T_rear_lens=body_T_rear_lens,
     joint_tags={
       joint: tag_id
       for joint, tag_id in zip(FINGER_JOINTS, tracker.tags.fingers, strict=True)

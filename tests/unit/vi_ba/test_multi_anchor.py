@@ -16,6 +16,8 @@ from specialist.vi_ba.anchor_detection import (
 from specialist.vi_ba.build import LensChannel, LensSetup, add_mei_anchor_tag_factor
 from specialist.vi_ba.compose import (
   TrackerKeys,
+  _add_anchor_factors,
+  _add_corner_factors_for_anchor,
   _bfs_world_alignments,
   align_to_shared_world,
   anchor_corner_sigma,
@@ -588,3 +590,107 @@ def test_corner_noise_whitens_by_the_sighting_radius() -> None:
   )
   assert expected > 0.9
   assert sigma_of(2) == pytest.approx(expected, rel=1e-6)
+
+
+def _anchor_corner_graph(
+  tracker: PreparedTracker, tag_id: int, tag_size: float, base_sigma: float
+) -> gtsam.NonlinearFactorGraph:
+  graph = gtsam.NonlinearFactorGraph()
+  _add_corner_factors_for_anchor(
+    [tracker], TrackerKeys([tracker.name]), base_sigma, tag_id, tag_size, graph
+  )
+  return graph
+
+
+def test_anchor_corner_factors_reach_the_graph_priced_by_radius() -> None:
+  """Sightings inside and well past the calibrated radius whiten by their own sigmas."""
+  params = narrow_mei_params()
+  calibrated_radius = 40.0
+  world_T_tag = _pose(0.0, 0.0, 0.0, 0.0, 0.0, 1.0)
+  central = _project_tag(gtsam.Pose3(), params, world_T_tag, 1, 0.1)
+  oblique_body = _pose(0.0, np.deg2rad(35.0), 0.0, 0.0, 0.0, 0.0)
+  oblique = _project_tag(oblique_body, params, world_T_tag, 1, 0.1)
+  assert sighting_max_radius(central.corners, params) < calibrated_radius
+  assert sighting_max_radius(oblique.corners, params) > calibrated_radius
+
+  tracker = _dummy_tracker(
+    "a",
+    [gtsam.Pose3(), oblique_body],
+    {},
+    gtsam.Pose3(),
+    gtsam.Pose3(),
+    front_tags_per_kf=[[central], [oblique]],
+    calibrated_radius=calibrated_radius,
+  )
+  graph = _anchor_corner_graph(tracker, 1, 0.1, 1.05)
+  keys = TrackerKeys(["a"])
+  values = gtsam.Values()
+  values.insert(keys.anchor_key(1), world_T_tag)
+  values.insert(keys.pose_key("a", 0), gtsam.Pose3().retract(np.full(6, 1e-4)))
+  values.insert(keys.pose_key("a", 1), oblique_body.retract(np.full(6, 1e-4)))
+
+  # The cost ratio of the two sightings is the inverse square of their sigma ratio.
+  costs = [graph.at(i).error(values) for i in range(graph.size())]
+  assert len(costs) == 8
+  expected = [
+    anchor_corner_sigma(
+      sighting_max_radius(det.corners, params), calibrated_radius, 1.05
+    )
+    for det in (central, oblique)
+  ]
+  assert expected[1] > 4.0 * expected[0]
+  assert sum(costs[4:]) / sum(costs[:4]) < (expected[0] / expected[1]) ** 2 * 10.0
+
+
+def test_a_rear_anchor_sighting_reprojects_through_the_solved_seat() -> None:
+  """A rear factor's third key is the seat; a front one uses the baked extrinsic."""
+  tracker = _dummy_tracker(
+    "a",
+    [gtsam.Pose3()],
+    {},
+    gtsam.Pose3(),
+    gtsam.Pose3(),
+    front_tags_per_kf=[[_tag(1, 60.0, 120.0)]],
+    rear_tags_per_kf=[[_tag(1, 180.0, 120.0)]],
+  )
+  graph = _anchor_corner_graph(tracker, 1, 0.1, 1.05)
+  keys = TrackerKeys(["a"])
+  seat_key = keys.seat_key("a")
+  by_arity: dict[int, list[tuple[int, ...]]] = {}
+  for i in range(graph.size()):
+    factor_keys = tuple(graph.at(i).keys())
+    by_arity.setdefault(len(factor_keys), []).append(factor_keys)
+
+  assert sorted(by_arity) == [2, 3]
+  assert len(by_arity[2]) == 4
+  assert len(by_arity[3]) == 4
+  assert all(seat_key not in fk for fk in by_arity[2])
+  assert all(fk[2] == seat_key for fk in by_arity[3])
+
+
+def test_an_anchor_no_front_lens_resolved_is_reported(
+  capsys: pytest.CaptureFixture[str],
+) -> None:
+  """A rear-only tag carries no factors and reports the sightings it drops."""
+  tracker = _dummy_tracker(
+    "a",
+    [gtsam.Pose3()],
+    {},
+    gtsam.Pose3(),
+    gtsam.Pose3(),
+    anchor_local=gtsam.Pose3(),
+    rear_tags_per_kf=[[_tag(5, 180.0, 120.0)]],
+  )
+  args = Args(
+    base=Path("session_base.rrd"),
+    anchor=AnchorCfg(tag_ids=(1, 5)),
+    solver=SolverCfg(gpu="off"),
+  )
+  graph = gtsam.NonlinearFactorGraph()
+  values = gtsam.Values()
+  _add_anchor_factors(
+    [tracker], TrackerKeys(["a"]), args, {1: gtsam.Pose3()}, graph, values
+  )
+  out = capsys.readouterr().out
+  assert "anchor 5 has no world pose" in out
+  assert "1 rear sightings unused" in out
