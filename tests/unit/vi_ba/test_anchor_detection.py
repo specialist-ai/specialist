@@ -117,7 +117,7 @@ def test_well_conditioned_views_recover_truth() -> None:
 
 
 def _flip_scenario() -> tuple[
-  MeiParams, float, gtsam.Pose3, gtsam.Pose3, np.ndarray, np.ndarray, np.ndarray
+  MeiParams, float, gtsam.Pose3, gtsam.Pose3, np.ndarray, np.ndarray
 ]:
   """Two frames where a fast pitch puts the stale prior nearer the wrong IPPE twin."""
   params = _params()
@@ -127,12 +127,12 @@ def _flip_scenario() -> tuple[
   cam2_T_tag = gtsam.Pose3(gtsam.Rot3(delta), gtsam.Point3(0, 0, 0)).compose(cam1_T_tag)
   corners1 = _project_tag(cam1_T_tag, tag_size, params)
   corners2 = _project_tag(cam2_T_tag, tag_size, params)
-  return params, tag_size, cam1_T_tag, cam2_T_tag, corners1, corners2, delta
+  return params, tag_size, cam1_T_tag, cam2_T_tag, corners1, corners2
 
 
 def test_reprojection_ranking_picks_the_true_twin() -> None:
   """Full-MEI corner reprojection RMS picks the true IPPE solution from one frame."""
-  params, tag_size, _cam1_T_tag, cam2_T_tag, _, corners2, _ = _flip_scenario()
+  params, tag_size, _cam1_T_tag, cam2_T_tag, _, corners2 = _flip_scenario()
   if len(_ippe_solutions(corners2, tag_size, params)) < 2:
     pytest.skip("IPPE returned a single solution for this geometry")
   est = estimate_camera_to_tag_pose(corners2, tag_size, params)
@@ -142,7 +142,7 @@ def test_reprojection_ranking_picks_the_true_twin() -> None:
 
 def test_anchor_chain_resolves_each_frame_on_its_own() -> None:
   """``anchor_pose_from_tags`` survives a fast turn and an unsighted keyframe."""
-  params, tag_size, cam1_T_tag, cam2_T_tag, corners1, corners2, _ = _flip_scenario()
+  params, tag_size, cam1_T_tag, cam2_T_tag, corners1, corners2 = _flip_scenario()
   tags_per_kf = [
     [TagDetection(tag_id=1, center=corners1.mean(0), corners=corners1)],
     [],
