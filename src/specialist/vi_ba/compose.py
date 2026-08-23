@@ -221,18 +221,15 @@ class CrossSighting:
 
 def cross_sightings(
   trackers: list[PreparedTracker],
-  base_tag_ids: list[int],
   base_tag_size: float,
 ) -> list[CrossSighting]:
   """Every other-tracker sighting of a PnP-passing base tag or a modelled finger tag."""
   sightings: list[CrossSighting] = []
-  for owner_idx, owner in enumerate(trackers):
+  for owner in trackers:
     # The base tag, plus each finger tag with URDF joint kinematics.
-    targets: dict[int, int | None] = {base_tag_ids[owner_idx]: None}
-    finger_ids = (owner.left_finger_tag_id, owner.right_finger_tag_id)
-    for idx, (name, finger_id) in enumerate(
-      zip(FINGER_JOINTS, finger_ids, strict=True)
-    ):
+    targets: dict[int, int | None] = {owner.tags.base: None}
+    fingers = zip(FINGER_JOINTS, owner.tags.fingers, strict=True)
+    for idx, (name, finger_id) in enumerate(fingers):
       if finger_id > 0 and name in owner.finger_reproj:
         targets[finger_id] = idx
     for observer in trackers:
@@ -440,35 +437,32 @@ def _add_gripper_factors(
   base_tag_corners = tag_corners_local(args.gripper.tag_size)
   finger_factor_count = 0
   base_tag_factor_count = 0
-  for t, base_tag_id in zip(trackers, args.base_tag_ids, strict=True):
+  for t in trackers:
     reprojs = {
       idx: reproj
       for idx, joint in enumerate(FINGER_JOINTS)
       if (reproj := t.finger_reproj.get(joint)) is not None
     }
-    if t.body_T_base_tag is None or (not reprojs and base_tag_id <= 0):
-      continue
     bt_key = keys.base_tag_key(t.name)
     values.insert(bt_key, t.body_T_base_tag)
     graph.add(gtsam.PriorFactorPose3(bt_key, t.body_T_base_tag, base_tag_prior_noise))
     # Base-tag corners reproject through body_T_base_tag into this tracker's rear lens.
-    if base_tag_id > 0:
-      for dets in t.rear.tags:
-        det = next((d for d in dets if int(d.tag_id) == base_tag_id), None)
-        if det is None:
-          continue
-        bearing = tag_center_bearing(det, t.rear.setup.params)
-        for j in range(4):
-          add_mei_base_tag_factor(
-            graph,
-            bt_key,
-            det.corners[j],
-            base_tag_noise,
-            t.rear.setup,
-            base_tag_corners[j],
-            bearing,
-          )
-          base_tag_factor_count += 1
+    for dets in t.rear.tags:
+      det = next((d for d in dets if int(d.tag_id) == t.tags.base), None)
+      if det is None:
+        continue
+      bearing = tag_center_bearing(det, t.rear.setup.params)
+      for j in range(4):
+        add_mei_base_tag_factor(
+          graph,
+          bt_key,
+          det.corners[j],
+          base_tag_noise,
+          t.rear.setup,
+          base_tag_corners[j],
+          bearing,
+        )
+        base_tag_factor_count += 1
     both_fingers = len(reprojs) == 2
     observed_kf = sorted({kf for r in reprojs.values() for kf in r.observations})
     for kf in observed_kf:

@@ -37,6 +37,7 @@ from specialist.vi_ba.single_tracker import (
   _choose_prep_anchor,
 )
 from specialist.vi_ba.symbols import LANDMARK_CHAR
+from specialist.vi_ba.tag_discovery import GripperTags
 from tests.mei_fixtures import narrow_mei_params
 
 
@@ -158,12 +159,11 @@ def _dummy_tracker(
       {prep_anchor_tag_id: anchor_local} if anchor_local is not None else {}
     )
     | (extra_anchor_locals or {}),
-    body_T_base_tag=None,
+    body_T_base_tag=gtsam.Pose3(),
     joint_angles={},
     keyframe_times=np.zeros(n),
     finger_reproj={},
-    left_finger_tag_id=0,
-    right_finger_tag_id=0,
+    tags=GripperTags(2, (0, 0)),
   )
 
 
@@ -387,7 +387,6 @@ def _pinned_solve_fixture(
   args = Args(
     base=Path("session_base.rrd"),
     anchor=AnchorCfg(tag_ids=(1, 5) if with_secondary else (1,)),
-    base_tag_ids=(2,),
     solver=SolverCfg(velocity_prior_sigma=0.01, gpu="off"),
   )
   return [tracker], TrackerKeys(["a"]), args, world_T_ref, world_T_sec

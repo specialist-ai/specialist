@@ -31,14 +31,17 @@ from specialist.vi_ba.reference_solve import (
 from specialist.vi_ba.single_tracker import (
   PreparedTracker,
   captures_that_fit,
+  discover_tracker_tags,
   prepare_tracker,
 )
 from specialist.vi_ba.summary import Summary
+from specialist.vi_ba.tag_discovery import validate_discovered
+from specialist.vi_ba.urdf_joints import read_revolute_joints
 from specialist.vi_ba.viz_build import build_run_outputs
 
 
-def _resolve_urdf_path(explicit: Path | None) -> Path | None:
-  """The gripper URDF: an explicit path, else the cached/downloaded asset, else None."""
+def _resolve_urdf_path(explicit: Path | None) -> Path:
+  """``explicit``, else the downloaded gripper URDF; raises SystemExit if that fails."""
   if explicit is not None:
     return explicit
   try:
@@ -51,9 +54,10 @@ def _resolve_urdf_path(explicit: Path | None) -> Path | None:
         cache_dir=str(Path.home() / ".cache" / "specialist_description"),
       )
     )
-  except Exception as exc:  # headless env without the gripper-URDF package
-    print(f"  [warn] [gripper] URDF unavailable ({exc}); finger joint factors disabled")
-    return None
+  except Exception as exc:
+    raise SystemExit(
+      f"the gripper URDF is unavailable ({exc}); pass --urdf-path"
+    ) from exc
 
 
 def _stage_timer() -> Callable[[str], None]:
@@ -110,7 +114,7 @@ def main(args: Args) -> None:
   sys.stdout.reconfigure(line_buffering=True)  # type: ignore[union-attr]
   session = SessionRecording(args.base)
   names = tuple(session.tracker_names)
-  validate(args, len(names))
+  validate(args)
   if args.solver.gpu == "require":
     # A missing CUDA stack is a hard error in this mode; check it before the prep.
     assert_backend()
@@ -128,42 +132,37 @@ def main(args: Args) -> None:
   mark = _stage_timer()
   print(f"session {session.session_id}: trackers {list(names)}")
 
-  # The per-tracker id lists pair with the recording's names in sorted order.
-  left_finger_ids = args.left_finger_tag_ids or (0,) * len(names)
-  right_finger_ids = args.right_finger_tag_ids or (0,) * len(names)
-  specs = list(
-    zip(names, args.base_tag_ids, left_finger_ids, right_finger_ids, strict=True)
-  )
-  for name, base_tag_id, left_id, right_id in specs:
-    print(f"  {name}: base tag {base_tag_id}, finger tags {left_id}/{right_id}")
-
-  # Resolve the URDF once: the finger joint-angle factors and the viz overlay share it.
+  # Resolve the URDF once: tag discovery, finger factors and the viz overlay share it.
   urdf_path = _resolve_urdf_path(args.urdf_path)
 
   # The capture count sizes the flow worker pools and sets whether tag walks overlap.
   concurrent = captures_that_fit(session, names)
   set_precompute_concurrency(concurrent)
 
-  def _prep_one(spec: tuple[str, int, int, int]) -> PreparedTracker:
-    name, base_tag_id, left_id, right_id = spec
+  joints = read_revolute_joints(urdf_path)
+  specs = {
+    name: TrackerArgs(
+      base_rrd=args.base,
+      tracker=name,
+      keyframe_every=args.keyframe_every,
+      frontend=args.frontend,
+      anchor=args.anchor,
+      parallel_siblings=concurrent > 1,
+      gripper=args.gripper,
+      joints=joints,
+    )
+    for name in names
+  }
+  tags = {name: discover_tracker_tags(spec) for name, spec in specs.items()}
+  validate_discovered(tags)
+  for name, found in tags.items():
+    print(f"  {name}: base tag {found.base}, finger tags {found.fingers}")
+  mark("tags discovered")
+
+  def _prep_one(name: str) -> PreparedTracker:
     print(f"\n=== prep tracker {name!r} ===")
     try:
-      tracker = prepare_tracker(
-        name,
-        TrackerArgs(
-          base_rrd=args.base,
-          tracker=name,
-          keyframe_every=args.keyframe_every,
-          base_tag_id=base_tag_id,
-          left_finger_tag_id=left_id,
-          right_finger_tag_id=right_id,
-          frontend=args.frontend,
-          anchor=args.anchor,
-          parallel_siblings=concurrent > 1,
-          gripper=args.gripper,
-          urdf_path=urdf_path,
-        ),
-      )
+      tracker = prepare_tracker(name, specs[name], tags[name])
     except Exception as exc:
       # Name the failure at once: the traceback waits for sibling decodes to finish.
       if concurrent > 1:
@@ -173,7 +172,7 @@ def main(args: Args) -> None:
       f"  [{name}/prep] kf={tracker.n_keyframes}  "
       f"anchor_obs={len(anchored_keyframes(tracker))}  "
       f"front_pts={len(tracker.front.points)}  rear_pts={len(tracker.rear.points)}  "
-      f"body_T_base_tag={'yes' if tracker.body_T_base_tag else 'no'}"
+      f"tags={tracker.tags.base}/{tracker.tags.fingers[0]}/{tracker.tags.fingers[1]}"
     )
     return tracker
 
@@ -181,16 +180,16 @@ def main(args: Args) -> None:
 
   try:
     if concurrent == 1:
-      trackers: list[PreparedTracker] = [_prep_one(spec) for spec in specs]
+      trackers: list[PreparedTracker] = [_prep_one(name) for name in names]
     else:
       with ThreadPoolExecutor(max_workers=concurrent) as prep_pool:
-        trackers = list(prep_pool.map(_prep_one, specs))
+        trackers = list(prep_pool.map(_prep_one, names))
   finally:
     # Free the GPU flow workers' device memory for the joint bundle adjustment.
     gpu_flow.shutdown()
   mark("trackers prepared")
 
-  cross_obs = cross_sightings(trackers, list(args.base_tag_ids), args.gripper.tag_size)
+  cross_obs = cross_sightings(trackers, args.gripper.tag_size)
   print(f"[graph] cross-tracker observations: {len(cross_obs)}")
   if cross_obs:
     by_pair = Counter((sighting.observer, sighting.owner) for sighting in cross_obs)
