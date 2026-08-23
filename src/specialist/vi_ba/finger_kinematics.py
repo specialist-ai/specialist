@@ -29,9 +29,9 @@ from specialist.vi_ba.anchor_detection import (
   tag_corners_in_frame,
 )
 from specialist.vi_ba.build import LensSetup
-from specialist.vi_ba.configs import TrackerArgs
 from specialist.vi_ba.geometry import average_pose, rotate_about_z
-from specialist.vi_ba.urdf_joints import RevoluteJoint, read_revolute_joints
+from specialist.vi_ba.tag_discovery import GripperTags
+from specialist.vi_ba.urdf_joints import FINGER_JOINTS, RevoluteJoint
 
 Float64Array = npt.NDArray[np.float64]
 
@@ -237,23 +237,26 @@ def _joint_angles_per_kf(
 
 
 def recover_gripper_tags(
-  args: TrackerArgs,
+  tags: GripperTags,
+  joints: dict[str, RevoluteJoint],
   tags_per_kf: list[list[TagDetection]],
   lens: LensSetup,
+  tag_size: float,
   n_keyframes: int,
   kf_rotations: list[Float64Array],
-  tags_per_frame: list[list[TagDetection]] | None = None,
-  frame_times: Float64Array | None = None,
+  tags_per_frame: list[list[TagDetection]],
+  frame_times: Float64Array,
 ) -> tuple[
-  gtsam.Pose3 | None,
+  gtsam.Pose3,
   dict[str, list[float]],
   dict[str, FingerReproj],
   dict[str, tuple[Float64Array, Float64Array]],
 ]:
   """Base-tag body pose, per-finger joint angles, and finger reprojection inputs.
 
-  ``body_T_base_tag`` is the mean of the base tag's body-frame pose
-  (``lens.extrinsic ∘ cam_T_tag``) over the rear keyframes that see it.
+  ``tags`` names this tracker's own tags. ``body_T_base_tag`` is the mean of the
+  base tag's body-frame pose (``lens.extrinsic ∘ cam_T_tag``) over the rear
+  keyframes that see it.
   ``joint_angles`` holds each configured finger's per-keyframe URDF
   revolute-joint angle from PnP (the viz seed and the bundle's per-keyframe
   fallback). ``finger_reproj`` carries the corner-reprojection inputs the joint
@@ -263,8 +266,8 @@ def recover_gripper_tags(
   """
   base_tag_obs = anchor_pose_from_tags(
     tags_per_kf,
-    tag_id=args.base_tag_id,
-    tag_size=args.gripper.tag_size,
+    tag_id=tags.base,
+    tag_size=tag_size,
     params=lens.params,
     kf_rotations=kf_rotations,
   )
@@ -273,53 +276,36 @@ def recover_gripper_tags(
     body_T_base_tag = average_pose(
       [lens.extrinsic.compose(p) for p in base_tag_obs.values()], "mean"
     )
-  if args.base_tag_id > 0 and body_T_base_tag is None:
+  if body_T_base_tag is None:
     raise ValueError(
-      f"base tag {args.base_tag_id} was configured but never detected in the rear "
-      f"lens across {n_keyframes} keyframes — its base-tag, finger, and cross-tracker "
-      f"factors would all be silently disabled. Wrong id, or the tag out of the "
-      f"rear-lens field of view?"
+      f"base tag {tags.base} was discovered but never resolved a pose "
+      f"across {n_keyframes} rear keyframes — its base-tag, finger, and "
+      f"cross-tracker factors would all be silently disabled"
     )
 
-  # The URDF is authored in the base (URDF root) frame; the bundle's
-  # body_T_base_tag carries each finger joint to the body frame.
-  joints = read_revolute_joints(args.urdf_path) if args.urdf_path is not None else {}
   joint_angles: dict[str, list[float]] = {}
   finger_reproj: dict[str, FingerReproj] = {}
   frame_angles: dict[str, tuple[Float64Array, Float64Array]] = {}
-  for joint_name, finger_id in (
-    ("left_finger", args.left_finger_tag_id),
-    ("right_finger", args.right_finger_tag_id),
-  ):
+  for joint_name, finger_id in zip(FINGER_JOINTS, tags.fingers, strict=True):
     if finger_id <= 0:
       continue
     joint_angles[joint_name] = _joint_angles_per_kf(
       tags_per_kf,
       lens,
-      base_tag_id=args.base_tag_id,
+      base_tag_id=tags.base,
       finger_tag_id=finger_id,
-      tag_size=args.gripper.tag_size,
+      tag_size=tag_size,
       n_keyframes=n_keyframes,
       kf_rotations=kf_rotations,
     )
-    if args.urdf_path is None:
-      continue
-    joint = joints.get(joint_name)
-    if joint is None or joint.joint_T_tag0 is None:
-      raise ValueError(
-        f"finger tag {finger_id} was configured for '{joint_name}', but "
-        f"{args.urdf_path} has no revolute joint '{joint_name}' carrying an "
-        f"AprilTag frame (revolute joints present: {sorted(joints)}). Wrong URDF?"
-      )
-    if body_T_base_tag is None:
-      continue
+    joint = joints[joint_name]
     reproj = build_finger_reproj(
       joint,
       tags_per_kf,
       lens,
       finger_tag_id=finger_id,
       body_T_base_tag=body_T_base_tag,
-      tag_size=args.gripper.tag_size,
+      tag_size=tag_size,
       n_keyframes=n_keyframes,
     )
     if reproj is None:
@@ -329,15 +315,13 @@ def recover_gripper_tags(
       )
     else:
       finger_reproj[joint_name] = reproj
-    if tags_per_frame is None or frame_times is None:
-      continue
     indices, angles = frame_finger_angles(
       joint,
       tags_per_frame,
       lens,
       finger_tag_id=finger_id,
       body_T_base_tag=body_T_base_tag,
-      tag_size=args.gripper.tag_size,
+      tag_size=tag_size,
     )
     if len(indices):
       frame_angles[joint_name] = (frame_times[indices], angles)

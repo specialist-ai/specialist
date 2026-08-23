@@ -43,8 +43,6 @@ class Args:
   input_insvs: tuple[Path, ...]
   # Recording id shared by this session's base recording and track layers.
   session_id: str
-  # One name per capture; the solve reads them back off the recording.
-  tracker_names: tuple[str, ...] = ()
   # Corpus root; the base recording lands as ``base/<session-id>.rrd``.
   output_dir: Path = Path("logs")
   # Where the remuxed per-lens MP4s stage; needs roughly the session's video
@@ -65,13 +63,7 @@ class Args:
 
 def main(args: Args) -> None:
   sys.stdout.reconfigure(line_buffering=True)  # type: ignore[union-attr]
-  names = (
-    list(args.tracker_names)
-    if args.tracker_names
-    else [f"tracker_{i}" for i in range(len(args.input_insvs))]
-  )
-  if len(names) != len(args.input_insvs):
-    raise SystemExit("--tracker-names must match --input-insvs in length")
+  names = [f"tracker_{i}" for i in range(len(args.input_insvs))]
   out_path = args.output_dir / "base" / f"{args.session_id}.rrd"
   if out_path.exists() and not args.overwrite:
     raise SystemExit(

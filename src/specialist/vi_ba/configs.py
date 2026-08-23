@@ -6,12 +6,13 @@ flags (e.g. ``--frontend.orb-n-features 500``).
 
 from __future__ import annotations
 
-import itertools
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
 import numpy as np
+
+from specialist.vi_ba.urdf_joints import RevoluteJoint
 
 __all__ = [
   "AnchorCfg",
@@ -129,13 +130,9 @@ class TrackerArgs:
 
   base_rrd: Path  # the session's base recording
   tracker: str  # this tracker's entity name inside the base recording
-  base_tag_id: int
   anchor: AnchorCfg
   keyframe_every: int  # 0 = auto (round(fps/10))
-  urdf_path: Path | None  # gripper URDF for finger joint kinematics
-  # 0 disables the corresponding URDF revolute joint angle recovery.
-  left_finger_tag_id: int
-  right_finger_tag_id: int
+  joints: dict[str, RevoluteJoint]
   frontend: FrontendCfg
   gripper: GripperCfg
   # True when sibling captures prepare concurrently; gates per-thread AprilTag
@@ -145,10 +142,9 @@ class TrackerArgs:
 
 @dataclass
 class Args:
-  """One run's full configuration: the base recording, the keyframe stride,
-  the tag ids that identify anchors and grippers, and the nested per-stage
-  knobs above. The recording carries the session window, the tracker names,
-  and the session id."""
+  """One run's full configuration: the base recording, the keyframe stride, the
+  anchor tag ids, and the nested per-stage knobs above. The recording carries
+  the session window, the tracker names, and the session id."""
 
   base: Path
   anchor: AnchorCfg
@@ -162,45 +158,17 @@ class Args:
   # Replace an existing track for this session; off refuses.
   overwrite: bool = False
 
-  # One id per tracker; cross-tracker disambiguation needs distinct ids.
-  base_tag_ids: tuple[int, ...] = ()
-  # Per-tracker finger tag ids (or 0 to disable for that tracker). Used to
-  # recover the URDF revolute-joint angles each keyframe.
-  left_finger_tag_ids: tuple[int, ...] = ()
-  right_finger_tag_ids: tuple[int, ...] = ()
-
   frontend: FrontendCfg = field(default_factory=FrontendCfg)
   gripper: GripperCfg = field(default_factory=GripperCfg)
   solver: SolverCfg = field(default_factory=SolverCfg)
 
 
-def validate(args: Args, n_trackers: int) -> None:
-  """Every invariant the run configuration must satisfy before any prep starts:
-  one base tag per tracker in the recording, per-tracker id lists sized to the
-  trackers, distinct base and anchor ids, disjoint tag-id kinds, and a positive
-  solver iteration count."""
+def validate(args: Args) -> None:
+  """Every invariant the run configuration must satisfy before any prep starts.
+  ``validate_discovered`` asserts the discovered gripper tag ids."""
   if args.solver.max_iterations < 1:
     raise ValueError(
       f"--solver.max-iterations must be positive, got {args.solver.max_iterations}"
-    )
-  if not args.base_tag_ids:
-    raise ValueError(
-      f"--base-tag-ids must be supplied (one per tracker, got {n_trackers} trackers)"
-    )
-  for field_name, ids in (
-    ("base_tag_ids", args.base_tag_ids),
-    ("left_finger_tag_ids", args.left_finger_tag_ids),
-    ("right_finger_tag_ids", args.right_finger_tag_ids),
-  ):
-    if ids and len(ids) != n_trackers:
-      raise ValueError(
-        f"{field_name} length ({len(ids)}) must match "
-        f"the recording's trackers ({n_trackers})"
-      )
-  if len(set(args.base_tag_ids)) != len(args.base_tag_ids):
-    raise ValueError(
-      f"--base-tag-ids must be distinct per tracker for cross-tracker "
-      f"disambiguation, got {list(args.base_tag_ids)}"
     )
   if not args.anchor.enabled_tag_ids:
     raise ValueError(
@@ -211,29 +179,3 @@ def validate(args: Args, n_trackers: int) -> None:
     raise ValueError(
       f"--anchor.tag-ids must be distinct, got {list(args.anchor.tag_ids)}"
     )
-  _validate_tag_id_disjointness(args)
-
-
-def _validate_tag_id_disjointness(args: Args) -> None:
-  """Anchor, base, and nonzero finger tag ids must be pairwise disjoint: a
-  shared id would let one physical tag enter the graph as two different
-  factor kinds."""
-  groups = (
-    ("--anchor.tag-ids", set(args.anchor.enabled_tag_ids)),
-    ("--base-tag-ids", {int(i) for i in args.base_tag_ids}),
-    (
-      "--left/right-finger-tag-ids",
-      {
-        int(i)
-        for i in (*args.left_finger_tag_ids, *args.right_finger_tag_ids)
-        if int(i) > 0
-      },
-    ),
-  )
-  for (name_a, ids_a), (name_b, ids_b) in itertools.combinations(groups, 2):
-    overlap = ids_a & ids_b
-    if overlap:
-      raise ValueError(
-        f"tag ids {sorted(overlap)} appear in both {name_a} and "
-        f"{name_b}; anchor, base, and finger tags must be disjoint"
-      )

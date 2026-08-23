@@ -238,10 +238,7 @@ def _build_tracker_outputs(
     f"  [{tracker.name}/viz] kf={tracker.n_keyframes} bbox={bbox_diagonal:.3f} m "
     f"front_rmse={front_rmse:.2f}px{rear_note}"
   )
-  if tracker.body_T_base_tag is not None:
-    base_tag_poses = [p.compose(tracker.body_T_base_tag) for p in poses]
-  else:
-    base_tag_poses = poses
+  base_tag_poses = [p.compose(tracker.body_T_base_tag) for p in poses]
   biases_final = [
     result.values.atConstantBias(keys.bias_key(tracker.name, i))
     for i in range(tracker.n_keyframes)
@@ -307,13 +304,15 @@ def _build_tracker_outputs(
   return viz_data, summary
 
 
-def _tag_size_by_id(args: Args) -> dict[int, float]:
-  """Metric side length per tag id, across anchors, base tags, and fingers."""
-  finger_ids = (*args.left_finger_tag_ids, *args.right_finger_tag_ids)
+def _tag_size_by_id(args: Args, trackers: list[PreparedTracker]) -> dict[int, float]:
+  """Metric side length per tag id, across anchors and every tracker's
+  discovered gripper tags."""
+  gripper_ids = {
+    tid for t in trackers for tid in (t.tags.base, *t.tags.fingers) if tid > 0
+  }
   return {
     **{tid: float(args.anchor.tag_size) for tid in args.anchor.enabled_tag_ids},
-    **{int(tid): float(args.gripper.tag_size) for tid in args.base_tag_ids},
-    **{int(tid): float(args.gripper.tag_size) for tid in finger_ids if int(tid) > 0},
+    **{tid: float(args.gripper.tag_size) for tid in gripper_ids},
   }
 
 
@@ -329,7 +328,6 @@ def _base_tag_corners_world(
       for pose in optimized_body_poses[t.name]
     ]
     for t in trackers
-    if t.body_T_base_tag is not None
   }
 
 
@@ -368,7 +366,7 @@ def build_run_outputs(
   base_tag_corners = _base_tag_corners_world(
     trackers, optimized_body_poses, args.gripper.tag_size
   )
-  tag_sizes = _tag_size_by_id(args)
+  tag_sizes = _tag_size_by_id(args, trackers)
   by_observer: dict[str, list[CrossSighting]] = {t.name: [] for t in trackers}
   for sighting in cross_obs:
     by_observer[sighting.observer].append(sighting)
@@ -376,10 +374,10 @@ def build_run_outputs(
 
   viz_trackers: list[TrackerVizData] = []
   per_tracker: list[TrackerSummary] = []
-  for t, base_tag_id in zip(trackers, args.base_tag_ids, strict=True):
+  for t in trackers:
     viz_data, summary = _build_tracker_outputs(
       t,
-      base_tag_id=base_tag_id,
+      base_tag_id=t.tags.base,
       poses=optimized_body_poses[t.name],
       result=result,
       keys=keys,

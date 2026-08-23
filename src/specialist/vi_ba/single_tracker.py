@@ -70,6 +70,12 @@ from specialist.vi_ba.init import (
   two_view_essential,
   visual_inertial_align,
 )
+from specialist.vi_ba.tag_discovery import (
+  GripperTags,
+  TagDiscoveryError,
+  discover_gripper_tags,
+  uniform_sample_rows,
+)
 from specialist.vi_ba.tracks import (
   add_loop_landmarks,
   bearings_by_track,
@@ -95,6 +101,7 @@ _PREP_MEMORY_SHARE = 0.35
 __all__ = [
   "PreparedTracker",
   "captures_that_fit",
+  "discover_tracker_tags",
   "prepare_tracker",
 ]
 
@@ -156,9 +163,9 @@ class PreparedTracker:
   # sighted tag's pose in this tracker's local world.
   anchor_obs_by_tag: dict[int, dict[int, dict[str, gtsam.Pose3]]]
   anchor_locals_by_tag: dict[int, gtsam.Pose3]
-  body_T_base_tag: gtsam.Pose3 | None
+  body_T_base_tag: gtsam.Pose3
   # URDF joint name → per-keyframe rotation about the URDF z-axis. NaN where
-  # either tag is missing or PnP fails. Empty when no finger ids configured.
+  # either tag is missing or PnP fails. Empty when no finger tag was found.
   joint_angles: dict[str, list[float]]
   keyframe_times: Float64Array
   # Session-clock frame number per keyframe: the ``keyframe`` timeline value
@@ -166,8 +173,8 @@ class PreparedTracker:
   keyframe_rows: npt.NDArray[np.int64]
   # URDF joint name -> kinematic inputs for the joint-angle reprojection factors.
   finger_reproj: dict[str, FingerReproj]
-  left_finger_tag_id: int
-  right_finger_tag_id: int
+  # This tracker's own tag ids, discovered from its rear lens.
+  tags: GripperTags
   # Body-frame, rescaled IMU samples, for IMU-rate propagation between keyframes.
   imu: ImuSamples | None = None
   # Per-joint detection-only finger angles at the frame rate, as (times, angles);
@@ -542,7 +549,28 @@ def finger_stride(keyframe_every: int, fps: float) -> int:
   )
 
 
-def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
+def discover_tracker_tags(args: TrackerArgs) -> GripperTags:
+  """Identify one tracker's gripper tags from a sparse rear-lens read, so a
+  take whose tags are missing or unrecognisable fails before the prep decodes
+  anything."""
+  session = SessionRecording(args.base_rrd)
+  rear = session.lens_video(args.tracker, "rear")
+  walk = RecordingKeyframes(rear, uniform_sample_rows(len(rear.times)), band=1)
+  detections = _per_band(detect_all_tags, walk)
+  _, rear_lens = session.lens_setups(args.tracker, int(walk[0].shape[1]))
+  try:
+    return discover_gripper_tags(
+      detections,
+      rear_lens.params,
+      args.joints,
+      tag_size=args.gripper.tag_size,
+      anchor_tag_ids=set(args.anchor.enabled_tag_ids),
+    )
+  except TagDiscoveryError as exc:
+    raise TagDiscoveryError(f"{args.tracker}: {exc}") from exc
+
+
+def prepare_tracker(name: str, args: TrackerArgs, tags: GripperTags) -> PreparedTracker:
   """Run every per-tracker stage. Returns a ``PreparedTracker`` ready for
   joint-graph composition. Body poses are in this tracker's own gravity-
   aligned visual world; the caller aligns trackers to a shared frame via
@@ -601,26 +629,14 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
   decoded_width, front_tags_per_kf, front_orb = walk_front()
   front_lens, rear_lens = session.lens_setups(args.tracker, decoded_width)
   release_freed_memory()
-  # Rear: with fingers configured, detect at every frame in one dense walk; the
-  # keyframe subset feeds the existing machinery and the full series carries the
-  # finger angles. Without fingers the dense detections would be pure waste.
-  wants_fingers = args.urdf_path is not None and (
-    args.left_finger_tag_id > 0 or args.right_finger_tag_id > 0
+  # Rear: one dense walk, of which the keyframe set is a stride.
+  stride = finger_stride(keyframe_every, fps)
+  dense_rows = nearest_rows(rear_video.times, front_video.times[covered][::stride])
+  rear_tags_per_frame = _per_band(
+    detect_all_tags, RecordingKeyframes(rear_video, dense_rows, band=PREP_BAND)
   )
-  rear_tags_per_frame: list[list[TagDetection]] | None = None
-  rear_frame_times: Float64Array | None = None
-  if wants_fingers:
-    stride = finger_stride(keyframe_every, fps)
-    dense_rows = nearest_rows(rear_video.times, front_video.times[covered][::stride])
-    rear_tags_per_frame = _per_band(
-      detect_all_tags, RecordingKeyframes(rear_video, dense_rows, band=PREP_BAND)
-    )
-    rear_frame_times = rear_video.times[dense_rows]
-    rear_tags_per_kf = rear_tags_per_frame[:: keyframe_every // stride]
-  else:
-    rear_tags_per_kf = _per_band(
-      detect_all_tags, RecordingKeyframes(rear_video, rear_kf_rows, band=PREP_BAND)
-    )
+  rear_frame_times = rear_video.times[dense_rows]
+  rear_tags_per_kf = rear_tags_per_frame[:: keyframe_every // stride]
   n_keyframes = min(len(front_tags_per_kf), len(rear_tags_per_kf))
   release_freed_memory()
   if n_keyframes < 3:
@@ -807,9 +823,11 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
 
   body_T_base_tag, joint_angles, finger_reproj, finger_frame_angles = (
     recover_gripper_tags(
-      args,
+      tags,
+      args.joints,
       rear_tags_per_kf,
       rear_lens,
+      args.gripper.tag_size,
       n_keyframes,
       rear_kf_rotations,
       rear_tags_per_frame,
@@ -832,8 +850,7 @@ def prepare_tracker(name: str, args: TrackerArgs) -> PreparedTracker:
     keyframe_times=keyframe_times,
     keyframe_rows=np.round(keyframe_times * fps).astype(np.int64),
     finger_reproj=finger_reproj,
-    left_finger_tag_id=args.left_finger_tag_id,
-    right_finger_tag_id=args.right_finger_tag_id,
+    tags=tags,
     imu=imu,
     finger_frame_angles=finger_frame_angles,
   )
