@@ -208,10 +208,10 @@ def solve_joint(
   args: Args,
   cross_obs: list[CrossSighting],
 ) -> ReferenceSolve:
-  """Solve the joint graph, with the first enabled tag naming the world, and
-  return the solution to export."""
-  seed = align_to_shared_world(trackers, args.anchor.enabled_tag_ids)
-  return _solve_joint_graph(trackers, keys, args, cross_obs, seed)
+  """Ground every tracker in the shared world the anchors define, then solve the
+  joint graph from that seed."""
+  anchor_seed = align_to_shared_world(trackers, args.anchor.enabled_tag_ids)
+  return _solve_joint_graph(trackers, keys, args, cross_obs, anchor_seed)
 
 
 def adopt_ba_refined_estimates(

@@ -329,8 +329,8 @@ def build_vi_graph(
 ) -> tuple[gtsam.NonlinearFactorGraph, gtsam.Values]:
   """Dual-lens visual-inertial graph: MEI projection factors plus
   ``preintegrated[i]`` covering ``(t_i, t_{i+1}]`` between consecutive
-  keyframes, with Gaussian priors on ``V(0)`` / ``B(0)`` and no pose gauge;
-  the caller grounds the poses."""
+  keyframes, with Gaussian priors on ``V(0)`` / ``B(0)``. The caller grounds
+  the poses."""
   n = len(body_poses)
   if n < 2:
     raise ValueError("build_vi_graph needs at least two keyframes")

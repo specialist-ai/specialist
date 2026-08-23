@@ -538,7 +538,7 @@ PYBIND11_MODULE(_mei_factor_cpp, m) {
         py::arg("pixel"), py::arg("noise"), py::arg("extrinsic"), py::arg("c"),
         py::arg("fx"), py::arg("fy"), py::arg("cx"), py::arg("cy"),
         py::arg("k1"), py::arg("k2"), py::arg("k3"), py::arg("p1"),
-        py::arg("p2"), py::arg("xi"), 
+        py::arg("p2"), py::arg("xi"),
         py::arg("obs_bearing"));
   m.def("make_mei_seated_cross_finger_factor_cpp",
         &make_mei_seated_cross_finger_factor_cpp, py::arg("observer_key"),
@@ -553,6 +553,6 @@ PYBIND11_MODULE(_mei_factor_cpp, m) {
         py::arg("noise"), py::arg("extrinsic"), py::arg("c"), py::arg("fx"),
         py::arg("fy"), py::arg("cx"), py::arg("cy"), py::arg("k1"),
         py::arg("k2"), py::arg("k3"), py::arg("p1"), py::arg("p2"),
-        py::arg("xi"),  py::arg("obs_bearing"),
+        py::arg("xi"), py::arg("obs_bearing"),
         py::arg("seat_key") = py::none());
 }

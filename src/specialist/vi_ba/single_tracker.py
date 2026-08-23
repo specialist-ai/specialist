@@ -465,15 +465,16 @@ def keyframe_grid(
   covered: npt.NDArray[np.int64],
   fps: float,
   keyframe_every: int,
-) -> npt.NDArray[np.int64]:
-  """Keyframe rows over the covered span, phase snapped to the session-clock
-  stride lattice the review timeline buckets by. When no covered row sits on
-  the lattice the grid simply starts at the first covered row."""
+) -> tuple[npt.NDArray[np.int64], int]:
+  """Keyframe rows over the covered span and the phase they start on, snapped
+  to the session-clock stride lattice the review timeline buckets by. When no
+  covered row sits on the lattice the grid simply starts at the first covered
+  row."""
   stride = schema.keyframe_stride(fps)
   session_rows = np.round(times * fps).astype(np.int64)
   on_lattice = np.flatnonzero(session_rows[covered] % stride == 0)
   phase = int(on_lattice[0]) if len(on_lattice) else 0
-  return covered[phase::keyframe_every]
+  return covered[phase::keyframe_every], phase
 
 
 def finger_stride(keyframe_every: int, fps: float) -> int:
@@ -526,7 +527,9 @@ def prepare_tracker(args: TrackerArgs, tags: GripperTags) -> PreparedTracker:
   keyframe_every = resolve_keyframe_every(args.keyframe_every, fps)
   raw_imu = session.imu(args.tracker)
   covered = covered_rows(front_video.times, rear_video.times, raw_imu.t, fps)
-  front_rows = keyframe_grid(front_video.times, covered, fps, keyframe_every)
+  front_rows, grid_phase = keyframe_grid(
+    front_video.times, covered, fps, keyframe_every
+  )
   grid_times = front_video.times[front_rows]
   rear_kf_rows = nearest_rows(rear_video.times, grid_times)
 
@@ -573,7 +576,9 @@ def prepare_tracker(args: TrackerArgs, tags: GripperTags) -> PreparedTracker:
   release_freed_memory()
   # Rear: one dense walk, of which the keyframe set is a stride.
   stride = finger_stride(keyframe_every, fps)
-  dense_rows = nearest_rows(rear_video.times, front_video.times[covered][::stride])
+  dense_rows = nearest_rows(
+    rear_video.times, front_video.times[covered][grid_phase::stride]
+  )
   rear_tags_per_frame = _per_band(
     detect_all_tags, RecordingKeyframes(rear_video, dense_rows, band=PREP_BAND)
   )

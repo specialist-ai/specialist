@@ -9,12 +9,15 @@ from concurrent.futures import ThreadPoolExecutor
 import gtsam
 import numpy as np
 from specialist_camera import mei_project
+from specialist_corpus import schema
 
 from specialist.vi_ba.build import LensSetup
 from specialist.vi_ba.configs import FrontendCfg
 from specialist.vi_ba.single_tracker import (
   _anchor_metric_scale,
   _anchor_pose_seed,
+  finger_stride,
+  keyframe_grid,
 )
 from specialist.vi_ba.tracks import add_loop_landmarks, run_lens_frontend
 from tests.frame_fixtures import translating_frames
@@ -259,3 +262,30 @@ def test_add_loop_landmarks_reliable_views_resist_drift() -> None:
   # The full track, drifted tail included, still feeds the BA reprojection
   # factors, so the drifted pose is pulled onto the reliable structure.
   assert 5 in fk_rel[99]
+
+
+def test_the_finger_stride_divides_the_keyframe_interval() -> None:
+  """The dense walk's keyframe subset is only exact when the stride divides the
+  interval, so a rate that allows a wider non-divisor still takes the divisor."""
+  assert finger_stride(3, 30.0) == 1
+  assert finger_stride(6, 60.0) == 2
+  # fps / 30 allows 2, but 2 does not divide 5.
+  assert finger_stride(5, 60.0) == 1
+
+
+def test_the_dense_finger_walk_keeps_the_keyframe_grid() -> None:
+  """The dense rear walk's keyframe subset must land on the front grid, at
+  every phase a covered span can start on."""
+  for fps, keyframe_every in ((30.0, 3), (60.0, 6)):
+    times = np.arange(0, 200) / fps
+    stride = finger_stride(keyframe_every, fps)
+    for start in range(7):
+      covered = np.arange(start, 150)
+      front_rows, phase = keyframe_grid(times, covered, fps, keyframe_every)
+      # The grid snaps to the session-clock lattice, not to the covered span.
+      session_stride = schema.keyframe_stride(fps)
+      lattice = np.round(times[front_rows] * fps).astype(np.int64) % session_stride
+      assert not lattice.any()
+      rear_rows = covered[phase::stride][:: keyframe_every // stride]
+      n = min(len(front_rows), len(rear_rows))
+      np.testing.assert_array_equal(rear_rows[:n], front_rows[:n])

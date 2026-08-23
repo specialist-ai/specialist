@@ -14,6 +14,7 @@ track).
 
 from __future__ import annotations
 
+import itertools
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from functools import partial
@@ -296,6 +297,13 @@ def cross_sightings(
   Captures are audio-synced, so observer and owner share the keyframe index. A
   PnP solve gates degenerate / behind-camera base-tag detections; the finger
   factors rely on the reprojection factor's own cheirality guard."""
+  for a, b in itertools.combinations(trackers, 2):
+    n = min(a.n_keyframes, b.n_keyframes)
+    if not np.array_equal(a.keyframe_rows[:n], b.keyframe_rows[:n]):
+      raise ValueError(
+        f"keyframe grids of {a.name!r} and {b.name!r} disagree over their "
+        f"shared span; cross-tracker sightings would pair the wrong instants"
+      )
   sightings: list[CrossSighting] = []
   for owner in trackers:
     # The owner tags an observer may see: the base tag, plus each finger tag
