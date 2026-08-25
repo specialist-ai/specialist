@@ -42,7 +42,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libboost-all-dev
       - name: Install dependencies
         # robot-descriptions is a private SSH git dep (URDF assets) used only
-        # lazily in scripts/track.py; CI has no SSH creds and doesn't need it.
+        # lazily in scripts/estimate.py; CI has no SSH creds and doesn't need it.
         run: uv sync --no-group gpu --no-install-package robot-descriptions
       - name: Run mypy
         run: uv run --no-sync mypy
@@ -63,7 +63,7 @@ jobs:
         run: sudo apt-get install -y ffmpeg
       - name: Install dependencies
         # robot-descriptions is a private SSH git dep (URDF assets) used only
-        # lazily in scripts/track.py; CI has no SSH creds and doesn't need it.
+        # lazily in scripts/estimate.py; CI has no SSH creds and doesn't need it.
         run: uv sync --no-group gpu --no-install-package robot-descriptions
       - name: Run tests
         run: uv run --no-sync pytest || [ $? -eq 5 ]

@@ -39,14 +39,11 @@ Float64Array = npt.NDArray[np.float64]
 
 # One lens's surviving observations, ``{track_id: {keyframe: pixel}}``.
 LandmarkTracks = dict[int, dict[int, Float64Array]]
-# One lens's triangulated points, ``{track_id: world_point}``.
-LandmarkPoints = dict[int, Float64Array]
 # Per tracker name, the ``(front, rear)`` pair each lens map comes in.
 LandmarkKeep = dict[str, tuple[LandmarkTracks, LandmarkTracks]]
 __all__ = [
   "CrossSighting",
   "LandmarkKeep",
-  "LandmarkPoints",
   "LandmarkTracks",
   "TrackerKeys",
   "align_to_shared_world",

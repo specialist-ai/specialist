@@ -16,7 +16,6 @@ class CaptureInfo:
 
   rear_path: Path
   fps: float
-  width: int
   duration: float
 
 
@@ -50,6 +49,5 @@ def probe_capture(video_path: Path) -> CaptureInfo:
   return CaptureInfo(
     rear_path=rear_path,
     fps=fps,
-    width=width,
     duration=min(int(front_frames), int(rear_frames)) / fps,
   )

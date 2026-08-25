@@ -1,4 +1,4 @@
-"""Nested tyro config dataclasses for ``track.py`` and ``prepare_tracker``."""
+"""Nested tyro config dataclasses for ``estimate.py`` and ``prepare_tracker``."""
 
 from __future__ import annotations
 

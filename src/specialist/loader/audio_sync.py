@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import functools
-import os
-import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -39,23 +37,10 @@ class AudioSyncResult:
 
 @functools.cache
 def resolve_ffmpeg() -> str:
-  """The ffmpeg from ``$FFMPEG``, else ``imageio-ffmpeg``, else PATH; raises if none."""
-  override = os.environ.get("FFMPEG")
-  if override:
-    return override
-  try:
-    import imageio_ffmpeg
+  """The ffmpeg binary the ``imageio-ffmpeg`` dependency ships."""
+  import imageio_ffmpeg
 
-    return str(imageio_ffmpeg.get_ffmpeg_exe())
-  except Exception:  # any import or resolution failure falls through
-    pass
-  on_path = shutil.which("ffmpeg")
-  if on_path is not None:
-    return on_path
-  raise RuntimeError(
-    "ffmpeg not found: it ships via the imageio-ffmpeg dependency "
-    "(run `uv sync`); or set $FFMPEG; or put ffmpeg on PATH"
-  )
+  return str(imageio_ffmpeg.get_ffmpeg_exe())
 
 
 def _decode_mono_pcm(source: str | Path) -> Float64Array:

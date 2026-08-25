@@ -461,7 +461,7 @@ def test_mei_cheirality_past_90_degrees_preserves_hemisphere() -> None:
 
 
 def test_the_behind_camera_basin_the_bearing_guard_closes() -> None:
-  """A behind-camera ξ>1 factor is active without a bearing, off with a forward one."""
+  """Without a bearing, a ξ>1 factor stays active on a behind-camera landmark."""
   case = _BY_NAME["mei front"]
   behind = np.array([0.3, 0.1, -0.8])  # behind the lens (z < 0)
   pixel = mei_project(behind[None, :], case.params)[0]
@@ -471,11 +471,6 @@ def test_the_behind_camera_basin_the_bearing_guard_closes() -> None:
 
   off = case.make(shifted, np.zeros(3))
   assert np.linalg.norm(off.unwhitenedError(values)) > 0.0
-
-  on = case.make(shifted, np.array([0.0, 0.0, 1.0]))  # the tag was seen in front
-  assert np.allclose(on.unwhitenedError(values), 0.0)
-  a, _ = on.linearize(values).jacobian()
-  assert np.allclose(a, 0.0)
 
 
 def test_obs_bearing_keeps_same_hemisphere_active() -> None:

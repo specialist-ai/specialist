@@ -29,16 +29,6 @@ def test_resolve_ffmpeg_returns_runnable_binary(
   resolve_ffmpeg.cache_clear()
 
 
-def test_resolve_ffmpeg_honors_env_override(
-  monkeypatch: pytest.MonkeyPatch,
-) -> None:
-  """``$FFMPEG`` takes priority so a specific binary can be forced."""
-  resolve_ffmpeg.cache_clear()
-  monkeypatch.setenv("FFMPEG", "/custom/path/ffmpeg")
-  assert resolve_ffmpeg() == "/custom/path/ffmpeg"
-  resolve_ffmpeg.cache_clear()
-
-
 def _burst_signal(
   rate: int,
   duration: float,

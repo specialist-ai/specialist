@@ -234,17 +234,15 @@ def recover_gripper_tags(
     params=lens.params,
     kf_rotations=kf_rotations,
   )
-  body_T_base_tag: gtsam.Pose3 | None = None
-  if base_tag_obs:
-    body_T_base_tag = average_pose(
-      [lens.extrinsic.compose(p) for p in base_tag_obs.values()], "mean"
-    )
-  if body_T_base_tag is None:
+  if not base_tag_obs:
     raise ValueError(
       f"base tag {tags.base} was discovered but never resolved a pose "
       f"across {n_keyframes} rear keyframes — its base-tag, finger, and "
       f"cross-tracker factors would all be silently disabled"
     )
+  body_T_base_tag = average_pose(
+    [lens.extrinsic.compose(p) for p in base_tag_obs.values()], "mean"
+  )
 
   joint_angles: dict[str, list[float]] = {}
   finger_reproj: dict[str, FingerReproj] = {}

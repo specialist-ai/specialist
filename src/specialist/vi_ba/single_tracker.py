@@ -163,7 +163,7 @@ class PreparedTracker:
   # This tracker's own tag ids, discovered from its rear lens.
   tags: GripperTags
   # Body-frame, rescaled IMU samples, for IMU-rate propagation between keyframes.
-  imu: ImuSamples | None = None
+  imu: ImuSamples
   # Per-joint raw ``(times, angles)`` at the finger rate; export pins them to the solve.
   finger_frame_angles: dict[str, tuple[Float64Array, Float64Array]] = field(
     default_factory=dict
@@ -241,7 +241,7 @@ def _choose_prep_anchor(
   """The id sighted at most keyframes; a tie goes to the earlier ``tag_ids`` entry."""
   if not tag_ids:
     raise ValueError("no anchor tag id is enabled; prep has nothing to ground on")
-  return max(tag_ids, key=lambda tid: len(obs_by_tag.get(tid, {})))
+  return max(tag_ids, key=lambda tid: len(obs_by_tag[tid]))
 
 
 def _first_sighting_local(
@@ -512,8 +512,9 @@ def discover_tracker_tags(args: TrackerArgs) -> GripperTags:
     raise TagDiscoveryError(f"{args.tracker}: {exc}") from exc
 
 
-def prepare_tracker(name: str, args: TrackerArgs, tags: GripperTags) -> PreparedTracker:
+def prepare_tracker(args: TrackerArgs, tags: GripperTags) -> PreparedTracker:
   """Every per-tracker stage; body poses land in the tracker's gravity-aligned world."""
+  name = args.tracker
   configure_detector(args.frontend.parallel_tag_detect and args.parallel_siblings)
   session = SessionRecording(args.base_rrd)
   front_video = session.lens_video(args.tracker, "front")
@@ -616,12 +617,10 @@ def prepare_tracker(name: str, args: TrackerArgs, tags: GripperTags) -> Prepared
     for tag_id in args.anchor.enabled_tag_ids
   }
   prep_anchor_tag_id = _choose_prep_anchor(args.anchor.enabled_tag_ids, obs_by_tag)
-  anchor_obs_per_kf: dict[int, dict[str, gtsam.Pose3]] = obs_by_tag.get(
-    prep_anchor_tag_id, {}
-  )
+  anchor_obs_per_kf = obs_by_tag[prep_anchor_tag_id]
   reference_tag_id = args.anchor.enabled_tag_ids[0]
   if prep_anchor_tag_id != reference_tag_id:
-    n_ref = len(obs_by_tag.get(reference_tag_id, {}))
+    n_ref = len(obs_by_tag[reference_tag_id])
     print(
       f"  [{name}/anchor] prep reference: tag {prep_anchor_tag_id} "
       f"({len(anchor_obs_per_kf)} sighted keyframes vs {n_ref} for "

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import gtsam
 import numpy as np
 import pytest
@@ -109,9 +111,12 @@ def _scene(
   return samples
 
 
-def _discover(samples: list[list[TagDetection]]) -> GripperTags:
+def _discover(
+  samples: list[list[TagDetection]],
+  joints: dict[str, RevoluteJoint] | None = None,
+) -> GripperTags:
   return discover_gripper_tags(
-    samples, _PARAMS, _JOINTS, tag_size=_TAG_SIZE, anchor_tag_ids=_ANCHORS
+    samples, _PARAMS, joints or _JOINTS, tag_size=_TAG_SIZE, anchor_tag_ids=_ANCHORS
   )
 
 
@@ -168,9 +173,11 @@ def test_uniform_sample_rows_bounds() -> None:
   assert list(uniform_sample_rows(5, count=40)) == [0, 1, 2, 3, 4]
 
 
-def test_the_other_operators_whole_gripper_is_rejected_by_rigidity() -> None:
-  """The foreign gripper fits the URDF too; only its rear-lens motion tells it apart."""
-  assert _discover(_scene()) == GripperTags(2000, (2001, 2002))
+def test_a_gripper_with_one_finger_tagged_assigns_rather_than_crashing() -> None:
+  """The untagged finger stays at zero."""
+  joints = dict(_JOINTS)
+  joints["right_finger"] = replace(joints["right_finger"], joint_T_tag0=None)
+  assert _discover(_scene(), joints=joints) == GripperTags(2000, (2001, 0))
 
 
 def test_a_second_still_gripper_refuses_rather_than_guesses() -> None:
