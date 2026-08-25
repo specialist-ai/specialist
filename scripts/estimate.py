@@ -15,6 +15,7 @@ import tyro
 
 from specialist.record.layer import write_estimate_layers
 from specialist.record.session import SessionRecording
+from specialist.vi_ba.anchor_detection import configure_detector
 from specialist.vi_ba.compose import (
   TrackerKeys,
   anchored_keyframes,
@@ -35,7 +36,7 @@ from specialist.vi_ba.single_tracker import (
   prepare_tracker,
 )
 from specialist.vi_ba.summary import Summary
-from specialist.vi_ba.tag_discovery import validate_discovered
+from specialist.vi_ba.tag_discovery import GripperTags, validate_discovered
 from specialist.vi_ba.urdf_joints import read_revolute_joints
 from specialist.vi_ba.viz_build import build_run_estimate
 
@@ -129,7 +130,21 @@ def main(args: Args) -> None:
     )
     for name in names
   }
-  tags = {name: discover_tracker_tags(spec) for name, spec in specs.items()}
+
+  def _discover_one(name: str) -> GripperTags:
+    try:
+      return discover_tracker_tags(specs[name])
+    except Exception as exc:
+      if concurrent > 1:
+        print(f"\n=== discover tracker {name!r} FAILED ===\n{exc}")
+      raise
+
+  if concurrent == 1:
+    tags = {name: _discover_one(name) for name in names}
+  else:
+    configure_detector(args.frontend.parallel_tag_detect)
+    with ThreadPoolExecutor(max_workers=concurrent) as discovery_pool:
+      tags = dict(zip(names, discovery_pool.map(_discover_one, names), strict=True))
   validate_discovered(tags)
   for name, found in tags.items():
     print(f"  {name}: base tag {found.base}, finger tags {found.fingers}")

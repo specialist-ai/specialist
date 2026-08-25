@@ -183,23 +183,16 @@ def _per_kf_cam_T_tag(
 def _joint_angles_per_kf(
   tags_per_kf: list[list[TagDetection]],
   lens: LensSetup,
-  base_tag_id: int,
+  cam_T_base: gtsam.Pose3,
   finger_tag_id: int,
   tag_size: float,
   n_keyframes: int,
   kf_rotations: list[Float64Array],
 ) -> list[float]:
-  """Per keyframe, the finger's signed +z angle to the base tag; NaN where unseen."""
-  cam_T_base_per_kf = _per_kf_cam_T_tag(
-    tags_per_kf, lens, base_tag_id, tag_size, n_keyframes, kf_rotations
-  )
+  """Per-keyframe signed finger angle about +z from the base tag; NaN where unseen."""
   cam_T_finger_per_kf = _per_kf_cam_T_tag(
     tags_per_kf, lens, finger_tag_id, tag_size, n_keyframes, kf_rotations
   )
-  observed_base = [p for p in cam_T_base_per_kf if p is not None]
-  if not observed_base:
-    return [float("nan")] * n_keyframes
-  cam_T_base = average_pose(observed_base, "mean")
   out: list[float] = [float("nan")] * n_keyframes
   for kf in range(n_keyframes):
     cam_T_finger = cam_T_finger_per_kf[kf]
@@ -228,7 +221,7 @@ def recover_gripper_tags(
 ]:
   """Base-tag body pose, per-finger joint angles, and finger reprojection inputs."""
   base_tag_obs = anchor_pose_from_tags(
-    tags_per_kf,
+    tags_per_kf[:n_keyframes],
     tag_id=tags.base,
     tag_size=tag_size,
     params=lens.params,
@@ -243,6 +236,7 @@ def recover_gripper_tags(
   body_T_base_tag = average_pose(
     [lens.extrinsic.compose(p) for p in base_tag_obs.values()], "mean"
   )
+  cam_T_base = average_pose(list(base_tag_obs.values()), "mean")
 
   joint_angles: dict[str, list[float]] = {}
   finger_reproj: dict[str, FingerReproj] = {}
@@ -253,7 +247,7 @@ def recover_gripper_tags(
     joint_angles[joint_name] = _joint_angles_per_kf(
       tags_per_kf,
       lens,
-      base_tag_id=tags.base,
+      cam_T_base=cam_T_base,
       finger_tag_id=finger_id,
       tag_size=tag_size,
       n_keyframes=n_keyframes,
