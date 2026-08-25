@@ -123,8 +123,8 @@ def test_the_fixture_carries_one_of_everything_a_camera_holds() -> None:
 
   empty = [f.name for f in fields(camera) if carries_nothing(camera, f.name)]
   assert camera.lenses, "a camera with no lens exercises no overlay"
-  # Per field rather than per lens: the front lens is never masked and the rear
-  # rejects nothing, so what matters is that some lens exercises each field.
+  # A field counts as exercised when any lens carries it: the rear lens rejects
+  # no keypoints, so its rejected-keypoint field is empty by design.
   empty += [
     f"LensEstimate.{f.name}"
     for f in fields(next(iter(camera.lenses.values())))
@@ -438,38 +438,6 @@ def test_no_layer_embeds_a_blueprint(
   assert not RrdReader(str(estimate_path)).blueprints()
 
 
-def test_several_mask_rects_reach_the_layer(tmp_path: Path) -> None:
-  """A capture may mask more than one static region, and every box in the set
-  is one row of the same chunk. Where the boxes are shaped which pixels reached
-  the solve, so they sit with the answers."""
-  estimate, _viz = write_run(
-    tmp_path,
-    "sess_mask",
-    _two_cameras(),
-    mask_rects=((0, 0, 10, 10), (20, 20, 40, 40)),
-    urdf_path=urdf_file(tmp_path),
-    frame_period=1.0 / 30.0,
-  )
-  boxes: dict[str, list[tuple[object, object]]] = {}
-  for chunk in _chunks(estimate):
-    batch = chunk.to_record_batch()
-    if not chunk.entity_path.endswith("/static_mask"):
-      continue
-    if "Boxes2D:centers" not in batch.schema.names:
-      continue
-    row = batch.to_pydict()
-    boxes[chunk.entity_path] = list(
-      zip(row["Boxes2D:centers"][0], row["Boxes2D:half_sizes"][0], strict=True)
-    )
-
-  assert boxes, "no mask boxes reached the layer"
-  # Every rectangle in the set, and the right way round: a box whose centre and
-  # half-size are swapped masks a different part of the image.
-  for path, pairs in boxes.items():
-    got = sorted((tuple(c), tuple(h)) for c, h in pairs)
-    assert got == [((5.0, 5.0), (5.0, 5.0)), ((30.0, 30.0), (10.0, 10.0))], (path, got)
-
-
 def test_a_model_that_fails_to_write_is_not_mistaken_for_a_missing_model(
   tmp_path: Path,
 ) -> None:
@@ -488,7 +456,6 @@ def test_a_model_that_fails_to_write_is_not_mistaken_for_a_missing_model(
       {0: gtsam.Pose3()},
       0,
       0.1,
-      mask_pad_px=45,
       urdf_path=urdf_file(tmp_path),
       timeline_start=0.0,
       frame_period=1.0 / 30.0,

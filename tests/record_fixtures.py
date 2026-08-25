@@ -162,8 +162,6 @@ def camera_estimate(slot: str, *, offset: float = 0.0, n: int = 4) -> CameraEsti
       tag_detections=detections,
       tag_axes=[np.zeros((3, 2, 2)) + i for i in range(n)],
     ),
-    # The rear lens is where cross-camera sightings come from, and the only
-    # lens the frontend masks.
     "rear": LensEstimate(
       points={2: np.full(3, 0.5)},
       rmse_per_kf=rmse,
@@ -172,7 +170,6 @@ def camera_estimate(slot: str, *, offset: float = 0.0, n: int = 4) -> CameraEsti
       landmark_reprojections=[np.full((2, 2), 9.1 + i) for i in range(n)],
       tag_detections=detections,
       tag_axes=[np.zeros((3, 2, 2)) + i for i in range(n)],
-      static_mask_rects=[(0, 0, 8, 8)],
     ),
   }
   return data
@@ -196,7 +193,6 @@ def write_run(
   *,
   per_camera: list[CameraSummary] | None = None,
   summary: Summary | None = None,
-  mask_rects: tuple[tuple[int, int, int, int], ...] = (),
   urdf_path: Path,
   open_viewer: bool = False,
   frame_period: float,
@@ -210,7 +206,6 @@ def write_run(
         len(c.keyframe_times),
         sum(1 for lines in c.anchor_obs_lines if len(lines)),
         front_rmse=0.4,
-        rear_rmse=0.6,
         base_tag_id=c.base_tag_id,
         seat_rotation=(0.0, 0.0, 0.05),
         seat_anchor_obs=12,
@@ -220,11 +215,6 @@ def write_run(
     ]
   estimate_path = root / "estimate" / f"{session_id}.rrd"
   viz_path = root / "viz" / f"{session_id}.rrd"
-  for camera in cameras:
-    if mask_rects:
-      camera.lenses.setdefault("rear", LensEstimate()).static_mask_rects = list(
-        mask_rects
-      )
   write_estimate_layers(
     estimate_path=estimate_path,
     viz_path=viz_path,
@@ -237,9 +227,6 @@ def write_run(
     summary=summary or make_summary(),
     anchor_tag_size=0.1,
     session_id=session_id,
-    # What production passes: the frontend masks every tag it detects on the
-    # rear lens, and these cameras carry detections on both.
-    mask_pad_px=45,
     urdf_path=urdf_path,
     frame_period=frame_period,
     timeline_start=0.0,

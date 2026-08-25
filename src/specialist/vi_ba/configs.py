@@ -45,35 +45,21 @@ class FrontendCfg:
   feature_max_half_angle: float = float(np.deg2rad(70.0))
 
   reproj_sigma: float = 0.5
-  # Padding (px) around a masked tag's detected box; the tag overlay draws the
-  # padded boxes, none when masking is off.
-  mask_tag_pad: int = 45
-  # Exclude non-anchor tags (the grippers' own plates) from feature detection.
-  # The essential-matrix RANSAC and the parallax filter also reject features
-  # that move with the gripper, so this is belt-and-braces.
-  mask_tags: bool = True
 
   min_parallax: float = float(np.deg2rad(0.5))
   # Max metric depth (m) for kept landmarks in the final (scaled) triangulation.
   max_landmark_depth: float = 5.0
 
-  mask_rear_rects: tuple[tuple[int, int, int, int], ...] = ((728, 1425, 2153, 2880),)
   init_min_shared_tracks: int = 30
   vo_min_registered_ratio: float = 0.7
-  # Run the rear lens's landmark frontend (flow, features, triangulation). Its
-  # tags are always detected; this only governs the visual landmarks, which the
-  # gripper body and the static mask cover much of.
-  rear_landmarks: bool = False
   # Re-match ORB features between spatially-close, non-adjacent keyframes to
   # recover tracks the intervening motion breaks.
   loop_closure: bool = True
 
   # Triangulate the revisit loop landmarks from the anchor-covisible views alone.
   anchored_loop_closure: bool = True
-  # Cap on triangulated landmarks per lens (keeps the longest-track,
-  # best-constrained landmarks). The dense far-field front structure is
-  # redundant; the cap bounds the joint BA size.
-  max_landmarks_per_lens: int = 4000
+  # Cap on triangulated landmarks, keeping the longest tracks.
+  max_landmarks: int = 4000
   # Cap on reprojection observations per track fed to the joint BA (endpoints +
   # evenly-spaced middle).
   max_obs_per_track: int = 8
@@ -169,10 +155,4 @@ def validate(args: Args) -> None:
   if len(set(args.anchor.tag_ids)) != len(args.anchor.tag_ids):
     raise ValueError(
       f"--anchor.tag-ids must be distinct, got {list(args.anchor.tag_ids)}"
-    )
-  if args.frontend.rear_landmarks:
-    raise ValueError(
-      "--frontend.rear-landmarks reprojects rear landmarks through the factory "
-      "rear-lens rotation while the rear tag factors solve the seat; one lens "
-      "cannot carry two rotations"
     )

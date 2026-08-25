@@ -54,19 +54,12 @@ def _outlier_landmark_keys(
   keys: TrackerKeys,
   landmark_keep: LandmarkKeep,
 ) -> set[int]:
-  """The landmark keys the cull dropped, across both lenses of every tracker."""
+  """The landmark keys the cull dropped, over every tracker's front lens."""
   drop: set[int] = set()
   for t in trackers:
-    front_keep, rear_keep = landmark_keep[t.name]
+    keep = landmark_keep[t.name]
     drop.update(
-      keys.front_landmark_key(t.name, tid)
-      for tid in t.front.points
-      if tid not in front_keep
-    )
-    drop.update(
-      keys.rear_landmark_key(t.name, tid)
-      for tid in t.rear.points
-      if tid not in rear_keep
+      keys.front_landmark_key(t.name, tid) for tid in t.front.points if tid not in keep
     )
   return drop
 
@@ -80,10 +73,8 @@ def _solve_with_cull_reoptimize(
   gpu: GpuMode,
 ) -> tuple[OptimizeResult, LandmarkKeep]:
   """Solve the joint graph, then drop the landmarks the first solve exposes as
-  outliers (mismatched / degenerate) and re-solve warm-started, so they bias
-  neither the exported map nor the poses. The prep is untouched, so this costs
-  one extra seconds-long solve. Returns the re-solved result and, per tracker,
-  the kept ``(front, rear)`` landmark tracks."""
+  outliers and re-solve warm-started. Returns the re-solved result and, per
+  tracker, the landmark tracks it kept."""
   print(f"\n[graph] joint graph: {graph.size()} factors, {values.size()} variables")
   result = optimize_graph(
     graph,
@@ -95,15 +86,12 @@ def _solve_with_cull_reoptimize(
   landmark_keep: LandmarkKeep = {}
   for t in trackers:
     poses_1 = poses_by_tracker[t.name]
-    f_pts_1 = points_from_values(
+    points = points_from_values(
       result.values, keys.front_landmark_key, t.name, t.front.points
     )
-    r_pts_1 = points_from_values(
-      result.values, keys.rear_landmark_key, t.name, t.rear.points
+    landmark_keep[t.name] = cull_outlier_landmarks(
+      points, t.front.tracks, poses_1, t.front.setup
     )
-    front_keep = cull_outlier_landmarks(f_pts_1, t.front.tracks, poses_1, t.front.setup)
-    rear_keep = cull_outlier_landmarks(r_pts_1, t.rear.tracks, poses_1, t.rear.setup)
-    landmark_keep[t.name] = (front_keep, rear_keep)
   first = result
   outlier_keys = _outlier_landmark_keys(trackers, keys, landmark_keep)
   if not outlier_keys and result.iterations >= _PRECULL_MAX_ITERATIONS:

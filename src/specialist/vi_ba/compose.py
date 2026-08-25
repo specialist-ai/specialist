@@ -50,8 +50,8 @@ Float64Array = npt.NDArray[np.float64]
 
 # One lens's surviving observations, ``{track_id: {keyframe: pixel}}``.
 LandmarkTracks = dict[int, dict[int, Float64Array]]
-# Per tracker name, the ``(front, rear)`` pair each lens map comes in.
-LandmarkKeep = dict[str, tuple[LandmarkTracks, LandmarkTracks]]
+# Per tracker name, the landmark map its front lens carries.
+LandmarkKeep = dict[str, LandmarkTracks]
 __all__ = [
   "CrossSighting",
   "LandmarkKeep",
@@ -102,8 +102,8 @@ _MAX_LANDMARKS_PER_TRACKER = 1_000_000
 class TrackerKeys:
   """Each tracker gets a unique slice of the integer-key space, indexed by
   ``_MAX_KEYFRAMES_PER_TRACKER`` for poses/velocities/biases and
-  ``_MAX_LANDMARKS_PER_TRACKER`` for each lens's landmarks. Anchors are shared
-  by every tracker, so they key off the tag id alone."""
+  ``_MAX_LANDMARKS_PER_TRACKER`` for its landmarks. Anchors are shared by every
+  tracker, so they key off the tag id alone."""
 
   def __init__(
     self,
@@ -133,30 +133,20 @@ class TrackerKeys:
   def bias_key(self, name: str, kf: int) -> int:
     return self._kf_key(_BIAS_CHAR, name, kf)
 
-  def _lm_key(self, name: str, half: int, track_id: int) -> int:
-    """Key for a landmark in one tracker's front (``half=0``) or rear
-    (``half=1``) lens slot.
-
-    Track ids are handed out monotonically by the frontend and never renumbered,
-    so a long capture that keeps redetecting can outgrow its slot. A key that
-    lands in the next slot is inserted once and then shared, fusing two
-    unrelated points into one variable, so the bound is checked rather than
-    assumed.
-    """
+  def front_landmark_key(self, name: str, track_id: int) -> int:
+    """Key for a landmark in one tracker's landmark slot. Track ids are handed
+    out monotonically and never renumbered, so a long capture can outgrow its
+    slot; the bound is checked."""
     if not 0 <= track_id < _MAX_LANDMARKS_PER_TRACKER:
       raise ValueError(
         f"track id {track_id} does not fit the {_MAX_LANDMARKS_PER_TRACKER}-wide "
         f"landmark slot for {name!r}; its key would collide with another slot"
       )
-    return self._slot_key(
-      LANDMARK_CHAR, name, half, _MAX_LANDMARKS_PER_TRACKER, track_id
+    return int(
+      gtsam.symbol(
+        LANDMARK_CHAR, self.tracker_index(name) * _MAX_LANDMARKS_PER_TRACKER + track_id
+      )
     )
-
-  def front_landmark_key(self, name: str, track_id: int) -> int:
-    return self._lm_key(name, 0, track_id)
-
-  def rear_landmark_key(self, name: str, track_id: int) -> int:
-    return self._lm_key(name, 1, track_id)
 
   def theta_key(self, name: str, finger_idx: int, kf: int) -> int:
     """Key for a finger's revolute joint angle (scalar) at one keyframe.
@@ -476,7 +466,6 @@ def _add_vi_subgraphs(
       biases=t.biases,
       preintegrated=t.preintegrated,
       front=t.front,
-      rear=t.rear,
       sigma=args.frontend.reproj_sigma,
       velocity_prior_sigma=args.solver.velocity_prior_sigma,
       graph=graph,
@@ -485,7 +474,6 @@ def _add_vi_subgraphs(
       velocity_key_fn=partial(keys.velocity_key, t.name),
       bias_key_fn=partial(keys.bias_key, t.name),
       front_landmark_key_fn=partial(keys.front_landmark_key, t.name),
-      rear_landmark_key_fn=partial(keys.rear_landmark_key, t.name),
     )
 
 

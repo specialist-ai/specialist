@@ -44,12 +44,3 @@ def test_rejects_anchor_tag_ids_that_are_all_disabled() -> None:
 def test_rejects_duplicate_anchor_tag_ids() -> None:
   with pytest.raises(ValueError, match="must be distinct"):
     validate(_args(anchor=AnchorCfg(tag_ids=(1, 1))))
-
-
-def test_rejects_rear_landmarks() -> None:
-  """Rear landmark factors reproject through the factory rear-lens rotation
-  while the rear tag factors solve the seat; one lens cannot carry both."""
-  from specialist.vi_ba.configs import FrontendCfg
-
-  with pytest.raises(ValueError, match="rear-landmarks"):
-    validate(_args(frontend=FrontendCfg(rear_landmarks=True)))

@@ -17,7 +17,6 @@ from specialist.vi_ba.build import LensSetup
 from specialist.vi_ba.configs import FrontendCfg
 from specialist.vi_ba.features import (
   Frame,
-  Rect,
   chain_tracks,
   dis_flow_track,
   essential_ransac_inliers,
@@ -55,20 +54,14 @@ def run_lens_frontend(
   frames: Sequence[np.ndarray],
   params: MeiParams,
   cfg: FrontendCfg,
-  masks: list[list[Rect]] | None = None,
   *,
   label: str | None = None,
 ) -> tuple[list[Float64Array], dict[int, dict[int, Float64Array]]]:
   """DIS flow → essential-RANSAC → chain for one lens, returning the per-frame
-  keypoints and the chained tracks. ``masks[k]`` (optional, the blocked
-  rectangles for that keyframe) suppresses new detections and filters tracked
-  points that drift into them."""
-  if masks is not None and len(masks) != len(frames):
-    raise ValueError(f"masks length {len(masks)} != frames length {len(frames)}")
+  keypoints and the chained tracks."""
   keypoints, matches_between = dis_flow_track(
     frames,
     n_features=cfg.orb_n_features,
-    masks=masks,
     gpu_flow=cfg.gpu_flow,
     flow_scale=cfg.flow_scale,
     label=label,

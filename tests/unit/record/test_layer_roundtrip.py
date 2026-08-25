@@ -24,12 +24,11 @@ def estimate_rrd(tmp_path_factory: pytest.TempPathFactory) -> Path:
     cameras,
     per_camera=[
       CameraSummary(
-        c.slot,
-        4,
-        3,
-        0.4,
-        0.6,
-        c.base_tag_id,
+        slot=c.slot,
+        n_keyframes=4,
+        anchor_obs=3,
+        front_rmse=0.4,
+        base_tag_id=c.base_tag_id,
         seat_rotation=(0.0, 0.0, 0.05),
         seat_anchor_obs=12,
         seat_cross_obs=7,
@@ -81,7 +80,7 @@ def _worst_rmse(estimate: Path) -> float:
   raise AssertionError("the estimate layer carries no worst_rmse")
 
 
-def test_worst_rmse_is_the_worst_lens_that_was_measured(tmp_path: Path) -> None:
+def test_worst_rmse_is_the_worst_camera_that_was_measured(tmp_path: Path) -> None:
   """An unmeasured camera's NaN RMSE neither becomes the worst RMSE nor
   poisons the comparison that picks one."""
   cameras = [camera_estimate("cam00"), camera_estimate("cam01", offset=1.0)]
@@ -92,23 +91,21 @@ def test_worst_rmse_is_the_worst_lens_that_was_measured(tmp_path: Path) -> None:
     per_camera=[
       # The NaN camera comes first.
       CameraSummary(
-        cameras[0].slot,
-        4,
-        3,
-        float("nan"),
-        0.9,
-        2000,
+        slot=cameras[0].slot,
+        n_keyframes=4,
+        anchor_obs=3,
+        front_rmse=float("nan"),
+        base_tag_id=2000,
         seat_rotation=(0.0, 0.0, 0.05),
         seat_anchor_obs=12,
         seat_cross_obs=7,
       ),
       CameraSummary(
-        cameras[1].slot,
-        4,
-        3,
-        0.4,
-        float("nan"),
-        2003,
+        slot=cameras[1].slot,
+        n_keyframes=4,
+        anchor_obs=3,
+        front_rmse=0.4,
+        base_tag_id=2003,
         seat_rotation=(0.0, 0.0, 0.05),
         seat_anchor_obs=12,
         seat_cross_obs=7,
@@ -117,10 +114,10 @@ def test_worst_rmse_is_the_worst_lens_that_was_measured(tmp_path: Path) -> None:
     urdf_path=urdf_file(tmp_path),
     frame_period=1.0 / 30.0,
   )
-  assert _worst_rmse(estimate) == pytest.approx(0.9)
+  assert _worst_rmse(estimate) == pytest.approx(0.4)
 
 
-def test_worst_rmse_is_nan_when_no_lens_was_measured(tmp_path: Path) -> None:
+def test_worst_rmse_is_nan_when_no_camera_was_measured(tmp_path: Path) -> None:
   """The worst RMSE over a run that measured no camera is NaN."""
   cameras = [camera_estimate("cam00")]
   estimate, _viz = write_run(
@@ -129,12 +126,11 @@ def test_worst_rmse_is_nan_when_no_lens_was_measured(tmp_path: Path) -> None:
     cameras,
     per_camera=[
       CameraSummary(
-        cameras[0].slot,
-        4,
-        3,
-        float("nan"),
-        float("nan"),
-        2000,
+        slot=cameras[0].slot,
+        n_keyframes=4,
+        anchor_obs=3,
+        front_rmse=float("nan"),
+        base_tag_id=2000,
         seat_rotation=(0.0, 0.0, 0.05),
         seat_anchor_obs=12,
         seat_cross_obs=7,

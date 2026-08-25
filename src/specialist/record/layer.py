@@ -72,14 +72,8 @@ def _send_run_properties(
       static=True,
       recording=stream,
     )
-  # Worst reprojection among the measured lenses; an unmeasured lens's NaN would
-  # poison max() and the selector. Per-lens gaps sit on each camera's fit entity.
-  measured = [
-    rmse
-    for camera in per_camera
-    for rmse in (camera.front_rmse, camera.rear_rmse)
-    if not math.isnan(rmse)
-  ]
+  # A camera the run never measured would poison max() with its NaN.
+  measured = [c.front_rmse for c in per_camera if not math.isnan(c.front_rmse)]
   stream.send_property(
     schema.ESTIMATE_PROPERTIES,
     rr.AnyValues(
@@ -120,7 +114,6 @@ def write_estimate_layers(
   summary: Summary,
   anchor_tag_size: float,
   session_id: str,
-  mask_pad_px: int,
   open_viewer: bool,
   urdf_path: Path,
   timeline_start: float,
@@ -161,7 +154,6 @@ def write_estimate_layers(
         estimate.anchor_poses_world,
         estimate.reference_tag_id,
         anchor_tag_size,
-        mask_pad_px=mask_pad_px,
         urdf_path=urdf_path,
         timeline_start=timeline_start,
         frame_period=frame_period,

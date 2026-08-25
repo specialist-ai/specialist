@@ -33,7 +33,6 @@ __all__ = [
   "detect_orb",
   "dis_flow_track",
   "essential_ransac_inliers",
-  "mask_plane",
   "match_pair",
   "parallel_map",
   "set_precompute_concurrency",
@@ -306,29 +305,6 @@ def _in_bounds(xy: Float64Array, h: int, w: int) -> npt.NDArray[np.bool_]:
   return (xy[:, 0] >= 1.0) & (xy[:, 0] < w - 1) & (xy[:, 1] >= 1.0) & (xy[:, 1] < h - 1)
 
 
-def mask_plane(shape: tuple[int, int], blocked: list[Rect]) -> np.ndarray:
-  """The OpenCV per-pixel mask a rectangle list stands for: 255 keeps a pixel,
-  0 excludes it. Built where cv2 needs a plane and dropped straight after, so a
-  capture holds its rectangles rather than one full-resolution plane per
-  keyframe."""
-  plane = np.full(shape, 255, dtype=np.uint8)
-  for x0, y0, x1, y1 in blocked:
-    plane[y0:y1, x0:x1] = 0
-  return plane
-
-
-def _mask_ok(
-  xy: Float64Array, blocked: list[Rect], shape: tuple[int, int]
-) -> npt.NDArray[np.bool_]:
-  ix = np.round(xy[:, 0]).astype(np.int64)
-  iy = np.round(xy[:, 1]).astype(np.int64)
-  h, w = shape
-  ok = (ix >= 0) & (ix < w) & (iy >= 0) & (iy < h)
-  for x0, y0, x1, y1 in blocked:
-    ok &= ~((ix >= x0) & (ix < x1) & (iy >= y0) & (iy < y1))
-  return ok
-
-
 # Shi-Tomasi seeding: a corner must clear this fraction of the strongest corner
 # response and stand this many pixels clear of any already-tracked point, and a
 # keyframe reseeds once propagation has lost half of its feature budget.
@@ -364,7 +340,6 @@ def detect_corners(
 def dis_flow_track(
   frames: Sequence[np.ndarray],
   n_features: int,
-  masks: list[list[Rect]] | None = None,
   gpu_flow: bool = False,
   flow_scale: float = 1.0,
   *,
@@ -377,8 +352,6 @@ def dis_flow_track(
   Returns each frame's ``(N, 2)`` tracked points and the ``(M, 2)`` index
   pairs linking consecutive frames' points.
   """
-  if masks is not None and len(masks) != len(frames):
-    raise ValueError(f"masks length {len(masks)} != frames length {len(frames)}")
   if not frames:
     return [], []
 
@@ -395,7 +368,6 @@ def dis_flow_track(
   matches_between: list[npt.NDArray[np.int64]] = []
 
   for k, img in enumerate(frames):
-    mask_k = None if masks is None else masks[k]
     if k >= 1:
       (flow_fwd, flow_bwd), backend = next(pairs)
 
@@ -409,8 +381,6 @@ def dis_flow_track(
       ok = np.isfinite(fb) & (fb < _FB_ERROR_THRESHOLD)
       h, w = img.shape[:2]
       ok &= _in_bounds(nxt_xy, h, w)
-      if mask_k is not None:
-        ok &= _mask_ok(nxt_xy, mask_k, img.shape[:2])
       sel = np.where(ok)[0]
       per_frame_pts[k] = nxt_xy[sel]
       matches_between.append(
@@ -433,7 +403,7 @@ def dis_flow_track(
     n_active = per_frame_pts[k].shape[0]
     need_redetect = k == 0 or n_active < round(_REDETECT_RATIO * n_features)
     if need_redetect:
-      redetect_mask = mask_plane(img.shape[:2], mask_k or [])
+      redetect_mask = np.full(img.shape[:2], 255, dtype=np.uint8)
       for p in per_frame_pts[k]:
         cv2.circle(
           redetect_mask,
@@ -459,23 +429,12 @@ def dis_flow_track(
   return per_frame_pts, matches_between
 
 
-def detect_orb(
-  image: np.ndarray,
-  n_features: int,
-  fast_threshold: int,
-  mask: np.ndarray | None = None,
-) -> Frame:
-  """Run OpenCV ORB on a single grayscale frame.
-
-  ``mask`` is the standard OpenCV per-pixel ``uint8`` mask: ``255`` keeps a
-  pixel eligible for detection, ``0`` excludes it. Used to suppress
-  keypoints on body-attached regions (gripper, mounted tags) that would
-  otherwise bias the BA toward zero motion.
-  """
+def detect_orb(image: np.ndarray, n_features: int, fast_threshold: int) -> Frame:
+  """Run OpenCV ORB on a single grayscale frame."""
   orb = cv2.ORB_create(  # type: ignore[attr-defined]
     nfeatures=n_features, fastThreshold=fast_threshold
   )
-  kps, desc = orb.detectAndCompute(image, mask)
+  kps, desc = orb.detectAndCompute(image, None)
   if kps is None or len(kps) == 0 or desc is None:
     return Frame(
       keypoints=np.empty((0, 2)),
