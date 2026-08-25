@@ -1,9 +1,8 @@
 """Assemble a dual-lens VI-BA ``NonlinearFactorGraph``: one ``Pose3`` per
 keyframe, one ``Point3`` per triangulated landmark (front/rear in disjoint
 namespaces), one MEI projection factor per observation. Consecutive
-keyframes are tied by IMU preintegration factors (visual-only mode
-substitutes weak pose priors), with the gauge pinned by a tight prior on
-the first keyframe pose."""
+keyframes are tied by IMU preintegration factors, with the gauge pinned by
+a tight prior on the first keyframe pose."""
 
 from __future__ import annotations
 
@@ -13,7 +12,6 @@ from dataclasses import dataclass, field
 import gtsam
 import numpy as np
 import numpy.typing as npt
-from gtsam.symbol_shorthand import B, L, V, X
 
 from specialist.loader.mei_model import MeiParams
 from specialist.record import schema
@@ -44,8 +42,6 @@ Float64Array = npt.NDArray[np.float64]
 _BIAS_PRIOR_SIGMA_ACCEL = 1.0e-2
 _BIAS_PRIOR_SIGMA_GYRO = 1.0e-3
 
-_REAR_LANDMARK_OFFSET = 1_000_000
-
 __all__ = [
   "add_mei_factor",
   "LensChannel",
@@ -56,9 +52,7 @@ __all__ = [
   "add_mei_finger_factor",
   "add_mei_world_point_factor",
   "build_vi_graph",
-  "front_landmark_key",
   "huber_pixel_noise",
-  "rear_landmark_key",
 ]
 
 
@@ -119,14 +113,6 @@ class LensChannel:
   # Rectangles masked out of this lens's frames at every keyframe; the front
   # lens is never masked.
   static_mask_rects: list[Rect] = field(default_factory=list)
-
-
-def front_landmark_key(track_id: int) -> int:
-  return int(L(track_id))
-
-
-def rear_landmark_key(track_id: int) -> int:
-  return int(L(_REAR_LANDMARK_OFFSET + track_id))
 
 
 def huber_pixel_noise(sigma: float) -> gtsam.noiseModel.Base:
@@ -333,110 +319,73 @@ def _add_projection_factors(
 def build_vi_graph(
   body_poses: list[gtsam.Pose3],
   *,
-  velocities: list[Float64Array] | None = None,
-  biases: list[gtsam.imuBias.ConstantBias] | None = None,
-  preintegrated: list[gtsam.PreintegratedCombinedMeasurements] | None = None,
+  velocities: list[Float64Array],
+  biases: list[gtsam.imuBias.ConstantBias],
+  preintegrated: list[gtsam.PreintegratedCombinedMeasurements],
   front: LensChannel,
   rear: LensChannel,
   sigma: float,
-  velocity_prior_sigma: float = 0.1,
-  anchor_last_pose: bool = False,
-  pose_key_fn: Callable[[int], int] | None = None,
-  velocity_key_fn: Callable[[int], int] | None = None,
-  bias_key_fn: Callable[[int], int] | None = None,
-  front_landmark_key_fn: Callable[[int], int] | None = None,
-  rear_landmark_key_fn: Callable[[int], int] | None = None,
-  graph: gtsam.NonlinearFactorGraph | None = None,
-  values: gtsam.Values | None = None,
-  weak_pose_sigmas: tuple[float, ...] | None = None,
+  velocity_prior_sigma: float,
+  pose_key_fn: Callable[[int], int],
+  velocity_key_fn: Callable[[int], int],
+  bias_key_fn: Callable[[int], int],
+  front_landmark_key_fn: Callable[[int], int],
+  rear_landmark_key_fn: Callable[[int], int],
+  graph: gtsam.NonlinearFactorGraph,
+  values: gtsam.Values,
 ) -> tuple[gtsam.NonlinearFactorGraph, gtsam.Values]:
   """Dual-lens visual-inertial graph: MEI projection factors plus
   ``preintegrated[i]`` covering ``(t_i, t_{i+1}]`` between consecutive
   keyframes. Gauge is fixed by a tight prior on ``X(0)`` plus Gaussian
-  priors on ``V(0)`` / ``B(0)``.
-
-  Pass ``preintegrated=None`` for a visual-only graph: the velocity/bias
-  variables, IMU factors, and ``V(0)`` / ``B(0)`` priors are dropped and the
-  inter-pose motion model becomes a gauge prior on ``X(0)``, an optional
-  tight ``anchor_last_pose`` prior on ``X(N-1)``, and weak
-  ``PriorFactorPose3`` priors (σ = ``weak_pose_sigmas``) on the rest."""
+  priors on ``V(0)`` / ``B(0)``."""
   n = len(body_poses)
-  if preintegrated is not None:
-    assert velocities is not None and biases is not None
-    if n < 2:
-      raise ValueError("build_vi_graph needs at least two keyframes")
-    if len(velocities) != n or len(biases) != n:
-      raise ValueError(
-        f"velocities/biases count mismatch: {len(velocities)}/{len(biases)} vs {n}"
-      )
-    if len(preintegrated) != n - 1:
-      raise ValueError(
-        f"preintegrated count must be N-1={n - 1}, got {len(preintegrated)}"
-      )
+  if n < 2:
+    raise ValueError("build_vi_graph needs at least two keyframes")
+  if len(velocities) != n or len(biases) != n:
+    raise ValueError(
+      f"velocities/biases count mismatch: {len(velocities)}/{len(biases)} vs {n}"
+    )
+  if len(preintegrated) != n - 1:
+    raise ValueError(
+      f"preintegrated count must be N-1={n - 1}, got {len(preintegrated)}"
+    )
 
-  if graph is None:
-    graph = gtsam.NonlinearFactorGraph()
-  if values is None:
-    values = gtsam.Values()
-  pose_key = pose_key_fn or (lambda i: int(X(i)))
-  front_lm = front_landmark_key_fn or front_landmark_key
-  rear_lm = rear_landmark_key_fn or rear_landmark_key
   pixel_noise = huber_pixel_noise(sigma)
   gauge = _gauge_noise()
-
-  if preintegrated is None:
-    # Visual-only: gauge prior on X(0), an optional tight prior on X(N-1), and
-    # weak pose priors on the rest standing in for the IMU chain.
-    weak = gtsam.noiseModel.Diagonal.Sigmas(
-      np.asarray(weak_pose_sigmas, dtype=np.float64)
+  vel_noise = gtsam.noiseModel.Isotropic.Sigma(3, velocity_prior_sigma)
+  bias_noise = gtsam.noiseModel.Diagonal.Sigmas(
+    np.asarray(
+      [_BIAS_PRIOR_SIGMA_ACCEL] * 3 + [_BIAS_PRIOR_SIGMA_GYRO] * 3,
+      dtype=np.float64,
     )
-    for i, pose in enumerate(body_poses):
-      values.insert(pose_key(i), pose)
-    graph.push_back(gtsam.PriorFactorPose3(pose_key(0), body_poses[0], gauge))
-    if anchor_last_pose and n > 1:
-      graph.push_back(gtsam.PriorFactorPose3(pose_key(n - 1), body_poses[-1], gauge))
-    weak_end = n - 1 if anchor_last_pose else n
-    for i in range(1, weak_end):
-      graph.push_back(gtsam.PriorFactorPose3(pose_key(i), body_poses[i], weak))
-  else:
-    # Visual-inertial: CombinedImuFactor chains the NavState between keyframes,
-    # with gauge + initial priors on (X0, V0, B0).
-    assert velocities is not None and biases is not None
-    vel_key = velocity_key_fn or (lambda i: int(V(i)))
-    bias_key = bias_key_fn or (lambda i: int(B(i)))
-    vel_noise = gtsam.noiseModel.Isotropic.Sigma(3, velocity_prior_sigma)
-    bias_noise = gtsam.noiseModel.Diagonal.Sigmas(
-      np.asarray(
-        [_BIAS_PRIOR_SIGMA_ACCEL] * 3 + [_BIAS_PRIOR_SIGMA_GYRO] * 3,
-        dtype=np.float64,
-      )
+  )
+  for i in range(n):
+    values.insert(pose_key_fn(i), body_poses[i])
+    values.insert(velocity_key_fn(i), np.asarray(velocities[i], dtype=np.float64))
+    values.insert(bias_key_fn(i), biases[i])
+  graph.push_back(gtsam.PriorFactorPose3(pose_key_fn(0), body_poses[0], gauge))
+  graph.push_back(
+    gtsam.PriorFactorVector(
+      velocity_key_fn(0), np.asarray(velocities[0], dtype=np.float64), vel_noise
     )
-    for i in range(n):
-      values.insert(pose_key(i), body_poses[i])
-      values.insert(vel_key(i), np.asarray(velocities[i], dtype=np.float64))
-      values.insert(bias_key(i), biases[i])
-    graph.push_back(gtsam.PriorFactorPose3(pose_key(0), body_poses[0], gauge))
+  )
+  graph.push_back(gtsam.PriorFactorConstantBias(bias_key_fn(0), biases[0], bias_noise))
+  for i, pim in enumerate(preintegrated):
     graph.push_back(
-      gtsam.PriorFactorVector(
-        vel_key(0), np.asarray(velocities[0], dtype=np.float64), vel_noise
+      gtsam.CombinedImuFactor(
+        pose_key_fn(i),
+        velocity_key_fn(i),
+        pose_key_fn(i + 1),
+        velocity_key_fn(i + 1),
+        bias_key_fn(i),
+        bias_key_fn(i + 1),
+        pim,
       )
     )
-    graph.push_back(gtsam.PriorFactorConstantBias(bias_key(0), biases[0], bias_noise))
-    for i, pim in enumerate(preintegrated):
-      graph.push_back(
-        gtsam.CombinedImuFactor(
-          pose_key(i),
-          vel_key(i),
-          pose_key(i + 1),
-          vel_key(i + 1),
-          bias_key(i),
-          bias_key(i + 1),
-          pim,
-        )
-      )
 
-  for channel, landmark_key_fn in ((front, front_lm), (rear, rear_lm)):
+  channels = ((front, front_landmark_key_fn), (rear, rear_landmark_key_fn))
+  for channel, landmark_key_fn in channels:
     _add_projection_factors(
-      graph, values, channel, landmark_key_fn, pixel_noise, pose_key
+      graph, values, channel, landmark_key_fn, pixel_noise, pose_key_fn
     )
   return graph, values

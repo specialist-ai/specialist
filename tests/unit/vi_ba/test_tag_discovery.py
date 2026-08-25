@@ -10,8 +10,7 @@ import gtsam
 import numpy as np
 import pytest
 
-from specialist.loader.mei_model import MeiParams, mei_project
-from specialist.vi_ba.anchor_detection import TagDetection, tag_corners_in_frame
+from specialist.vi_ba.anchor_detection import TagDetection
 from specialist.vi_ba.tag_discovery import (
   GripperTags,
   TagDiscoveryError,
@@ -20,10 +19,9 @@ from specialist.vi_ba.tag_discovery import (
   validate_discovered,
 )
 from specialist.vi_ba.urdf_joints import RevoluteJoint
+from tests.mei_fixtures import synthetic_tag_detection, wide_omni_params
 
-_PARAMS = MeiParams(
-  fx=800, fy=800, cx=960, cy=960, k1=0, k2=0, k3=0, p1=0, p2=0, xi=1.6
-)
+_PARAMS = wide_omni_params()
 _TAG = 0.01
 _ANCHORS = frozenset({1})
 _N = 12
@@ -44,10 +42,7 @@ _JOINTS = {"left_finger": _mirrored_joint(1.0), "right_finger": _mirrored_joint(
 
 
 def _detect(cam_T_tag: gtsam.Pose3, tag_id: int) -> TagDetection | None:
-  px = mei_project(tag_corners_in_frame(cam_T_tag, _TAG), _PARAMS)
-  if not np.all(np.isfinite(px)):
-    return None
-  return TagDetection(tag_id=tag_id, center=px.mean(0), corners=px)
+  return synthetic_tag_detection(cam_T_tag, tag_id, _TAG, _PARAMS)
 
 
 def _finger(cam_T_base: gtsam.Pose3, joint: RevoluteJoint, theta: float) -> gtsam.Pose3:

@@ -5,10 +5,37 @@ from __future__ import annotations
 
 import gtsam
 import numpy as np
-import numpy.typing as npt
+from gtsam.symbol_shorthand import B, L, V, X
 
 from specialist.loader.mei_model import MeiParams, mei_project
-from specialist.vi_ba.build import LensChannel, LensSetup, build_vi_graph
+from specialist.vi_ba.anchor_detection import TagDetection, tag_corners_in_frame
+from specialist.vi_ba.build import LensSetup, add_mei_factor
+
+_REAR_LANDMARK_OFFSET = 1_000_000
+
+
+def front_landmark_key(track_id: int) -> int:
+  return int(L(track_id))
+
+
+def rear_landmark_key(track_id: int) -> int:
+  return int(L(_REAR_LANDMARK_OFFSET + track_id))
+
+
+def wide_omni_params() -> MeiParams:
+  """The fx=800/cx=960 ξ=1.6 omni regime the gripper-tag tests project in."""
+  return MeiParams(fx=800, fy=800, cx=960, cy=960, k1=0, k2=0, k3=0, p1=0, p2=0, xi=1.6)
+
+
+def synthetic_tag_detection(
+  cam_T_tag: gtsam.Pose3, tag_id: int, tag_size: float, params: MeiParams
+) -> TagDetection | None:
+  """The detection an ideal detector reports for a tag at this pose, or None
+  when a corner projects non-finite."""
+  px = mei_project(tag_corners_in_frame(cam_T_tag, tag_size), params)
+  if not np.all(np.isfinite(px)):
+    return None
+  return TagDetection(tag_id=tag_id, center=px.mean(0), corners=px)
 
 
 def pinhole_params() -> MeiParams:
@@ -59,6 +86,19 @@ def distorted_omni_params(xi: float) -> MeiParams:
   )
 
 
+def single_tracker_keys() -> dict[str, object]:
+  """The keying and containers a graph needs, for a test with one camera."""
+  return {
+    "pose_key_fn": lambda i: int(X(i)),
+    "velocity_key_fn": lambda i: int(V(i)),
+    "bias_key_fn": lambda i: int(B(i)),
+    "front_landmark_key_fn": front_landmark_key,
+    "rear_landmark_key_fn": rear_landmark_key,
+    "graph": gtsam.NonlinearFactorGraph(),
+    "values": gtsam.Values(),
+  }
+
+
 def project_point(
   pose_wb: gtsam.Pose3,
   extrinsic: gtsam.Pose3,
@@ -70,40 +110,43 @@ def project_point(
   return mei_project(np.asarray(p_lens)[None, :], params)[0]
 
 
-def front_only_graph(
+def pinned_visual_graph(
   body_poses: list[gtsam.Pose3],
   front: LensSetup,
   front_tracks: dict,
   front_points: dict,
+  rear_tracks: dict | None = None,
+  rear_points: dict | None = None,
 ) -> tuple[gtsam.NonlinearFactorGraph, gtsam.Values]:
-  """Visual-only graph (no IMU, no rear lens), gauge-pinned at both ends."""
-  return build_vi_graph(
-    body_poses=body_poses,
-    preintegrated=None,
-    front=LensChannel(
-      side="front", setup=front, tracks=front_tracks, points=front_points
-    ),
-    rear=LensChannel(side="rear", setup=front),
-    sigma=1.0,
-    weak_pose_sigmas=(0.3,) * 6,
-    anchor_last_pose=True,
-  )
+  """One lens's projection factors over a pose chain pinned at both ends, the
+  pinned ends giving a visual-only chain its gauge."""
+  graph = gtsam.NonlinearFactorGraph()
+  values = gtsam.Values()
+  pixel_noise = gtsam.noiseModel.Isotropic.Sigma(2, 1.0)
+  tight = gtsam.noiseModel.Isotropic.Sigma(6, 1e-6)
+  weak = gtsam.noiseModel.Diagonal.Sigmas(np.full(6, 0.3))
+
+  for i, pose in enumerate(body_poses):
+    values.insert(int(X(i)), pose)
+  n = len(body_poses)
+  graph.push_back(gtsam.PriorFactorPose3(int(X(0)), body_poses[0], tight))
+  if n > 1:
+    graph.push_back(gtsam.PriorFactorPose3(int(X(n - 1)), body_poses[-1], tight))
+  for i in range(1, n - 1):
+    graph.push_back(gtsam.PriorFactorPose3(int(X(i)), body_poses[i], weak))
+
+  for points, tracks, key_fn in (
+    (front_points, front_tracks, front_landmark_key),
+    (rear_points or {}, rear_tracks or {}, rear_landmark_key),
+  ):
+    for tid, xyz in points.items():
+      lm_key = key_fn(tid)
+      values.insert(lm_key, gtsam.Point3(*np.asarray(xyz, dtype=np.float64)))
+      for kf, pt in tracks[tid].items():
+        add_mei_factor(graph, int(X(kf)), lm_key, pt, pixel_noise, front)
+  return graph, values
 
 
 def unit_pixel_noise() -> gtsam.noiseModel.Base:
   # Isotropic σ=1 px, so whitened == unwhitened.
   return gtsam.noiseModel.Isotropic.Sigma(2, 1.0)
-
-
-def fd_pose_columns(
-  residual_at, pose: gtsam.Pose3, h: float = 1e-6
-) -> npt.NDArray[np.float64]:
-  """Central finite difference of a residual w.r.t. the Pose3 retract tangent."""
-  cols = []
-  for i in range(6):
-    xi = np.zeros(6)
-    xi[i] = h
-    r_plus = residual_at(pose.retract(xi))
-    r_minus = residual_at(pose.retract(-xi))
-    cols.append((r_plus - r_minus) / (2.0 * h))
-  return np.column_stack(cols)  # 2x6
