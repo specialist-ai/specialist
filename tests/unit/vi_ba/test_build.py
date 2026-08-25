@@ -7,20 +7,21 @@ import numpy as np
 import pytest
 from gtsam.symbol_shorthand import B, V, X
 
-from specialist.vi_ba.build import (
-  LensChannel,
-  LensSetup,
-  build_vi_graph,
-  front_landmark_key,
-  rear_landmark_key,
-)
+from specialist.vi_ba.build import LensChannel, LensSetup, build_vi_graph
 from specialist.vi_ba.imu import (
   ImuSamples,
   integrate_samples,
   make_preintegration_params,
 )
 from specialist.vi_ba.optimize import optimize_graph
-from tests.mei_fixtures import front_only_graph, pinhole_mei_params, project_point
+from tests.mei_fixtures import (
+  front_landmark_key,
+  pinhole_mei_params,
+  pinned_visual_graph,
+  project_point,
+  rear_landmark_key,
+  single_tracker_keys,
+)
 
 _GRAVITY = np.array([0.0, 0.0, -9.81])
 
@@ -41,6 +42,8 @@ def _imu_only_graph(
     front=LensChannel(side="front", setup=front),
     rear=LensChannel(side="rear", setup=front),
     sigma=1.0,
+    velocity_prior_sigma=0.1,
+    **single_tracker_keys(),  # type: ignore[arg-type]
   )
 
 
@@ -57,7 +60,7 @@ def test_build_graph_minimum_two_poses_one_landmark() -> None:
   front_tracks = {7: {0: pix_a, 1: pix_b}}
   front_points = {7: xyz}
 
-  graph, values = front_only_graph(poses, front_setup, front_tracks, front_points)
+  graph, values = pinned_visual_graph(poses, front_setup, front_tracks, front_points)
 
   # 2 tight priors (first + last), 0 intermediate priors, 2 projection factors.
   assert graph.size() == 4
@@ -87,16 +90,8 @@ def test_build_graph_dual_lens_uses_disjoint_landmark_keys() -> None:
   }
 
   lens = LensSetup(extrinsic=extrinsic, params=params)
-  graph, values = build_vi_graph(
-    body_poses=poses,
-    preintegrated=None,
-    front=LensChannel(
-      side="front", setup=lens, tracks=front_tracks, points={0: xyz_front}
-    ),
-    rear=LensChannel(side="rear", setup=lens, tracks=rear_tracks, points={0: xyz_rear}),
-    sigma=1.0,
-    weak_pose_sigmas=(0.3,) * 6,
-    anchor_last_pose=True,
+  graph, values = pinned_visual_graph(
+    poses, lens, front_tracks, {0: xyz_front}, rear_tracks, {0: xyz_rear}
   )
   # Front landmark key != rear landmark key.
   assert front_landmark_key(0) != rear_landmark_key(0)
@@ -115,7 +110,7 @@ def test_build_graph_weak_priors_on_intermediate_keyframes() -> None:
     gtsam.Pose3(gtsam.Rot3(), gtsam.Point3(0.2, 0.0, 0.0)),
     gtsam.Pose3(gtsam.Rot3(), gtsam.Point3(0.3, 0.0, 0.0)),
   ]
-  graph, _ = front_only_graph(
+  graph, _ = pinned_visual_graph(
     poses, LensSetup(extrinsic=extrinsic, params=params), {}, {}
   )
   # 2 tight priors + 2 weak priors (frames 1, 2) = 4 total.
@@ -146,7 +141,7 @@ def test_optimize_graph_converges_from_small_perturbation() -> None:
     true_poses[0],
     gtsam.Pose3(gtsam.Rot3(), gtsam.Point3(0.25, 0.02, 0.01)),
   ]
-  graph, values = front_only_graph(
+  graph, values = pinned_visual_graph(
     init_poses,
     LensSetup(extrinsic=extrinsic, params=params),
     front_tracks,
@@ -162,7 +157,7 @@ def test_optimize_graph_rejects_non_finite_initial_error_before_solving(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
   poses = [gtsam.Pose3(), gtsam.Pose3(gtsam.Rot3(), gtsam.Point3(np.nan, 0.0, 0.0))]
-  graph, values = front_only_graph(
+  graph, values = pinned_visual_graph(
     poses, LensSetup(extrinsic=gtsam.Pose3(), params=pinhole_mei_params()), {}, {}
   )
   assert not np.isfinite(graph.error(values))
