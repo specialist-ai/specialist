@@ -5,9 +5,9 @@ AprilTag wall-anchor frame, for humanoid fingertip data collection.
 
 Each gripper carries an Insta360 (two back-to-back fisheye cameras) plus an IMU,
 with AprilTags rigidly mounted on the gripper body. A wall- or ceiling-mounted
-anchor tag pins the world frame and metric scale. Per tracker, a GTSAM factor
+anchor tag pins the world frame and metric scale. Per camera, a GTSAM factor
 graph fuses visual odometry, IMU preintegration, and tag-corner reprojection;
-with multiple grippers, sightings of each other's tags tie the trackers
+with multiple grippers, sightings of each other's tags tie the cameras
 together. The output is globally-consistent metric trajectories and finger
 joint angles.
 
@@ -73,12 +73,12 @@ the rest:
 
 ```
 base/<session-id>.rrd    # remuxed per-lens video, IMU, calibration, offsets
-track/<session-id>.rrd   # the solve's answers: poses, joint angles, opening
+estimate/<session-id>.rrd # the run's answers: poses, joint angles, opening
 viz/<session-id>.rrd     # what is only drawn: ribbon, overlays, meshes
 mocap/<session-id>.rrd   # ground-truth layer (eval branch)
 ```
 
-**1. Convert.** One `_00_` master `.insv` per tracker (its `_10_` rear sibling
+**1. Convert.** One `_00_` master `.insv` per camera (its `_10_` rear sibling
 is found automatically). The first capture's clock is the session clock; the
 rest are audio-synced onto it, and the recording is trimmed to the span every
 capture covers.
@@ -94,24 +94,24 @@ real PTS, the native-rate IMU, the calibration, and the audio offsets. Pass
 `--audio-offsets` to supply the shifts by hand when a take's clips share no
 audible event.
 
-**2. Solve.** `track.py` reads the base recording — it carries the tracker
+**2. Estimate.** `estimate.py` reads the base recording — it carries the camera
 names, the session window, and the session id, so none of them are passed
-again. Each tracker's own base and finger tags are discovered from its rear
+again. Each camera's own base and finger tags are discovered from its rear
 lens against the gripper URDF, so only the anchors are named; the first
 `--anchor.tag-ids` entry is the reference anchor that pins the world gauge. The
 URDF is required: `--urdf-path` overrides the packaged gripper description.
 
 ```
-uv run python scripts/track.py --base logs/base/<session-id>.rrd \
+uv run python scripts/estimate.py --base logs/base/<session-id>.rrd \
   --anchor.tag-ids <anchor-tag-id> --output-dir logs
 ```
 
-A single tracker is the same command with no cross-tracker factors.
+A single camera is the same command with no cross-camera factors.
 `--keyframe-every` overrides the automatic ~0.10 s keyframe stride, and
 `--no-open-viewer` keeps a headless box from spawning one.
 
 The run writes two layers sharing the base recording's id:
-`logs/track/<session-id>.rrd` carries what a consumer reads — body poses,
+`logs/estimate/<session-id>.rrd` carries what a consumer reads — body poses,
 keyframe poses, finger joint angles, gripper opening, the solved anchor poses
 and the run summary — and `logs/viz/<session-id>.rrd` carries what is only
 drawn, the trajectory ribbon, the image overlays, the landmarks, the robot
@@ -119,7 +119,7 @@ meshes and the diagnostic scalars. Re-running a session refuses to overwrite
 either unless `--overwrite` is passed, so point experimental runs at their own
 `--output-dir`. It spawns a viewer on the way out; to re-open a session later,
 load the layers beside their base — the shared id merges them — with
-`uv run rerun logs/base/<id>.rrd logs/track/<id>.rrd logs/viz/<id>.rrd`.
+`uv run rerun logs/base/<id>.rrd logs/estimate/<id>.rrd logs/viz/<id>.rrd`.
 
 **3. Register** (optional) the pair on a Rerun catalog, which installs the
 standard dashboard as the dataset default. A layer whose recording id matches
@@ -150,7 +150,7 @@ src/specialist/
 
 scripts/
 ├── convert.py          captures → one session base recording
-├── track.py            the VI-BA driver (N ≥ 1 trackers) → track + viz layers
+├── estimate.py         the VI-BA driver (N ≥ 1 cameras) → estimate + viz layers
 ├── register.py         a layer-first corpus root → a Rerun catalog dataset
 ├── imu.py              IMU rate / noise / Allan-deviation probe
 ├── video_imu_timing.py video↔IMU clock + rolling-shutter probe

@@ -1,77 +1,421 @@
 """The rrd written by the layer writer round-trips through the reader."""
 
+import hashlib
+import re
 from dataclasses import fields
 from pathlib import Path
+from typing import Any
 
 import gtsam
 import numpy as np
 import pytest
-from rerun.experimental import Chunk, RrdReader
+from rerun.experimental import Chunk, ChunkStore, RrdReader
 
-from specialist.vi_ba.summary import TrackerSummary
-from specialist.vi_ba.viz import TrackerVizData, _overlay_index, solution_chunks
-from tests.record_fixtures import make_summary, urdf_file, viz_tracker, write_run
+from specialist.record import schema
+from specialist.vi_ba.blueprint import (
+  _hidden_overlay_overrides,
+  _triad_overrides,
+  _without_pixels,
+)
+from specialist.vi_ba.summary import CameraSummary, Summary
+from specialist.vi_ba.viz import (
+  CameraEstimate,
+  Layers,
+  estimate_chunks,
+)
+from tests.record_fixtures import camera_estimate, urdf_file, write_run
 
-# Every entity a solve writes, and the layer that must carry it. An entity a
-# future solve adds and routes nowhere would otherwise join the track layer in
-# silence, which is the one thing the split exists to prevent.
-_TRACK = (
+# Every entity a solve writes, and the layer that must carry it.
+_ESTIMATE = (
   "/world",
-  "/world/anchor_tag",
-  "/world/anchor_tag/frame",
-  "/tracker_0/body",
-  "/tracker_0/body_keyframes",
-  "/tracker_0/gripper",
-  "/tracker_0/gripper_opening",
-  "/tracker_1/body",
+  "/world/anchor/0",
+  "/camera/cam00",
+  "/camera/cam00/base_tag",
+  "/camera/cam00/state/pose",
+  "/camera/cam00/state/lin_vel",
+  "/camera/cam00/lin_vel",
+  "/camera/cam00/imu/bias/gyro",
+  "/camera/cam00/imu/bias/accel",
+  "/camera/cam00/gripper",
+  "/camera/cam00/gripper/opening",
+  "/camera/cam00/gripper/tf_static",
+  "/camera/cam00/front/detection/keypoints",
+  "/camera/cam00/front/detection/keypoints_rejected",
+  "/camera/cam00/front/detection/tags",
+  "/camera/cam00/front/detection/tags/center",
+  "/camera/cam01",
 )
 _VIZ = (
-  "/tracker_0/trajectory",
-  "/tracker_0/body/marker",
-  "/tracker_0/landmarks/front",
-  "/tracker_0/landmarks/rear",
-  "/tracker_0/tf_static",
-  "/tracker_0/gripper/visual_geometries/base/visual_0",
-  "/metrics/distance_from_start/tracker_0",
-  "/tracker_1/trajectory",
+  "/camera/cam00/gripper/visual_geometries/base/visual_0",
+  "/world/anchor/0",
+  "/camera/cam00/trajectory",
+  "/camera/cam00/marker",
+  "/camera/cam00/landmark/front",
+  "/camera/cam00/landmark/rear",
+  "/camera/cam00/fit/rmse",
+  "/camera/cam00/front/overlay/tag_axes",
+  "/camera/cam00/front/overlay/landmark_reprojection",
+  "/camera/cam01/trajectory",
 )
 
 
-def _two_trackers() -> list[TrackerVizData]:
-  return [viz_tracker("tracker_0", highrate=True), viz_tracker("tracker_1", offset=1.0)]
+def _two_cameras() -> list[CameraEstimate]:
+  return [camera_estimate("cam00"), camera_estimate("cam01", offset=1.0)]
 
 
 @pytest.fixture(scope="module")
-def solved_run(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, Path]:
-  """One two-tracker run with a URDF model: the layers every check that only
-  reads a finished run shares."""
+def estimated_run(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, Path]:
+  """One two-camera run with a URDF model."""
   tmp = tmp_path_factory.mktemp("solved")
-  return write_run(tmp, "sess_route", _two_trackers(), urdf_path=urdf_file(tmp))
+  # A frame clock, so the review timeline exists.
+  return write_run(
+    tmp,
+    "sess_route",
+    _two_cameras(),
+    urdf_path=urdf_file(tmp),
+    frame_period=1.0 / 30.0,
+  )
 
 
-def test_each_layer_carries_exactly_what_it_owns(solved_run: tuple[Path, Path]) -> None:
-  """The producer names the layer for each chunk it builds, so a new entity
-  that nobody routes lands nowhere by accident rather than in the answers."""
-  track_path, viz_path = solved_run
-  track = set(RrdReader(str(track_path)).store().schema().entity_paths())
-  viz = set(RrdReader(str(viz_path)).store().schema().entity_paths())
+def _chunks(path: Path) -> list[Chunk]:
+  """One layer's chunks, read back off disk."""
+  return list(RrdReader(str(path)).store().stream().to_chunks())
 
-  assert len(RrdReader(str(track_path)).recordings()) == 1
-  assert not track & viz, f"{sorted(track & viz)} in both layers"
-  assert not set(_TRACK) - track, f"missing from track: {sorted(set(_TRACK) - track)}"
-  assert not set(_VIZ) - viz, f"missing from viz: {sorted(set(_VIZ) - viz)}"
-  assert not set(_VIZ) & track, f"decoration in track: {sorted(set(_VIZ) & track)}"
-  assert not set(_TRACK) & viz, f"answers in viz: {sorted(set(_TRACK) & viz)}"
+
+def _names(path: Path) -> set[tuple[str, str]]:
+  """Every ``(entity, component)`` one layer writes."""
+  return {
+    (chunk.entity_path, name)
+    for chunk in _chunks(path)
+    for name in chunk.to_record_batch().schema.names
+    if not name.startswith("rerun.controls.") and name not in chunk.timeline_names
+  }
+
+
+def _column(path: Path, entity: str, component: str) -> list[list[object]]:
+  """Every row one component holds at one entity, empty rows included."""
+  rows = []
+  for chunk in _chunks(path):
+    if chunk.entity_path != entity:
+      continue
+    batch = chunk.to_record_batch()
+    if component in batch.schema.names:
+      rows.extend(batch.to_pydict()[component])
+  return rows
+
+
+def test_the_fixture_carries_one_of_everything_a_camera_holds() -> None:
+  """Every field of ``CameraEstimate`` carries a value in the fixture."""
+  camera = camera_estimate("cam00")
+
+  def carries_nothing(owner: object, name: str) -> bool:
+    """A field is unexercised when it holds nothing, or holds a sentinel
+    meaning nothing: an id below zero."""
+    value = getattr(owner, name)
+    if value is None:
+      return True
+    if isinstance(value, np.ndarray):
+      return value.size == 0
+    if isinstance(value, (dict, list, str)):
+      return not value
+    return isinstance(value, int) and not isinstance(value, bool) and value < 0
+
+  empty = [f.name for f in fields(camera) if carries_nothing(camera, f.name)]
+  assert camera.lenses, "a camera with no lens exercises no overlay"
+  # Per field rather than per lens: the front lens is never masked and the rear
+  # rejects nothing, so what matters is that some lens exercises each field.
+  empty += [
+    f"LensEstimate.{f.name}"
+    for f in fields(next(iter(camera.lenses.values())))
+    if all(carries_nothing(lens, f.name) for lens in camera.lenses.values())
+  ]
+  assert not empty, f"a field no test exercises: {empty}"
+
+
+def test_each_layer_carries_exactly_what_it_owns(
+  estimated_run: tuple[Path, Path],
+) -> None:
+  """An entity may appear in both layers, the quantity in one and the way of
+  drawing it in the other, but a ``(entity, component)`` name may not: two
+  writers of one name resolve silently by write time."""
+  estimate_path, viz_path = estimated_run
+  estimate, viz = _names(estimate_path), _names(viz_path)
+  estimate_entities = {e for e, _ in estimate}
+  viz_entities = {e for e, _ in viz}
+
+  assert len(RrdReader(str(estimate_path)).recordings()) == 1
+  assert not estimate & viz, f"{sorted(estimate & viz)} written by both layers"
+  assert not set(_ESTIMATE) - estimate_entities, (
+    f"missing: {sorted(set(_ESTIMATE) - estimate_entities)}"
+  )
+  assert not set(_VIZ) - viz_entities, f"missing: {sorted(set(_VIZ) - viz_entities)}"
+
+  known = re.compile(
+    r"^/(world(/anchor/\d+)?|estimate|__properties(/\w+)?"
+    r"|camera/cam\d\d(/(front|rear)(/video|/(overlay|detection)(/[\w.]+)*)?"
+    r"|/(state|imu|fit|landmark|factor|gripper)(/[\w./]+)?"
+    r"|/(marker|base_tag|lin_vel|trajectory))?)$"
+  )
+  stray = sorted({e for e, _ in estimate | viz if not known.match(e)})
+  assert not stray, f"entities routed by nobody: {stray}"
+
+
+def test_a_static_component_never_replaces_a_different_temporal_one(
+  estimated_run: tuple[Path, Path],
+) -> None:
+  """A static component shadows every temporal value of the same component on
+  the same entity, for all time and across layers, so a static that differs
+  from the series it covers is refused."""
+  for path in estimated_run:
+    static: dict[tuple[str, str], list[Any]] = {}
+    temporal: dict[tuple[str, str], list[Any]] = {}
+    for chunk in _chunks(path):
+      batch = chunk.to_record_batch()
+      side = static if chunk.is_static else temporal
+      for name, values in zip(
+        batch.schema.names, batch.to_pydict().values(), strict=True
+      ):
+        if name.startswith("rerun.controls.") or name in chunk.timeline_names:
+          continue
+        side.setdefault((chunk.entity_path, name), []).extend(values)
+    for key, covered in static.items():
+      series = temporal.get(key)
+      if series is None:
+        continue
+      assert all(value == covered[0] for value in series), (
+        f"{path.parent.name}: static {key[1]} on {key[0]} replaces a series "
+        f"that disagrees with it"
+      )
+
+
+# Everything under the camera that is measured FROM the camera, and so is meant
+# to ride its pose. Anything else has to say where it is.
+_RIDES_THE_BODY = frozenset({"", "/front", "/rear", "/imu", "/base_tag", "/marker"})
+
+# What a CoordinateFrame can place; a declaration on an entity holding none of
+# these is inert.
+_DRAWABLE = ("Points3D", "LineStrips3D", "Boxes3D", "Asset3D", "TransformAxes3D")
+
+
+def _blueprint_draws_on(slots: list[str]) -> set[str]:
+  """The entities the blueprint puts a visualizer on, without their leading
+  slash."""
+  return {p.lstrip("/") for p in _triad_overrides(slots, (0, 1), 0.1)}
+
+
+def test_an_anchor_records_the_width_it_was_solved_against(
+  estimated_run: tuple[Path, Path],
+) -> None:
+  """The estimate layer carries the tag width the solve used."""
+  estimate, _ = estimated_run
+  sizes = set()
+  for chunk in _chunks(estimate):
+    if schema.anchor_id_of(str(chunk.entity_path)) is None:
+      continue
+    batch = chunk.to_record_batch()
+    if "tag_size" in batch.schema.names:
+      sizes |= {v for row in batch.column("tag_size").to_pylist() if row for v in row}
+  assert sizes == {0.1}
+
+
+def test_an_anchor_keeps_both_its_triad_and_its_outline() -> None:
+  """An override replaces the visualizer set an entity gets on its own."""
+  overrides = _triad_overrides(["cam00"], (7,), 0.1)
+  drawn = overrides[f"/{schema.anchor(7)}"]
+  assert [type(v).__name__ for v in drawn] == ["TransformAxes3D", "LineStrips3D"]
+
+
+def test_what_the_camera_pose_carries_is_only_what_is_mounted_on_it(
+  estimated_run: tuple[Path, Path],
+) -> None:
+  """The camera entity carries the body pose, so a transform beneath it
+  composes with that pose and drawable data beneath it is drawn through it.
+  Anything not mounted on the camera either names its own frame (drawable) or
+  names both ends of its edge (transforms)."""
+  declared: set[str] = set()
+  detached: set[str] = set()
+  drawable: set[str] = set()
+  path_framed: set[str] = set()
+  for path in estimated_run:
+    for chunk in _chunks(path):
+      entity, names = chunk.entity_path, chunk.to_record_batch().schema.names
+      if "CoordinateFrame:frame" in names:
+        declared.add(entity)
+      if "Transform3D:parent_frame" in names:
+        detached.add(entity)
+      elif any(n.startswith("Transform3D:") for n in names):
+        path_framed.add(entity)
+      if any(n.split(":")[0] in _DRAWABLE for n in names):
+        drawable.add(entity)
+
+  def mounted(entity: str) -> bool:
+    if not entity.startswith("/camera/cam0"):
+      return True
+    suffix = entity[len("/camera/cam00") :]
+    return suffix in _RIDES_THE_BODY or suffix.startswith(("/front/", "/rear/"))
+
+  adrift = sorted(e for e in drawable - declared if not mounted(e))
+  assert not adrift, f"drawn through the camera pose, naming no frame: {adrift}"
+  composed = sorted(e for e in path_framed - detached if not mounted(e))
+  assert not composed, f"composes with the camera pose unintentionally: {composed}"
+
+  # The blueprint draws on entities the layers only place.
+  painted = drawable | {f"/{path}" for path in _blueprint_draws_on(["cam00", "cam01"])}
+  inert = sorted(e for e in declared - painted if e.startswith("/camera/"))
+  assert not inert, f"frame declared on an entity holding nothing drawable: {inert}"
+
+
+def test_every_tag_the_solve_used_is_named_in_the_layer(
+  estimated_run: tuple[Path, Path],
+) -> None:
+  """Every physical tag the solve used is an entity carrying its own pose and
+  id: each world anchor, the base tag on the body, and the tag riding each
+  revolute joint whose angle was reprojected from it."""
+  named: dict[str, int] = {}
+  for chunk in _chunks(estimated_run[0]):
+    batch = chunk.to_record_batch()
+    if "tag_id" in batch.schema.names:
+      # The rows that clear an overlay carry an empty id; the tag entities and
+      # the drawn rows carry a real one.
+      ids = [v for row in batch.to_pydict()["tag_id"] or [] for v in (row or [])]
+      if ids:
+        named[chunk.entity_path] = int(ids[0])
+  assert named.get(f"/{schema.base_tag('cam00')}") == 2000
+  for joint, tag in (("left_finger", 2001), ("right_finger", 2002)):
+    entity = f"/{schema.joint_tag('cam00', joint)}"
+    assert named.get(entity) == tag, (entity, named.get(entity), named)
+
+  # Naming a frame nothing defines places the tag nowhere.
+  defined, named_frames = set(), {}
+  for path in estimated_run:
+    for chunk in _chunks(path):
+      batch = chunk.to_record_batch()
+      row = batch.to_pydict()
+      for column, sink in (
+        ("Transform3D:child_frame", defined),
+        ("CoordinateFrame:frame", None),
+      ):
+        if column not in batch.schema.names:
+          continue
+        for value in row[column]:
+          frame = value[0] if isinstance(value, list) else value
+          if not frame:
+            continue
+          if sink is None:
+            named_frames[chunk.entity_path] = str(frame)
+          else:
+            sink.add(str(frame))
+  dangling = {e: f for e, f in named_frames.items() if f not in defined}
+  assert not dangling, f"entities naming a frame nothing defines: {dangling}"
+
+
+def test_the_model_the_angles_came_from_is_named(
+  estimated_run: tuple[Path, Path], tmp_path: Path
+) -> None:
+  """The layer records which model the joint angles came from, and each
+  joint's axis and limits."""
+  values: dict[tuple[str, str], Any] = {}
+  for chunk in _chunks(estimated_run[0]):
+    batch = chunk.to_record_batch()
+    for name, column in zip(
+      batch.schema.names, batch.to_pydict().values(), strict=True
+    ):
+      if name in ("robot", "urdf_sha", "axis", "joint_type", "limit_lower"):
+        values[chunk.entity_path, name] = column[0]
+
+  def one(entity: str, name: str) -> Any:
+    return np.asarray(values[entity, name]).reshape(-1)
+
+  gripper = f"/{schema.gripper('cam00')}"
+  assert one(gripper, "robot")[0] == "gripper"
+  digest = str(one(gripper, "urdf_sha")[0])
+  # The fixture writes the same bytes every time, so a digest that tracks the
+  # model matches a fresh copy of it.
+  assert digest == hashlib.sha256(urdf_file(tmp_path).read_bytes()).hexdigest(), (
+    "the digest does not track the model it was read from"
+  )
+  for joint in ("left_finger", "right_finger"):
+    entity = f"/{schema.joint_model('cam00', joint)}"
+    assert one(entity, "joint_type")[0] == "revolute"
+    # The finger factors rotate about +z and do not read the URDF axis.
+    assert list(one(entity, "axis")) == [0.0, 0.0, 1.0]
+    assert one(entity, "limit_lower")[0] == pytest.approx(-1.0)
+
+
+def test_no_frame_is_defined_twice(estimated_run: tuple[Path, Path]) -> None:
+  """One frame, one definition: Rerun resolves a second definition of a child
+  frame by log order across layers. A static definition and a temporal one are
+  not a clash, since the temporal one wins; two of a kind is the ambiguity."""
+  by_frame: dict[tuple[str, bool], set[str]] = {}
+  for path in estimated_run:
+    for chunk in _chunks(path):
+      batch = chunk.to_record_batch()
+      if "Transform3D:child_frame" not in batch.schema.names:
+        continue
+      for value in batch.to_pydict()["Transform3D:child_frame"]:
+        name = value[0] if isinstance(value, list) else value
+        if name:
+          by_frame.setdefault((str(name), bool(chunk.is_static)), set()).add(
+            chunk.entity_path
+          )
+  twice = {
+    f"{name}{' (static)' if static else ''}": sorted(entities)
+    for (name, static), entities in by_frame.items()
+    if len(entities) > 1
+  }
+  assert not twice, f"frames defined by more than one entity: {twice}"
+
+
+def test_what_the_lens_measured_is_an_answer_not_a_picture(
+  estimated_run: tuple[Path, Path],
+) -> None:
+  """The pixels a lens measured are a quantity in the estimate layer: the
+  keypoints the frontend tracked, the ones it rejected, and each tag's corner
+  quad, centre and integer id. The label string is a rendering."""
+  estimate, viz = _names(estimated_run[0]), _names(estimated_run[1])
+  lens = "/camera/cam00/front/detection"
+  for entity, component in (
+    (f"{lens}/keypoints", "Points2D:positions"),
+    (f"{lens}/keypoints_rejected", "Points2D:positions"),
+    (f"{lens}/tags", "LineStrips2D:strips"),
+    (f"{lens}/tags", "tag_id"),
+    (f"{lens}/tags/center", "Points2D:positions"),
+  ):
+    assert (entity, component) in estimate, f"{entity}:{component} is not an answer"
+    assert (entity, component) not in viz, f"{entity}:{component} is drawn twice"
+
+  ids = _column(estimated_run[0], f"{lens}/tags", "tag_id")
+  assert sorted({int(v) for row in ids for v in row}) == [0, 2000]
+  assert (f"{lens}/tags/center", "Points2D:labels") in viz
+
+
+def test_no_answer_is_split_across_clocks(estimated_run: tuple[Path, Path]) -> None:
+  """In the answers layer, every chunk of one ``(entity, component)`` carries
+  the same clocks."""
+  estimate_path, _viz_path = estimated_run
+  clocks: dict[tuple[str, str], set[frozenset[str]]] = {}
+  for chunk in _chunks(estimate_path):
+    if chunk.is_static:
+      continue
+    timelines = frozenset(chunk.timeline_names)
+    for name in chunk.to_record_batch().schema.names:
+      if name.startswith("rerun.controls.") or name in timelines:
+        continue
+      clocks.setdefault((chunk.entity_path, name), set()).add(timelines)
+  split = {
+    key: sorted(map(sorted, seen)) for key, seen in clocks.items() if len(seen) > 1
+  }
+  assert not split, f"one name, different clocks: {split}"
 
 
 def test_the_session_clock_carries_durations_in_every_layer(
-  solved_run: tuple[Path, Path],
+  estimated_run: tuple[Path, Path],
 ) -> None:
   """The session clock is indexed by durations, which a reader divides by a
   nanosecond."""
   seen = 0
-  for path in solved_run:
-    for chunk in RrdReader(str(path)).store().stream().to_chunks():
+  for path in estimated_run:
+    for chunk in _chunks(path):
       schema = chunk.to_record_batch().schema
       if "video_time" in schema.names:
         dtype = schema.field("video_time").type
@@ -80,45 +424,46 @@ def test_the_session_clock_carries_durations_in_every_layer(
   assert seen, "no chunk carried the session clock"
 
 
-def test_the_dashboard_ships_with_what_it_draws(solved_run: tuple[Path, Path]) -> None:
-  """The dashboard is the viz layer's: it plots the overlays and the metrics,
-  which the track layer does not carry, and two files claiming the same
-  default would leave whichever loaded last to win."""
-  track_path, viz_path = solved_run
-  assert RrdReader(str(viz_path)).blueprints()
-  assert not RrdReader(str(track_path)).blueprints()
-
-
-def test_overlay_index_bounds_each_keyframe_to_one_frame() -> None:
-  """Data rows sit at keyframe times (carrying the review timeline when
-  given); clearing rows follow one frame period later on the video clock
-  alone, so a 30 fps video never wears an overlay computed from an older
-  keyframe and the review timeline never sees a clearing row."""
-  kf_times = np.array([0.0, 0.1, 0.2])
-  kf_col = object()
-  data, clear = _overlay_index(kf_times, 1.0 / 30.0, [], kf_col)  # type: ignore[arg-type]
-  assert len(data) == 2 and data[1] is kf_col
-  assert clear is not None and len(clear) == 1
-  fallback = [object()]
-  same, none = _overlay_index(None, 1.0 / 30.0, fallback, None)  # type: ignore[arg-type]
-  assert same is fallback and none is None
+def test_no_layer_embeds_a_blueprint(
+  estimated_run: tuple[Path, Path],
+) -> None:
+  """An embedded blueprint would freeze its solve date's layout and shadow
+  the corpus .rbl on direct opens."""
+  estimate_path, viz_path = estimated_run
+  assert not RrdReader(str(viz_path)).blueprints()
+  assert not RrdReader(str(estimate_path)).blueprints()
 
 
 def test_several_mask_rects_reach_the_layer(tmp_path: Path) -> None:
   """A capture may mask more than one static region, and every box in the set
-  is one row of the same chunk."""
-  _track, viz = write_run(
+  is one row of the same chunk. Where the boxes are shaped which pixels reached
+  the solve, so they sit with the answers."""
+  estimate, _viz = write_run(
     tmp_path,
     "sess_mask",
-    _two_trackers(),
+    _two_cameras(),
     mask_rects=((0, 0, 10, 10), (20, 20, 40, 40)),
+    urdf_path=urdf_file(tmp_path),
+    frame_period=1.0 / 30.0,
   )
-  masks = {
-    chunk.entity_path: chunk.num_rows
-    for chunk in RrdReader(str(viz)).store().stream().to_chunks()
-    if chunk.entity_path.endswith("/static_mask")
-  }
-  assert masks and all(rows == 1 for rows in masks.values()), masks
+  boxes: dict[str, list[tuple[object, object]]] = {}
+  for chunk in _chunks(estimate):
+    batch = chunk.to_record_batch()
+    if not chunk.entity_path.endswith("/static_mask"):
+      continue
+    if "Boxes2D:centers" not in batch.schema.names:
+      continue
+    row = batch.to_pydict()
+    boxes[chunk.entity_path] = list(
+      zip(row["Boxes2D:centers"][0], row["Boxes2D:half_sizes"][0], strict=True)
+    )
+
+  assert boxes, "no mask boxes reached the layer"
+  # Every rectangle in the set, and the right way round: a box whose centre and
+  # half-size are swapped masks a different part of the image.
+  for path, pairs in boxes.items():
+    got = sorted((tuple(c), tuple(h)) for c, h in pairs)
+    assert got == [((5.0, 5.0), (5.0, 5.0)), ((30.0, 30.0), (10.0, 10.0))], (path, got)
 
 
 def test_a_model_that_fails_to_write_is_not_mistaken_for_a_missing_model(
@@ -126,102 +471,216 @@ def test_a_model_that_fails_to_write_is_not_mistaken_for_a_missing_model(
 ) -> None:
   """A sink that raises on a mesh chunk raises out of ``estimate_chunks``: the
   optional-model guard covers building the model, not writing it."""
-  data = viz_tracker("t0")
-  data.urdf_root_poses = list(data.body_poses)
+  data = camera_estimate("cam00")
 
   def die(chunk: Chunk) -> None:
     if "geometries" in chunk.entity_path:
       raise OSError(28, "No space left on device")
 
   with pytest.raises(OSError):
-    solution_chunks(
-      die,
-      die,
+    estimate_chunks(
+      Layers(die, die),
       [data],
       {0: gtsam.Pose3()},
       0,
       0.1,
-      mask_pad_px=-1,
+      mask_pad_px=45,
       urdf_path=urdf_file(tmp_path),
+      timeline_start=0.0,
+      frame_period=1.0 / 30.0,
     )
 
 
 def test_a_viewer_that_cannot_open_does_not_cost_the_run_its_layers(
   tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-  """A box with no display cannot show the run, and the run is worth more than
-  the look at it."""
+  """A viewer that cannot open still leaves the run's layers written.
+
+  The patch goes on ``rerun.spawn`` itself, which is what the writer calls;
+  patching the helper underneath it does nothing when ``spawn`` returns early,
+  and the writer then probes the viewer port for real.
+  """
 
   def no_display(**kwargs: object) -> None:
     raise RuntimeError("no display")
 
-  monkeypatch.setattr("rerun.sinks._spawn_viewer", no_display)
-  for path in write_run(tmp_path, "sess_headless", _two_trackers(), open_viewer=True):
+  monkeypatch.setattr("rerun.spawn", no_display)
+  for path in write_run(
+    tmp_path,
+    "sess_headless",
+    _two_cameras(),
+    open_viewer=True,
+    urdf_path=urdf_file(tmp_path),
+    frame_period=1.0 / 30.0,
+  ):
     assert path.exists()
 
 
-def test_every_number_the_summary_carries_reaches_the_layer(tmp_path: Path) -> None:
+def test_every_number_the_summary_carries_reaches_the_layer(
+  estimated_run: tuple[Path, Path],
+) -> None:
   """Every field of ``Summary`` and ``CameraSummary`` reaches the layer."""
-  quality = TrackerSummary(
-    name="tracker_0",
-    n_keyframes=3,
-    anchor_obs=2,
-    bounding_box_diagonal=1.5,
-    path_length=2.5,
-    front_rmse=0.4,
-    rear_rmse=0.6,
-  )
-  summary = make_summary("tracker_0")
-  track, _viz = write_run(
-    tmp_path,
-    "sess_props",
-    [viz_tracker("tracker_0", highrate=True)],
-    per_tracker=[quality],
-    summary=summary,
-  )
-  columns = RrdReader(str(track)).store().schema().component_columns()
   written = {
     (c.entity_path, c.component)
-    for c in columns
-    if "__properties" in c.entity_path or "run_summary" in c.entity_path
+    for c in RrdReader(str(estimated_run[0])).store().schema().component_columns()
   }
-  # The curated headline set becomes segment-table columns; every other number
-  # reaches the layer as the static run_summary entities instead.
-  headline_homes = {
-    "sources": "/__properties/session",
-    "cross_tracker_obs": "/__properties/solver",
-    "solver_iterations": "/__properties/solver",
+  properties = {c for e, c in written if e.startswith("/__properties")}
+  for field in fields(Summary):
+    assert field.name in properties, field.name
+  # Provenance is written unconditionally: an empty value writes no column.
+  for name in ("git_sha", "estimated_at", "rerun_version"):
+    assert name in properties, name
+  for field in fields(CameraSummary):
+    if field.name != "slot":
+      assert ("/camera/cam00/fit", field.name) in written, field.name
+  # segment_table() has no projection pushdown, so every query pays for every
+  # property column any layer ever wrote.
+  assert properties == {f.name for f in fields(Summary)} | {
+    "worst_rmse",
+    "git_sha",
+    "estimated_at",
+    "rerun_version",
   }
-  for field in fields(summary):
-    home = headline_homes.get(field.name, "/run_summary")
-    assert (home, field.name) in written, field.name
-  for field in fields(quality):
-    home = (
-      "/__properties/quality_tracker_0"
-      if field.name == "front_rmse"
-      else "/run_summary/tracker_0"
-    )
-    assert (home, field.name) in written, field.name
 
 
-def test_training_fields_carry_the_keyframe_index(tmp_path: Path) -> None:
+def test_training_fields_carry_the_keyframe_index(
+  estimated_run: tuple[Path, Path],
+) -> None:
   """Every per-timestep field carries the keyframe timeline beside the session
   clock, so a dataloader can join one training row by integer keyframe
   index."""
-  track, _viz = write_run(
+  timelines: dict[str, set[str]] = {}
+  for chunk in _chunks(estimated_run[0]):
+    timelines.setdefault(chunk.entity_path, set()).update(chunk.timeline_names)
+  for entity in ("/camera/cam00/state/pose", "/camera/cam00/gripper/opening"):
+    assert {"video_time", "keyframe"} <= timelines[entity], (
+      entity,
+      timelines.get(entity),
+    )
+
+
+def test_every_overlay_answers_on_the_keyframe_clock_alone(tmp_path: Path) -> None:
+  """An overlay is one keyframe's answer about one frame: every one draws on
+  the keyframe clock and none exists on the video clock."""
+  estimate, viz = write_run(
     tmp_path,
-    "sess_clock",
-    [viz_tracker("tracker_0")],
+    "sess_kf",
+    _two_cameras(),
+    urdf_path=urdf_file(tmp_path),
     frame_period=1.0 / 30.0,
   )
-  timelines: dict[str, set[str]] = {}
-  for chunk in RrdReader(str(track)).store().stream().to_chunks():
-    timelines.setdefault(chunk.entity_path, set()).update(chunk.timeline_names)
-  for field in ("body_keyframes", "gripper_opening"):
-    entities = [e for e in timelines if field in e]
-    assert entities, field
-    for entity in entities:
-      assert {"video_time", "keyframe"} <= timelines[entity], (
-        entity,
-        timelines[entity],
+  geometry = ("strips", "positions", "centers")
+  answered = 0
+  for path in (estimate, viz):
+    by_entity: dict[str, list[Chunk]] = {}
+    for chunk in _chunks(path):
+      if not chunk.is_static and (
+        "/overlay/" in chunk.entity_path or "/detection/" in chunk.entity_path
+      ):
+        by_entity.setdefault(chunk.entity_path, []).append(chunk)
+    for entity, chunks in by_entity.items():
+      assert not any(schema.TIMELINE in c.timeline_names for c in chunks), (
+        f"{entity} is written on the video clock, where it would be held over "
+        f"the frames that follow the keyframe it was computed from"
       )
+      table = (
+        ChunkStore.from_chunks(chunks)
+        .reader(index=schema.KEYFRAME_TIMELINE)
+        .to_arrow_table()
+      )
+      for name in table.schema.names:
+        if name.split(":")[-1] not in geometry:
+          continue
+        assert any(table.column(name).to_pylist()), (
+          f"{entity}:{name} resolves to nothing on the keyframe timeline"
+        )
+        answered += 1
+  assert answered >= 8, f"only {answered} geometry columns were checked"
+
+
+def test_the_tag_overlay_is_visible_without_a_toggle() -> None:
+  """The tags and their axes draw as soon as the blueprint opens; the pixel
+  clouds beside them stay a toggle away."""
+  hidden = _hidden_overlay_overrides("cam00", "front")
+  tags = f"/{schema.detection('cam00', 'front', schema.TAGS_DETECTION)}"
+  assert tags not in hidden
+  assert f"/{schema.overlay('cam00', 'front', schema.TAG_AXES_OVERLAY)}" not in hidden
+  for path, kind in (
+    (schema.detection, schema.KEYPOINTS_DETECTION),
+    (schema.detection, schema.REJECTED_KEYPOINTS_DETECTION),
+    (schema.overlay, schema.LANDMARK_REPROJECTION_OVERLAY),
+  ):
+    override = hidden[f"/{path('cam00', 'front', kind)}"]
+    assert override.visible.as_arrow_array().to_pylist() == [False], kind
+
+
+def test_no_frame_pair_is_declared_twice(estimated_run: tuple[Path, Path]) -> None:
+  """A frame pair is one relation, so an edge declared by two entities is
+  refused."""
+  edges: dict[tuple[str, str], set[str]] = {}
+  for path in estimated_run:
+    for chunk in _chunks(path):
+      batch = chunk.to_record_batch()
+      names = batch.schema.names
+      if not {"Transform3D:parent_frame", "Transform3D:child_frame"} <= set(names):
+        continue
+      row = batch.to_pydict()
+      for parent, child in zip(
+        row["Transform3D:parent_frame"], row["Transform3D:child_frame"], strict=True
+      ):
+        if parent and child:
+          edges.setdefault((parent[0], child[0]), set()).add(chunk.entity_path)
+  doubled = {pair: sorted(who) for pair, who in edges.items() if len(who) > 1}
+  assert not doubled, f"one frame pair, two authors: {doubled}"
+
+
+def test_a_posed_entity_carries_nothing_wider_than_its_pose(
+  estimated_run: tuple[Path, Path],
+) -> None:
+  """An entity has as many instances as its widest component, so a posed
+  entity carries nothing wider than its pose."""
+  posed: set[str] = set()
+  widths: dict[str, dict[str, int]] = {}
+  for path in estimated_run:
+    for chunk in _chunks(path):
+      batch = chunk.to_record_batch()
+      row = batch.to_pydict()
+      for field in batch.schema:
+        if (field.metadata or {}).get(b"kind") != b"data":
+          continue
+        if field.name.startswith("Transform3D:"):
+          posed.add(chunk.entity_path)
+        width = max((len(v) for v in row[field.name] if v is not None), default=0)
+        seen = widths.setdefault(chunk.entity_path, {})
+        seen[field.name] = max(seen.get(field.name, 0), width)
+  wide = {
+    entity: {n: w for n, w in widths[entity].items() if w > 1}
+    for entity in posed
+    if any(w > 1 for w in widths[entity].values())
+  }
+  assert not wide, f"posed entities carrying a wider component: {wide}"
+
+
+def test_the_3d_view_drops_everything_measured_in_pixels(
+  estimated_run: tuple[Path, Path],
+) -> None:
+  """The viewer refuses to draw a 2D archetype without a pinhole above it, so
+  the 3D view drops every entity measured in pixels by path."""
+  flat = ("Points2D", "LineStrips2D", "Boxes2D")
+  pixel_entities = {
+    chunk.entity_path
+    for path in estimated_run
+    for chunk in _chunks(path)
+    if any(n.split(":")[0] in flat for n in chunk.to_record_batch().schema.names)
+  }
+  assert pixel_entities, "no 2D entity was written, so nothing is being checked"
+  dropped = {
+    pattern.removeprefix("- ").removesuffix("/**")
+    for pattern in _without_pixels(["cam00", "cam01"])
+  }
+  stray = sorted(
+    entity
+    for entity in pixel_entities
+    if not any(entity == d or entity.startswith(f"{d}/") for d in dropped)
+  )
+  assert not stray, f"2D entities the 3D view still pulls in: {stray}"

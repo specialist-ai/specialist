@@ -30,7 +30,6 @@ def test_probe_capture_returns_sibling_and_container_fps(tmp_path: Path) -> None
   capture = probe_capture(front)
   assert capture.rear_path == rear
   assert capture.fps == pytest.approx(30.0)
-  assert capture.width == 64
 
 
 def test_probe_capture_square_without_sibling_raises(tmp_path: Path) -> None:

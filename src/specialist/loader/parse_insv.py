@@ -1,16 +1,8 @@
 """Parse an Insta360 ``.insv`` file via ``telemetry-parser``.
 
-Wraps ``telemetry_parser.Parser`` in a typed view of the bits we actually
-use: IMU arrays with a single shared timestamp axis, the factory MEI
-intrinsics, the rolling-shutter readout time, and the raw ``offset_v3``
-array that encodes per-lens extrinsics.
-
-``telemetry-parser`` exposes only one ``fisheye_params`` block per file, even
-though the camera has two physical lenses. The dual-lens extrinsics and per-lens
-intrinsics live in the raw ``offset_v3`` array (40 floats packed as
-``[lens_count, front_block(19), rear_block(19), trailer]``) — callers that
-need per-lens calibration decode it via ``specialist.vi_ba.extrinsics``;
-``LensIntrinsics`` returns the single legacy MEI block as-is.
+Per-lens intrinsics and poses live in the raw ``offset_v3`` array, 40 floats
+packed as ``[lens_count, front_block(19), rear_block(19), trailer]``;
+``specialist.vi_ba.extrinsics`` decodes it.
 """
 
 from __future__ import annotations
@@ -23,28 +15,7 @@ import numpy as np
 import numpy.typing as npt
 import telemetry_parser
 
-__all__ = ["InsvData", "LensIntrinsics", "load_insv"]
-
-
-@dataclass(frozen=True)
-class LensIntrinsics:
-  """Factory MEI intrinsics for one fisheye, decoded from ``Lens.Data``.
-
-  ``camera_matrix`` is the 3x3 pinhole projection. ``distortion_coeffs`` holds
-  ``[k1, k2, k3, p1, p2, xi]`` — the Mei unified-omnidirectional model with a
-  Brown-Conrady distortion polynomial, where ``xi`` is the unit-sphere mirror
-  parameter.
-  """
-
-  camera_matrix: npt.NDArray[np.float64]
-  distortion_coeffs: npt.NDArray[np.float64]
-  calib_width: int
-  calib_height: int
-  distortion_model: str
-
-  @property
-  def xi(self) -> float:
-    return float(self.distortion_coeffs[5])
+__all__ = ["InsvData", "load_insv"]
 
 
 @dataclass(frozen=True)
@@ -64,7 +35,6 @@ class InsvData:
   imu_timestamps: npt.NDArray[np.float64]
   gyro_deg: npt.NDArray[np.float64]
   accel: npt.NDArray[np.float64]
-  intrinsics: LensIntrinsics
   rolling_shutter_readout: float
   offset_v3: npt.NDArray[np.float64]
   gyro_calib_numbers: npt.NDArray[np.float64]
@@ -156,15 +126,6 @@ def load_insv(path: str | Path) -> InsvData:
   accel = np.array([s["accl"] for s in imu_samples], dtype=np.float64)
 
   lens = meta["Lens"]["Data"]
-  fisheye = lens["fisheye_params"]
-  intrinsics = LensIntrinsics(
-    camera_matrix=np.asarray(fisheye["camera_matrix"], dtype=np.float64),
-    distortion_coeffs=np.asarray(fisheye["distortion_coeffs"], dtype=np.float64),
-    calib_width=int(lens["calib_dimension"]["w"]),
-    calib_height=int(lens["calib_dimension"]["h"]),
-    distortion_model=str(lens["distortion_model"]),
-  )
-
   default_meta = meta["Default"]["Metadata"]
   exposure = meta.get("Exposure", {}).get("Data", [])
   expo_t = np.array([e["t"] for e in exposure], dtype=np.float64)
@@ -194,7 +155,6 @@ def load_insv(path: str | Path) -> InsvData:
     imu_timestamps=ts,
     gyro_deg=gyro,
     accel=accel,
-    intrinsics=intrinsics,
     rolling_shutter_readout=float(lens["frame_readout_time"]) * 1e-3,
     offset_v3=np.asarray(default_meta["offset_v3"], dtype=np.float64),
     gyro_calib_numbers=np.asarray(

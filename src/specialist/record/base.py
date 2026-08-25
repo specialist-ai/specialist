@@ -25,7 +25,7 @@ Float64Array = npt.NDArray[np.float64]
 
 
 def imu_chunks(
-  tracker: str,
+  slot: str,
   insv: InsvData,
   time_shift: float,
   window: tuple[float, float],
@@ -38,12 +38,12 @@ def imu_chunks(
   gyro = np.radians(insv.gyro_deg[keep])
   return [
     Chunk.from_columns(
-      schema.imu_entity(tracker, "gyro"),
+      schema.imu_signal(slot, "gyro"),
       indexes=[times],
       columns=rr.Scalars.columns(scalars=gyro),
     ),
     Chunk.from_columns(
-      schema.imu_entity(tracker, "accel"),
+      schema.imu_signal(slot, "accel"),
       indexes=[times],
       columns=rr.Scalars.columns(scalars=insv.accel[keep]),
     ),
@@ -84,7 +84,7 @@ IMU_TO_BODY: Float64Array = np.array(
 
 
 def exposure_chunks(
-  tracker: str,
+  slot: str,
   insv: InsvData,
   time_shift: float,
   window: tuple[float, float],
@@ -97,7 +97,7 @@ def exposure_chunks(
     keep = (shifted >= window[0]) & (shifted <= window[1])
     chunks.append(
       Chunk.from_columns(
-        schema.exposure_entity(tracker),
+        schema.exposure(slot),
         indexes=[rr.TimeColumn(schema.TIMELINE, duration=shifted[keep])],
         columns=rr.Scalars.columns(scalars=insv.exposure_durations[keep]),
       )
@@ -107,7 +107,7 @@ def exposure_chunks(
     keep = (shifted >= window[0]) & (shifted <= window[1])
     chunks.append(
       Chunk.from_columns(
-        schema.ae_entity(tracker),
+        schema.autoexposure(slot),
         indexes=[rr.TimeColumn(schema.TIMELINE, duration=shifted[keep])],
         columns=cast("Any", rr.AnyValues).columns(
           **{name: values[keep] for name, values in insv.ae_stats.items()}
@@ -117,27 +117,25 @@ def exposure_chunks(
   return chunks
 
 
-def calibration_chunks(
-  tracker: str, insv: InsvData, imu_to_body: Float64Array = IMU_TO_BODY
-) -> list[Chunk]:
-  """Static per-lens MEI intrinsics (raw stitched-sensor units), body -> lens
-  extrinsics, the IMU mounting with its factory bias calibration, the factory
-  pinhole model, and everything else the capture recorded about itself."""
+def calibration_chunks(slot: str, insv: InsvData) -> list[Chunk]:
+  """Static per-lens MEI intrinsics in raw stitched-sensor units, carrying the
+  frame size they are expressed in, the body -> lens extrinsics, and the IMU
+  mounting with its factory bias calibration."""
   extrinsics = parse_insv_extrinsics(insv)
-  rotation = gtsam.Rot3(np.asarray(imu_to_body, dtype=np.float64))
+  rotation = gtsam.Rot3(IMU_TO_BODY)
   chunks = [
     _lens_calibration(
-      schema.calibration_entity(tracker, "front"),
+      schema.lens(slot, "front"),
       extrinsics.front,
       extrinsics.body_T_front_lens,
     ),
     _lens_calibration(
-      schema.calibration_entity(tracker, "rear"),
+      schema.lens(slot, "rear"),
       extrinsics.rear,
       extrinsics.body_T_rear_lens,
     ),
     Chunk.from_columns(
-      schema.calibration_entity(tracker, "imu"),
+      schema.imu(slot),
       indexes=[],
       columns=[
         *rr.Transform3D.columns(
@@ -150,29 +148,39 @@ def calibration_chunks(
         ),
       ],
     ),
-    Chunk.from_columns(
-      schema.calibration_entity(tracker, "factory_pinhole"),
-      indexes=[],
-      columns=rr.AnyValues.columns(
-        camera_matrix=[insv.intrinsics.camera_matrix.ravel()],
-        distortion_coeffs=[insv.intrinsics.distortion_coeffs],
-        calib_width=[float(insv.intrinsics.calib_width)],
-        calib_height=[float(insv.intrinsics.calib_height)],
-        distortion_model=[insv.intrinsics.distortion_model],
-      ),
-    ),
   ]
-  if insv.capture:
-    chunks.append(
-      Chunk.from_columns(
-        schema.calibration_entity(tracker, "capture"),
-        indexes=[],
-        columns=cast("Any", rr.AnyValues).columns(
-          **{name: [value] for name, value in insv.capture.items()}
-        ),
-      )
-    )
   return chunks
+
+
+# The IMU calibration already carries this, in seconds.
+_SUPERSEDED_CAPTURE = frozenset({"rolling_shutter_time"})
+
+
+def capture_chunk(
+  slot: str,
+  insv: InsvData,
+  source: str,
+  clock_shift: float,
+  clock_confidence: float,
+  clock_method: str,
+) -> Chunk:
+  """The camera's own account of itself, plus the shift that put its clock on
+  the session's: ``t_session = t_capture + clock_shift``."""
+  return Chunk.from_columns(
+    schema.camera(slot),
+    indexes=[],
+    columns=cast("Any", rr.AnyValues).columns(
+      source=[source],
+      clock_shift=[clock_shift],
+      clock_confidence=[clock_confidence],
+      clock_method=[clock_method],
+      **{
+        name: [value]
+        for name, value in insv.capture.items()
+        if name not in _SUPERSEDED_CAPTURE
+      },
+    ),
+  )
 
 
 def write_base_recording(

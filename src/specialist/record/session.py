@@ -1,12 +1,9 @@
 """Read a session's base recording back for the solve.
 
-``SessionRecording`` exposes the recording's stored facts — tracker names,
-per-lens encoded video and PTS, IMU samples, calibration, and the session
-properties — through the same pyarrow chunk stream the other record readers
-use. Whatever the recording does not store (frame rate, decoded size, the
-keyframe grid) is derived from the stored rows: fps from the PTS, the decoded
-size from a one-frame decode, and the rear lens's rows from nearest-PTS
-matching against the front lens's grid.
+``SessionRecording`` exposes the stored facts: camera slots, per-lens encoded
+video and PTS, IMU samples, calibration. What the recording does not store is
+derived from those rows — fps from the PTS, the decoded size from a one-frame
+decode, the rear lens's rows by nearest PTS against the front lens's grid.
 """
 
 from __future__ import annotations
@@ -124,17 +121,19 @@ class SessionRecording:
     return RrdReader(str(self.path)).store().stream()
 
   @property
-  def tracker_names(self) -> list[str]:
-    """Sorted tracker names carrying video under ``/image/``."""
-    root = f"/{schema.IMAGE_ROOT}/"
-    names = {
-      path.split("/")[2]
-      for path in RrdReader(str(self.path)).store().schema().entity_paths()
-      if path.startswith(root)
+  def slots(self) -> list[str]:
+    """The camera slots this recording holds video for."""
+    paths = {
+      p.strip("/") for p in RrdReader(str(self.path)).store().schema().entity_paths()
     }
-    if not names:
-      raise ValueError(f"{self.path} holds no {root}<tracker> video")
-    return sorted(names)
+    slots = [
+      slot
+      for slot in schema.slots_in(paths)
+      if any(schema.video(slot, side) in paths for side in schema.SIDES)
+    ]
+    if not slots:
+      raise ValueError(f"{self.path} holds no /{schema.CAMERA_ROOT}/<slot> video")
+    return slots
 
   def _entity_row(self, entity: str) -> dict[str, Any]:
     """Component name -> newest value across the entity's chunks."""
@@ -144,47 +143,39 @@ class SessionRecording:
       self._rows[entity] = cached
     return cached
 
-  @property
-  def sources(self) -> list[str]:
-    """The raw capture filenames the base recording was converted from."""
-    row = self._entity_row("__properties/session")
-    return [str(source) for source in row.get("sources", [])]
-
-  def lens_times(self, tracker: str, side: str) -> Float64Array:
+  def lens_times(self, slot: str, side: str) -> Float64Array:
     """One lens's frame PTS (s), one row per encoded sample."""
-    return frames.lens_times(self.path, schema.image_entity(tracker, side))
+    return frames.lens_times(self.path, schema.video(slot, side))
 
   @property
   def frame_times(self) -> dict[str, Float64Array]:
-    """Per-tracker front-lens frame times (s): the grid a solve's keyframe
+    """Per-camera front-lens frame times (s): the grid a solve's keyframe
     timestamps must land on."""
-    return {name: self.lens_times(name, "front") for name in self.tracker_names}
+    return {slot: self.lens_times(slot, "front") for slot in self.slots}
 
-  def lens_video(self, tracker: str, side: str) -> frames.LensVideo:
+  def lens_video(self, slot: str, side: str) -> frames.LensVideo:
     """One lens's encoded samples, ready for banded decoding."""
-    return frames.LensVideo(self.path, tracker, side)
+    return frames.LensVideo(self.path, slot, side)
 
-  def decoded_shape(self, tracker: str) -> tuple[int, int]:
+  def decoded_shape(self, slot: str) -> tuple[int, int]:
     """``(height, width)`` of the decoded front-lens frames, from a one-frame
     decode."""
     frame = frames.RecordingKeyframes(
-      self.lens_video(tracker, "front"), np.zeros(1, dtype=np.int64), band=1
+      self.lens_video(slot, "front"), np.zeros(1, dtype=np.int64), band=1
     )[0]
     return int(frame.shape[0]), int(frame.shape[1])
 
-  def lens_setups(
-    self, tracker: str, decoded_width: int
-  ) -> tuple[LensSetup, LensSetup]:
+  def lens_setups(self, slot: str, decoded_width: int) -> tuple[LensSetup, LensSetup]:
     """Per-lens MEI setups at the decode resolution: the stored intrinsics are
     authored in the camera's raw stitched frame and rescale by the ratio of the
     decoded stitched width (two square lenses) to the raw one."""
     return (
-      self._lens_setup(tracker, "front", decoded_width),
-      self._lens_setup(tracker, "rear", decoded_width),
+      self._lens_setup(slot, "front", decoded_width),
+      self._lens_setup(slot, "rear", decoded_width),
     )
 
-  def _lens_setup(self, tracker: str, side: str, decoded_width: int) -> LensSetup:
-    row = self._entity_row(schema.calibration_entity(tracker, side))
+  def _lens_setup(self, slot: str, side: str, decoded_width: int) -> LensSetup:
+    row = self._entity_row(schema.lens(slot, side))
 
     def scalar(name: str) -> float:
       return float(np.asarray(row[name], dtype=np.float64).reshape(-1)[0])
@@ -229,28 +220,28 @@ class SessionRecording:
     order = np.argsort(t, kind="stable")
     return t[order], np.concatenate(rows)[order]
 
-  def imu(self, tracker: str) -> ImuSamples:
+  def imu(self, slot: str) -> ImuSamples:
     """Raw-axis IMU samples as stored: t (s), gyro (rad/s), accel (m/s^2)."""
-    t_gyro, gyro = self._scalar_rows(schema.imu_entity(tracker, "gyro"))
-    t_accel, accel = self._scalar_rows(schema.imu_entity(tracker, "accel"))
+    t_gyro, gyro = self._scalar_rows(schema.imu_signal(slot, "gyro"))
+    t_accel, accel = self._scalar_rows(schema.imu_signal(slot, "accel"))
     if not np.array_equal(t_gyro, t_accel):
-      raise ValueError(f"{self.path}: gyro and accel rows disagree for {tracker}")
+      raise ValueError(f"{self.path}: gyro and accel rows disagree for {slot}")
     return ImuSamples(t=t_gyro, gyro=gyro, accel=accel)
 
-  def imu_to_body(self, tracker: str) -> Float64Array:
+  def imu_to_body(self, slot: str) -> Float64Array:
     """The IMU mounting rotation, raw IMU axes -> body."""
-    row = self._entity_row(schema.calibration_entity(tracker, "imu"))
+    row = self._entity_row(schema.imu(slot))
     matrix: Float64Array = _rot3(row).matrix()
     return matrix
 
-  def factory_bias(self, tracker: str) -> gtsam.imuBias.ConstantBias:
+  def factory_bias(self, slot: str) -> gtsam.imuBias.ConstantBias:
     """The factory IMU bias in raw IMU axes (accel m/s^2, gyro rad/s)."""
-    row = self._entity_row(schema.calibration_entity(tracker, "imu"))
+    row = self._entity_row(schema.imu(slot))
     accel = np.asarray(row["accel_bias"], dtype=np.float64).reshape(3)
     gyro = np.asarray(row["gyro_bias"], dtype=np.float64).reshape(3)
     return gtsam.imuBias.ConstantBias(accel, gyro)
 
-  def rolling_shutter_readout(self, tracker: str) -> float:
+  def rolling_shutter_readout(self, slot: str) -> float:
     """The rolling-shutter readout time (s) stored with the IMU calibration."""
-    row = self._entity_row(schema.calibration_entity(tracker, "imu"))
+    row = self._entity_row(schema.imu(slot))
     return float(np.asarray(row["rolling_shutter_readout"]).reshape(-1)[0])

@@ -11,9 +11,11 @@ import numpy as np
 import pytest
 from rerun.experimental import RrdReader
 
+from specialist.record import schema
 from specialist.record.base import (
   IMU_TO_BODY,
   calibration_chunks,
+  capture_chunk,
   exposure_chunks,
   imu_chunks,
   write_base_recording,
@@ -51,35 +53,29 @@ def base_rrd(tmp_path_factory: pytest.TempPathFactory) -> Path:
     clip = encode_clip(tmp / f"{lens}.mp4", n_frames, rate=_FPS, gop=5)
     clean = normalize_h264(clip, tmp / f"{lens}_clean.mp4")
     streams.append(
-      video_chunks(clean, f"image/tracker_0/{lens}", time_shift=shift, window=_WINDOW)
+      video_chunks(clean, schema.video("cam00", lens), time_shift=shift, window=_WINDOW)
     )
-  sidecars = (
-    imu_chunks("tracker_0", insv, time_shift=0.0, window=_WINDOW)
-    + exposure_chunks("tracker_0", insv, time_shift=0.0, window=_WINDOW)
-    + calibration_chunks("tracker_0", insv)
-  )
+  sidecars = [
+    *imu_chunks("cam00", insv, time_shift=0.0, window=_WINDOW),
+    *exposure_chunks("cam00", insv, time_shift=0.0, window=_WINDOW),
+    *calibration_chunks("cam00", insv),
+    capture_chunk("cam00", insv, "a_00_.insv", -0.25, 4.5, "audio"),
+  ]
   out = tmp / "base.rrd"
-  write_base_recording(
-    out,
-    "sess",
-    streams,
-    sidecars,
-    {"session": {"sources": ["a_00_.insv"]}},
-  )
+  write_base_recording(out, "sess", streams, sidecars, {"base": {"task": "fold"}})
   return out
 
 
-def test_identity_names_and_properties(base_rrd: Path) -> None:
+def test_identity_slots(base_rrd: Path) -> None:
   session = SessionRecording(base_rrd)
   assert session.session_id == "sess"
-  assert session.tracker_names == ["tracker_0"]
-  assert session.sources == ["a_00_.insv"]
+  assert session.slots == ["cam00"]
 
 
 def test_fps_is_pts_derived(base_rrd: Path) -> None:
   session = SessionRecording(base_rrd)
-  front = session.lens_times("tracker_0", "front")
-  rear = session.lens_times("tracker_0", "rear")
+  front = session.lens_times("cam00", "front")
+  rear = session.lens_times("cam00", "rear")
   assert fps_from_times(front) == pytest.approx(_FPS, rel=1e-6)
   assert len(front) == _FRONT_FRAMES
   assert len(rear) == _REAR_FRAMES
@@ -98,8 +94,8 @@ def test_grid_alignment_matches_rear_rows_by_pts(base_rrd: Path) -> None:
   """The keyframe grid is the front lens's PTS; the rear lens's rows come from
   nearest-PTS matching, absorbing the one-frame edge trim difference."""
   session = SessionRecording(base_rrd)
-  front = session.lens_video("tracker_0", "front")
-  rear = session.lens_video("tracker_0", "rear")
+  front = session.lens_video("cam00", "front")
+  rear = session.lens_video("cam00", "rear")
   grid = front.times[::2]
   rows = nearest_rows(rear.times, grid)
   np.testing.assert_array_equal(rows, np.arange(1, _FRONT_FRAMES + 1, 2))
@@ -135,7 +131,7 @@ def test_covered_rows_spans_then_clips_to_the_common_overlap() -> None:
 
 def test_recording_keyframes_rows_select_exact_frames(base_rrd: Path) -> None:
   session = SessionRecording(base_rrd)
-  video = session.lens_video("tracker_0", "front")
+  video = session.lens_video("cam00", "front")
   reference = RecordingKeyframes(video, np.arange(_FRONT_FRAMES), band=64)
   chosen = np.array([0, 3, 5, 11, 17])
   banded = RecordingKeyframes(video, chosen, band=2)
@@ -150,7 +146,7 @@ def test_seam_reach_back_does_not_redecode(base_rrd: Path) -> None:
   """An ascending pair walk across band seams costs one monotone decode
   sweep."""
   session = SessionRecording(base_rrd)
-  video = session.lens_video("tracker_0", "front")
+  video = session.lens_video("cam00", "front")
   reference = RecordingKeyframes(video, np.arange(_FRONT_FRAMES), band=64)
   banded = RecordingKeyframes(video, np.arange(_FRONT_FRAMES), band=4)
   decodes: list[int] = []
@@ -170,8 +166,8 @@ def test_seam_reach_back_does_not_redecode(base_rrd: Path) -> None:
 
 def test_decoded_shape_and_lens_setups(base_rrd: Path) -> None:
   session = SessionRecording(base_rrd)
-  assert session.decoded_shape("tracker_0") == (64, 64)
-  front, rear = session.lens_setups("tracker_0", 64)
+  assert session.decoded_shape("cam00") == (64, 64)
+  front, rear = session.lens_setups("cam00", 64)
   expected = parse_offset_v3(synthetic_insv().offset_v3)
   scale = 2 * 64 / expected.front.frame_width
   assert front.params.fx == pytest.approx(expected.front.fx * scale)
@@ -192,7 +188,7 @@ def test_decoded_shape_and_lens_setups(base_rrd: Path) -> None:
 def test_imu_comes_back_in_si_without_reconversion(base_rrd: Path) -> None:
   """The base stores gyro already in rad/s; the reader must not deg2rad again."""
   session = SessionRecording(base_rrd)
-  imu = session.imu("tracker_0")
+  imu = session.imu("cam00")
   assert imu.t[0] == pytest.approx(-0.5, abs=1e-9)
   np.testing.assert_allclose(imu.gyro[0], [np.pi / 2, 0.0, 0.0], atol=1e-12)
   np.testing.assert_allclose(imu.accel[0], [0.0, 0.0, 9.81], atol=1e-12)
@@ -204,21 +200,26 @@ def test_imu_calibration_roundtrips(base_rrd: Path) -> None:
   insv = synthetic_insv()
   numbers = insv.gyro_calib_numbers
   expected = gtsam.imuBias.ConstantBias(numbers[3:6], numbers[0:3])
-  bias = session.factory_bias("tracker_0")
+  bias = session.factory_bias("cam00")
   np.testing.assert_allclose(
     np.asarray(bias.accelerometer()), np.asarray(expected.accelerometer()), atol=1e-12
   )
   np.testing.assert_allclose(
     np.asarray(bias.gyroscope()), np.asarray(expected.gyroscope()), atol=1e-12
   )
-  np.testing.assert_allclose(session.imu_to_body("tracker_0"), IMU_TO_BODY, atol=1e-12)
-  assert session.rolling_shutter_readout("tracker_0") == pytest.approx(0.0157)
+  np.testing.assert_allclose(session.imu_to_body("cam00"), IMU_TO_BODY, atol=1e-12)
+  assert session.rolling_shutter_readout("cam00") == pytest.approx(0.0157)
+
+
+def _value(rrd: Path, entity: str, component: str) -> float:
+  """One static scalar off an entity."""
+  row = SessionRecording(rrd)._entity_row(entity.lstrip("/"))
+  return float(np.asarray(row[component]).reshape(-1)[0])
 
 
 def test_capture_telemetry_reaches_the_base(base_rrd: Path) -> None:
-  """Identity, the factory pinhole, per-frame exposure, and the AE reports
-  all ride the base recording; everything else about a capture is derivable
-  or was dropped by the parse policy."""
+  """Identity, the clock shift that put this capture on the session clock,
+  per-frame exposure and the AE reports all ride the base recording."""
   rows: dict[str, int] = {}
   columns: dict[str, set[str]] = {}
   for chunk in RrdReader(str(base_rrd)).store().stream().to_chunks():
@@ -228,10 +229,15 @@ def test_capture_telemetry_reaches_the_base(base_rrd: Path) -> None:
     columns.setdefault(e, set()).update(
       n.split(":")[-1] for n in batch_names if n not in chunk.timeline_names
     )
-  cap = "/calibration/tracker_0/capture"
+  cap = f"/{schema.camera('cam00')}"
   assert {"serial_number", "camera_type", "fw_version", "photo_rot"} <= columns[cap]
-  pin = "/calibration/tracker_0/factory_pinhole"
-  assert {"camera_matrix", "distortion_coeffs", "distortion_model"} <= columns[pin]
-  assert rows["/image/tracker_0/exposure"] == 3
-  assert rows["/image/tracker_0/ae"] == 2
-  assert "iso_value" in columns["/image/tracker_0/ae"]
+  assert {"source", "clock_shift", "clock_confidence", "clock_method"} <= columns[cap]
+  # The shift is the one the streams were written with.
+  assert _value(base_rrd, cap, "clock_shift") == pytest.approx(-0.25)
+  row = SessionRecording(base_rrd)._entity_row(cap.lstrip("/"))
+  assert str(np.asarray(row["source"]).reshape(-1)[0]) == "a_00_.insv"
+  # The rolling shutter is the IMU calibration's, in seconds, and only there.
+  assert "rolling_shutter_time" not in columns[cap]
+  assert rows[f"/{schema.exposure('cam00')}"] == 3
+  assert rows[f"/{schema.autoexposure('cam00')}"] == 2
+  assert "iso_value" in columns[f"/{schema.autoexposure('cam00')}"]

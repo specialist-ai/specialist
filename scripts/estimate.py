@@ -19,7 +19,6 @@ via ``TrackerKeys``, builds one VI subgraph per tracker, then adds:
 
 from __future__ import annotations
 
-import dataclasses
 import sys
 import time
 from collections import Counter
@@ -31,7 +30,7 @@ import gtsam
 import numpy as np
 import tyro
 
-from specialist.record.layer import write_solution_layers
+from specialist.record.layer import write_estimate_layers
 from specialist.record.session import SessionRecording
 from specialist.vi_ba.compose import (
   TrackerKeys,
@@ -40,6 +39,7 @@ from specialist.vi_ba.compose import (
 )
 from specialist.vi_ba.configs import Args, TrackerArgs, validate
 from specialist.vi_ba.features import set_precompute_concurrency
+from specialist.vi_ba.geometry import translation
 from specialist.vi_ba.gpu_lm import assert_backend
 from specialist.vi_ba.reference_solve import (
   adopt_ba_refined_estimates,
@@ -54,12 +54,11 @@ from specialist.vi_ba.single_tracker import (
 from specialist.vi_ba.summary import Summary
 from specialist.vi_ba.tag_discovery import validate_discovered
 from specialist.vi_ba.urdf_joints import read_revolute_joints
-from specialist.vi_ba.viz_build import build_run_outputs
+from specialist.vi_ba.viz_build import build_run_estimate
 
 
 def _resolve_urdf_path(explicit: Path | None) -> Path:
-  """The gripper URDF: an explicit path, else the cached/downloaded asset. Tag
-  discovery reads it, so a run cannot proceed without one."""
+  """The gripper URDF: an explicit path, else the cached/downloaded asset."""
   if explicit is not None:
     return explicit
   try:
@@ -94,12 +93,10 @@ def _print_capture_diagnostics(
   trackers: list[PreparedTracker],
   optimized_body_poses: dict[str, list[gtsam.Pose3]],
 ) -> None:
-  """Print the max kf-to-kf speed (a sanity check that any large jump is real
-  IMU-agreeing motion)."""
   print("\n=== max kf-to-kf speed (real motion if IMU agrees) ===")
   for t in trackers:
     poses = optimized_body_poses[t.name]
-    pts = np.array([np.asarray(p.translation(), dtype=np.float64) for p in poses])
+    pts = np.array([translation(p) for p in poses])
     if pts.shape[0] < 2:
       continue
     kf_t = np.asarray(t.keyframe_times, dtype=np.float64)
@@ -109,39 +106,14 @@ def _print_capture_diagnostics(
     print(f"  [{t.name}] max={speed[i]:.2f} m/s at kf {i}→{i + 1} (t={kf_t[i]:.2f}s)")
 
 
-def _non_default_flags(args: object, prefix: str = "") -> list[str]:
-  """Every defaulted field whose value differs from its declaration, dotted
-  through the nested configs. Required fields carry no default and are the
-  run's identity rather than its tuning, so they are not listed."""
-  out: list[str] = []
-  for spec in dataclasses.fields(args):  # type: ignore[arg-type]
-    value = getattr(args, spec.name)
-    if dataclasses.is_dataclass(value) and not isinstance(value, type):
-      out += _non_default_flags(value, f"{prefix}{spec.name}.")
-      continue
-    if spec.default is not dataclasses.MISSING:
-      default = spec.default
-    elif spec.default_factory is not dataclasses.MISSING:
-      default = spec.default_factory()
-    else:
-      continue
-    if value != default:
-      out.append(f"{prefix}{spec.name}={value}")
-  return out
-
-
 def main(args: Args) -> None:
-  # Runs are usually redirected to a file; line buffering keeps every line
-  # visible as it happens instead of in one burst at exit.
   sys.stdout.reconfigure(line_buffering=True)  # type: ignore[union-attr]
   session = SessionRecording(args.base)
-  names = tuple(session.tracker_names)
+  names = tuple(session.slots)
   validate(args)
   if args.solver.gpu == "require":
-    # A missing CUDA stack is a hard error under this mode, so find out before
-    # paying for the preparation rather than at the first solve.
     assert_backend()
-  rrd_path = args.output_dir / "track" / f"{session.session_id}.rrd"
+  rrd_path = args.output_dir / "estimate" / f"{session.session_id}.rrd"
   viz_path = args.output_dir / "viz" / f"{session.session_id}.rrd"
   existing = [p for p in (rrd_path, viz_path) if p.exists()]
   if existing and not args.overwrite:
@@ -155,14 +127,8 @@ def main(args: Args) -> None:
   mark = _stage_timer()
   print(f"session {session.session_id}: trackers {list(names)}")
 
-  # The gripper URDF drives tag discovery, the finger joint-angle factors, and
-  # the viz overlay, so resolve it once up front.
   urdf_path = _resolve_urdf_path(args.urdf_path)
 
-  # The flow precompute needs the capture count to shrink its per-lens worker
-  # pool, so it does not oversubscribe the shared cv2 thread pool. It also
-  # decides whether the tag walks ever overlap, which is what per-thread
-  # detectors cost their ~160 MB each for.
   concurrent = captures_that_fit(session, names)
   set_precompute_concurrency(concurrent)
 
@@ -189,11 +155,8 @@ def main(args: Args) -> None:
   def _prep_one(name: str) -> PreparedTracker:
     print(f"\n=== prep tracker {name!r} ===")
     try:
-      tracker = prepare_tracker(name, specs[name], tags[name])
+      tracker = prepare_tracker(specs[name], tags[name])
     except Exception as exc:
-      # A sibling capture already decoding cannot be interrupted, so the
-      # traceback only lands once it finishes; name the failure when it happens
-      # rather than leave the wait looking like a hang.
       if concurrent > 1:
         print(f"\n=== prep tracker {name!r} FAILED: {exc!r} ===")
       raise
@@ -214,9 +177,7 @@ def main(args: Args) -> None:
       with ThreadPoolExecutor(max_workers=concurrent) as prep_pool:
         trackers = list(prep_pool.map(_prep_one, names))
   finally:
-    # Flow is finished; release the per-stream GPU workers so the linear solver
-    # has device memory for the joint bundle adjustment. A no-op on the cv2 path
-    # (no stream ever primed).
+    # Release the per-stream GPU workers so the linear solver has device memory.
     gpu_flow.shutdown()
   mark("trackers prepared")
 
@@ -234,26 +195,11 @@ def main(args: Args) -> None:
 
   adopt_ba_refined_estimates(trackers, solve.result, keys)
 
-  outputs = build_run_outputs(
-    trackers,
-    solve.body_poses,
-    solve.result,
-    keys,
-    solve.landmark_keep,
-    args,
-    cross_obs,
-    solve.world_T_ref_anchor,
-    solve.ref_tag_id,
-    solve.secondary_anchor_world,
-    urdf_path=urdf_path,
-  )
+  estimate = build_run_estimate(trackers, solve, keys, args, cross_obs, joints)
 
   worst_move_translation, worst_move_rotation = solve.worst_secondary_move
   summary = Summary(
-    non_default_flags=tuple(_non_default_flags(args)),
-    sources=tuple(session.sources),
-    tracker_names=names,
-    cross_tracker_obs=len(cross_obs),
+    cross_camera_obs=len(cross_obs),
     initial_graph_error=solve.result.initial_error,
     final_graph_error=solve.result.final_error,
     solver_iterations=solve.result.iterations,
@@ -265,17 +211,14 @@ def main(args: Args) -> None:
   timeline_start = min(
     float(session.lens_times(n, lens)[0]) for n in names for lens in ("front", "rear")
   )
-  # The frame period bounds each image overlay to the one video frame it was
-  # computed from.
   frame_period = float(np.median(np.diff(session.lens_times(names[0], "front"))))
-  write_solution_layers(
-    track_path=rrd_path,
+  write_estimate_layers(
+    estimate_path=rrd_path,
     viz_path=viz_path,
     timeline_start=timeline_start,
     frame_period=frame_period,
-    outputs=outputs,
+    estimate=estimate,
     summary=summary,
-    reference_tag_id=solve.ref_tag_id,
     anchor_tag_size=args.anchor.tag_size,
     mask_pad_px=args.frontend.mask_tag_pad if args.frontend.mask_tags else -1,
     urdf_path=urdf_path,

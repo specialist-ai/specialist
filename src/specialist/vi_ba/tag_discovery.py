@@ -204,8 +204,9 @@ def discover_gripper_tags(
   found = [
     GripperTags(b.tag_id, (lf, rf))
     for b in candidates
-    for lf in riders[b.tag_id, left] or [0]
-    for rf in riders[b.tag_id, right] or [0]
+    # A finger with no rider contributes 0.
+    for lf in riders.get((b.tag_id, left), []) or [0]
+    for rf in riders.get((b.tag_id, right), []) or [0]
     if lf != rf
   ]
   # A gripper showing one finger tag still assigns, but a full pair outranks it.

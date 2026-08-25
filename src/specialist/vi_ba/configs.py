@@ -1,4 +1,4 @@
-"""Nested config dataclasses for ``track.py`` and ``prepare_tracker``.
+"""Nested config dataclasses for ``estimate.py`` and ``prepare_tracker``.
 
 Tyro picks up nested ``@dataclass`` fields and exposes them as dotted CLI
 flags (e.g. ``--frontend.orb-n-features 500``).
@@ -45,8 +45,8 @@ class FrontendCfg:
   feature_max_half_angle: float = float(np.deg2rad(70.0))
 
   reproj_sigma: float = 0.5
-  # Padding (px) around a masked tag's detected box. The track layer records
-  # the extent used, with -1 standing for masking turned off.
+  # Padding (px) around a masked tag's detected box; the tag overlay draws the
+  # padded boxes, none when masking is off.
   mask_tag_pad: int = 45
   # Exclude non-anchor tags (the grippers' own plates) from feature detection.
   # The essential-matrix RANSAC and the parallax filter also reject features

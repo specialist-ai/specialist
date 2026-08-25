@@ -37,8 +37,8 @@ _SCAN_LOCK = threading.Lock()
 def _scan_video(base_rrd: Path) -> dict[str, tuple[pa.Table, list[int]]]:
   """Every lens entity's ``(video_time, sample)`` table plus its keyframe
   timestamps (ns), collected in one pass over the recording. Cached per file:
-  a scan touches every chunk of a multi-gigabyte rrd, and the lens streams,
-  the sizing pass, and both trackers would otherwise each pay it. The sparse
+  a scan touches every chunk of a multi-gigabyte rrd, and the lens streams and
+  the sizing pass would otherwise each pay it once per camera. The sparse
   ``is_keyframe`` markers may share the sample chunks or sit in chunks of
   their own, so the two are collected independently and joined by timestamp."""
   key = (str(base_rrd), base_rrd.stat().st_mtime)
@@ -53,7 +53,7 @@ def _scan_video(base_rrd: Path) -> dict[str, tuple[pa.Table, list[int]]]:
       .store()
       .stream()
       .filter(
-        content="/image/**",
+        content=f"/{schema.CAMERA_ROOT}/**",
         components=["VideoStream:sample", "VideoStream:is_keyframe"],
       )
     )
@@ -114,8 +114,8 @@ def lens_times(base_rrd: Path, entity: str) -> Float64Array:
 class LensVideo:
   """One lens's encoded samples and the timeline they sit on."""
 
-  def __init__(self, base_rrd: Path, tracker: str, side: str) -> None:
-    self.entity = schema.image_entity(tracker, side)
+  def __init__(self, base_rrd: Path, slot: str, side: str) -> None:
+    self.entity = schema.video(slot, side)
     table, iframe_ns = _sample_table(base_rrd, self.entity)
     times_ns = schema.times_ns(table.column(schema.TIMELINE))
     self.times: Float64Array = times_ns / schema.NS_PER_SECOND

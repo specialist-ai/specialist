@@ -16,13 +16,11 @@ __all__ = ["CaptureInfo", "probe_capture"]
 
 @dataclass(frozen=True)
 class CaptureInfo:
-  """What one probe of a capture pair reads: the rear-lens file, the container
-  frame rate, the native per-lens width, and the seconds both lens files
+  """One probe of a capture pair. ``duration`` is the seconds both lens files
   cover."""
 
   rear_path: Path
   fps: float
-  width: int
   duration: float
 
 
@@ -61,6 +59,5 @@ def probe_capture(video_path: Path) -> CaptureInfo:
   return CaptureInfo(
     rear_path=rear_path,
     fps=fps,
-    width=width,
     duration=min(int(front_frames), int(rear_frames)) / fps,
   )
