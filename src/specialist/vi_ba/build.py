@@ -1,4 +1,4 @@
-"""The dual-lens VI-BA factor graph: keyframe poses, landmarks, MEI and IMU factors."""
+"""The VI-BA factor graph: keyframe poses, landmark points, MEI and IMU factors."""
 
 from __future__ import annotations
 
@@ -12,7 +12,6 @@ from specialist_camera import MeiParams
 from specialist_dataset import schema
 
 from specialist.vi_ba.anchor_detection import TagDetection
-from specialist.vi_ba.features import Rect
 
 try:
   from specialist.vi_ba._mei_factor_cpp import (
@@ -99,8 +98,6 @@ class LensChannel:
   tracks: dict[int, dict[int, Float64Array]] = field(default_factory=dict)
   points: dict[int, Float64Array] = field(default_factory=dict)
   rejected: dict[int, dict[int, Float64Array]] = field(default_factory=dict)
-  # Rectangles masked from this lens at every keyframe; the front lens has none.
-  static_mask_rects: list[Rect] = field(default_factory=list)
 
 
 def huber_pixel_noise(sigma: float) -> gtsam.noiseModel.Base:
@@ -304,18 +301,16 @@ def build_vi_graph(
   biases: list[gtsam.imuBias.ConstantBias],
   preintegrated: list[gtsam.PreintegratedCombinedMeasurements],
   front: LensChannel,
-  rear: LensChannel,
   sigma: float,
   velocity_prior_sigma: float,
   pose_key_fn: Callable[[int], int],
   velocity_key_fn: Callable[[int], int],
   bias_key_fn: Callable[[int], int],
   front_landmark_key_fn: Callable[[int], int],
-  rear_landmark_key_fn: Callable[[int], int],
   graph: gtsam.NonlinearFactorGraph,
   values: gtsam.Values,
 ) -> tuple[gtsam.NonlinearFactorGraph, gtsam.Values]:
-  """Dual-lens VI graph, priors on ``V(0)`` and ``B(0)``; the caller grounds poses."""
+  """MEI and IMU factors plus ``V(0)``/``B(0)`` priors; the caller grounds the poses."""
   n = len(body_poses)
   if n < 2:
     raise ValueError("build_vi_graph needs at least two keyframes")
@@ -359,9 +354,7 @@ def build_vi_graph(
       )
     )
 
-  channels = ((front, front_landmark_key_fn), (rear, rear_landmark_key_fn))
-  for channel, landmark_key_fn in channels:
-    _add_projection_factors(
-      graph, values, channel, landmark_key_fn, pixel_noise, pose_key_fn
-    )
+  _add_projection_factors(
+    graph, values, front, front_landmark_key_fn, pixel_noise, pose_key_fn
+  )
   return graph, values

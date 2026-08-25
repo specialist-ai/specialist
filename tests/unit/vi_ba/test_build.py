@@ -20,7 +20,6 @@ from tests.mei_fixtures import (
   pinhole_mei_params,
   pinned_visual_graph,
   project_point,
-  rear_landmark_key,
   single_tracker_keys,
 )
 
@@ -41,7 +40,6 @@ def _imu_only_graph(
     biases=biases,
     preintegrated=preintegrated,
     front=LensChannel(side="front", setup=front),
-    rear=LensChannel(side="rear", setup=front),
     sigma=1.0,
     velocity_prior_sigma=0.1,
     **single_tracker_keys(),  # type: ignore[arg-type]
@@ -69,41 +67,6 @@ def test_build_graph_minimum_two_poses_one_landmark() -> None:
   assert graph.size() == 4
   assert values.exists(X(0)) and values.exists(X(1))
   assert values.exists(front_landmark_key(7))
-
-
-def test_build_graph_dual_lens_uses_disjoint_landmark_keys() -> None:
-  params = pinhole_mei_params()
-  poses = [gtsam.Pose3(), gtsam.Pose3(gtsam.Rot3(), gtsam.Point3(0.3, 0.0, 0.0))]
-  extrinsic = gtsam.Pose3()
-
-  xyz_front = np.array([0.1, 0.0, 2.0])
-  xyz_rear = np.array([-0.1, 0.0, 2.0])  # behind-world landmark
-
-  front_tracks = {
-    0: {
-      0: project_point(poses[0], extrinsic, xyz_front, params),
-      1: project_point(poses[1], extrinsic, xyz_front, params),
-    }
-  }
-  rear_tracks = {
-    0: {
-      0: project_point(poses[0], extrinsic, xyz_rear, params),
-      1: project_point(poses[1], extrinsic, xyz_rear, params),
-    }
-  }
-
-  lens = LensSetup(
-    extrinsic=extrinsic, params=params, calibrated_radius=WIDE_CALIBRATED_RADIUS
-  )
-  graph, values = pinned_visual_graph(
-    poses, lens, front_tracks, {0: xyz_front}, rear_tracks, {0: xyz_rear}
-  )
-  # Front landmark key != rear landmark key.
-  assert front_landmark_key(0) != rear_landmark_key(0)
-  assert values.exists(front_landmark_key(0))
-  assert values.exists(rear_landmark_key(0))
-  # 2 tight priors + 2 front obs + 2 rear obs = 6.
-  assert graph.size() == 6
 
 
 def test_build_graph_weak_priors_on_intermediate_keyframes() -> None:

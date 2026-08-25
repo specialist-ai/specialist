@@ -38,8 +38,8 @@ Float64Array = npt.NDArray[np.float64]
 
 # One lens's surviving observations, ``{track_id: {keyframe: pixel}}``.
 LandmarkTracks = dict[int, dict[int, Float64Array]]
-# Per tracker name, the ``(front, rear)`` pair each lens map comes in.
-LandmarkKeep = dict[str, tuple[LandmarkTracks, LandmarkTracks]]
+# Per tracker name, the landmark map its front lens carries.
+LandmarkKeep = dict[str, LandmarkTracks]
 __all__ = [
   "CrossSighting",
   "LandmarkKeep",
@@ -114,22 +114,18 @@ class TrackerKeys:
   def bias_key(self, name: str, kf: int) -> int:
     return self._kf_key(_BIAS_CHAR, name, kf)
 
-  def _lm_key(self, name: str, half: int, track_id: int) -> int:
-    """Landmark key in a front or rear slot; raises ValueError on slot overflow."""
+  def front_landmark_key(self, name: str, track_id: int) -> int:
+    """Key for a landmark in the tracker's slot; raise when ``track_id`` overflows."""
     if not 0 <= track_id < _MAX_LANDMARKS_PER_TRACKER:
       raise ValueError(
         f"track id {track_id} does not fit the {_MAX_LANDMARKS_PER_TRACKER}-wide "
         f"landmark slot for {name!r}; its key would collide with another slot"
       )
-    return self._slot_key(
-      LANDMARK_CHAR, name, half, _MAX_LANDMARKS_PER_TRACKER, track_id
+    return int(
+      gtsam.symbol(
+        LANDMARK_CHAR, self.tracker_index(name) * _MAX_LANDMARKS_PER_TRACKER + track_id
+      )
     )
-
-  def front_landmark_key(self, name: str, track_id: int) -> int:
-    return self._lm_key(name, 0, track_id)
-
-  def rear_landmark_key(self, name: str, track_id: int) -> int:
-    return self._lm_key(name, 1, track_id)
 
   def theta_key(self, name: str, finger_idx: int, kf: int) -> int:
     """Key for a finger joint angle at ``kf``; ``finger_idx`` 0 is left, 1 is right."""
@@ -423,7 +419,6 @@ def _add_vi_subgraphs(
       biases=t.biases,
       preintegrated=t.preintegrated,
       front=t.front,
-      rear=t.rear,
       sigma=args.frontend.reproj_sigma,
       velocity_prior_sigma=args.solver.velocity_prior_sigma,
       graph=graph,
@@ -432,7 +427,6 @@ def _add_vi_subgraphs(
       velocity_key_fn=partial(keys.velocity_key, t.name),
       bias_key_fn=partial(keys.bias_key, t.name),
       front_landmark_key_fn=partial(keys.front_landmark_key, t.name),
-      rear_landmark_key_fn=partial(keys.rear_landmark_key, t.name),
     )
 
 

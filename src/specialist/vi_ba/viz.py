@@ -206,7 +206,6 @@ def _send_lens_tag_columns(
   tags_per_kf: list[list[tuple[int, Float64Array, Float64Array]]],
   index: list[rr.TimeColumn],
   anchor_tag_ids: set[int],
-  mask_pad_px: int,
 ) -> None:
   """Per-keyframe AprilTag quads, centres and ids; anchors yellow, other tags red."""
   yellow = np.asarray(_YELLOW, dtype=np.uint8)
@@ -217,12 +216,8 @@ def _send_lens_tag_columns(
   labels: list[str] = []
   colors: list[np.ndarray] = []
   partition: list[int] = []
-  mask_centers: list[np.ndarray] = []
-  mask_half_sizes: list[np.ndarray] = []
-  mask_partition: list[int] = []
   for tags in tags_per_kf:
     partition.append(len(tags))
-    masked_in_kf = 0
     for tid, center, corners in tags:
       closed = np.vstack([corners, corners[0:1]]).astype(np.float32)
       strips.append(closed)
@@ -231,13 +226,6 @@ def _send_lens_tag_columns(
       labels.append(str(tid))
       is_anchor = int(tid) in anchor_tag_ids
       colors.append(yellow if is_anchor else red)
-      if not is_anchor and mask_pad_px >= 0:
-        mn = corners.min(axis=0) - float(mask_pad_px)
-        mx = corners.max(axis=0) + float(mask_pad_px)
-        mask_centers.append(((mn + mx) * 0.5).astype(np.float32))
-        mask_half_sizes.append(((mx - mn) * 0.5).astype(np.float32))
-        masked_in_kf += 1
-    mask_partition.append(masked_in_kf)
   total = sum(partition)
   if total == 0:
     return
@@ -273,51 +261,6 @@ def _send_lens_tag_columns(
       "colors": color_arr,
       "radii": np.full(total, 10.0, dtype=np.float32),
     },
-  )
-  total_masked = sum(mask_partition)
-  if total_masked == 0:
-    return
-  # Mask boxes are corner quads grown by the pad: drawn, not measured.
-  _send_overlay(
-    layers,
-    f"{tags_path}/masked",
-    index,
-    rr.Boxes2D,
-    mask_partition,
-    measured={},
-    drawn={
-      "centers": np.stack(mask_centers),
-      "half_sizes": np.stack(mask_half_sizes),
-      "colors": _solid_colors(_RED, total_masked),
-      "labels": ["MASKED"] * total_masked,
-      "show_labels": [True] * total_masked,
-    },
-  )
-
-
-def _log_static_mask_rects(
-  layers: Layers, entity_path: str, rects: list[tuple[int, int, int, int]]
-) -> None:
-  """Log the rectangles the frontend is told to ignore."""
-  centers: list[np.ndarray] = []
-  half_sizes: list[np.ndarray] = []
-  for x1, y1, x2, y2 in rects:
-    centers.append(np.array([(x1 + x2) * 0.5, (y1 + y2) * 0.5], dtype=np.float32))
-    half_sizes.append(np.array([(x2 - x1) * 0.5, (y2 - y1) * 0.5], dtype=np.float32))
-  _static(
-    layers.estimate,
-    entity_path,
-    rr.Boxes2D.columns(
-      centers=np.stack(centers), half_sizes=np.stack(half_sizes)
-    ).partition([len(rects)]),
-  )
-  _static(
-    layers.viz,
-    entity_path,
-    rr.Boxes2D.columns(
-      colors=_solid_colors(_RED, len(rects)), labels=["STATIC"] * len(rects)
-    ).partition([len(rects)]),
-    rr.Boxes2D.columns(show_labels=[True]),
   )
 
 
@@ -424,7 +367,6 @@ class LensEstimate:
   )
   tag_axes: list[Float64Array] = field(default_factory=list)
   rmse_per_kf: list[float] = field(default_factory=list)
-  static_mask_rects: list[tuple[int, int, int, int]] = field(default_factory=list)
 
 
 @dataclass
@@ -847,7 +789,6 @@ def _lens_streams(
   data: CameraEstimate,
   indexes: _Indexes,
   anchor_tag_ids: set[int],
-  mask_pad_px: int,
 ) -> None:
   """Every image overlay, a kind at a time so each kind's chunks land together."""
   detection = schema.detection
@@ -871,7 +812,6 @@ def _lens_streams(
         lens.tag_detections,
         indexes.overlay,
         anchor_tag_ids,
-        mask_pad_px,
       )
   for lens_name, lens in data.lenses.items():
     if lens.rejected_keypoints:
@@ -902,13 +842,6 @@ def _lens_streams(
         overlay(data.slot, lens_name, schema.TAG_AXES_OVERLAY),
         lens.tag_axes,
         indexes.overlay,
-      )
-  for lens_name, lens in data.lenses.items():
-    if lens.static_mask_rects:
-      _log_static_mask_rects(
-        layers,
-        overlay(data.slot, lens_name, schema.STATIC_MASK_OVERLAY),
-        lens.static_mask_rects,
       )
 
 
@@ -949,7 +882,6 @@ def _send_camera(
   data: CameraEstimate,
   urdf_path: Path,
   anchor_tag_ids: set[int],
-  mask_pad_px: int,
   trajectory_color: tuple[int, int, int],
   timeline_start: float,
   frame_period: float,
@@ -971,7 +903,7 @@ def _send_camera(
     )
   _trajectory_streams(layers, data, indexes, gripper_hr, trajectory_color)
   _factor_line_streams(layers, data, indexes)
-  _lens_streams(layers, data, indexes, anchor_tag_ids, mask_pad_px)
+  _lens_streams(layers, data, indexes, anchor_tag_ids)
   _bias_streams(layers, data, indexes)
   _fit_streams(layers, data, indexes)
 
@@ -1027,7 +959,6 @@ def estimate_chunks(
   anchor_poses_world: dict[int, gtsam.Pose3],
   reference_tag_id: int,
   anchor_tag_size: float,
-  mask_pad_px: int,
   urdf_path: Path,
   timeline_start: float,
   frame_period: float,
@@ -1053,7 +984,6 @@ def estimate_chunks(
       camera,
       urdf_path=urdf_path,
       anchor_tag_ids=set(anchor_poses_world),
-      mask_pad_px=mask_pad_px,
       trajectory_color=_TRAJECTORY_PALETTE[i % len(_TRAJECTORY_PALETTE)],
       timeline_start=timeline_start,
       frame_period=frame_period,

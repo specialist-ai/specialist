@@ -23,10 +23,8 @@ from specialist.record.session import (
 from specialist.vi_ba.anchor_detection import (
   TagDetection,
   anchor_pose_from_tags,
-  apply_static_mask_rects,
   configure_detector,
   detect_all_tags,
-  non_anchor_tag_masks,
 )
 from specialist.vi_ba.build import LensChannel, LensSetup
 from specialist.vi_ba.configs import (
@@ -35,10 +33,8 @@ from specialist.vi_ba.configs import (
 )
 from specialist.vi_ba.features import (
   Frame,
-  Rect,
   available_ram,
   detect_orb,
-  mask_plane,
   parallel_map,
 )
 from specialist.vi_ba.finger_kinematics import FingerReproj, recover_gripper_tags
@@ -186,7 +182,6 @@ class _LensPrep:
   side: schema.Side
   setup: LensSetup
   tags: list[list[TagDetection]]
-  static_mask_rects: list[Rect] = field(default_factory=list)
   keypoints: list[Float64Array] = field(default_factory=list)
   kept: dict[int, dict[int, Float64Array]] = field(default_factory=dict)
   rejected: dict[int, dict[int, Float64Array]] = field(default_factory=dict)
@@ -204,7 +199,6 @@ class _LensPrep:
       tracks=self.tracks,
       points=self.points,
       rejected=self.rejected,
-      static_mask_rects=self.static_mask_rects,
     )
 
 
@@ -293,7 +287,6 @@ def _imu_and_initial_gravity(
 def _seed_body_poses(
   name: str,
   front: _LensPrep,
-  rear: _LensPrep,
   n_keyframes: int,
   anchor_obs_per_kf: dict[int, gtsam.Pose3],
   cfg: FrontendCfg,
@@ -323,30 +316,29 @@ def _seed_body_poses(
     f"  [{name}/vo] only {len(sfm_cams)}/{n_keyframes} "
     f"keyframes registered; using straight-line init"
   )
-  init_ch, (init_first, init_last, init_shared) = max(
-    (
-      (ch, pick_init_pair(ch.kept, n_keyframes, cfg.init_min_shared_tracks))
-      for ch in (front, rear)
-    ),
-    key=lambda candidate: candidate[1][2],
+  init_first, init_last, init_shared = pick_init_pair(
+    front.kept, n_keyframes, cfg.init_min_shared_tracks
   )
   if init_shared < 8:
-    raise RuntimeError(f"{name}: no lens has ≥8 shared tracks (best={init_shared})")
+    raise RuntimeError(
+      f"{name}: the front lens has no init pair with ≥8 shared tracks "
+      f"(best={init_shared})"
+    )
   if init_first:
     print(f"  [{name}/vo] init pair based at keyframe {init_first}")
   shared = [
-    obs for obs in init_ch.kept.values() if init_first in obs and init_last in obs
+    obs for obs in front.kept.values() if init_first in obs and init_last in obs
   ]
   pix_a = np.asarray([obs[init_first] for obs in shared], dtype=np.float64)
   pix_b = np.asarray([obs[init_last] for obs in shared], dtype=np.float64)
   r_cw_last, t_cw_last, _ = two_view_essential(
-    mei_unproject(pix_a, init_ch.setup.params),
-    mei_unproject(pix_b, init_ch.setup.params),
+    mei_unproject(pix_a, front.setup.params),
+    mei_unproject(pix_b, front.setup.params),
   )
   cam_poses = interpolate_camera_poses(
     r_cw_last, t_cw_last, n_keyframes, init_first=init_first, init_last=init_last
   )
-  return body_poses_from_camera_poses(cam_poses, init_ch.setup.extrinsic), False
+  return body_poses_from_camera_poses(cam_poses, front.setup.extrinsic), False
 
 
 def _align_visual_inertial(
@@ -475,19 +467,6 @@ def prepare_tracker(args: TrackerArgs, tags: GripperTags) -> PreparedTracker:
     front_video.times, covered, fps, keyframe_every
   )
   grid_times = front_video.times[front_rows]
-  rear_kf_rows = nearest_rows(rear_video.times, grid_times)
-
-  anchor_tag_ids = set(args.anchor.enabled_tag_ids)
-
-  def tag_masks(
-    shape: tuple[int, int], tags_per_kf: list[list[TagDetection]]
-  ) -> list[list[Rect]]:
-    """Per-keyframe rectangles over every non-anchor tag, empty with masking off."""
-    if not args.frontend.mask_tags:
-      return [[] for _ in tags_per_kf]
-    return non_anchor_tag_masks(
-      shape, tags_per_kf, anchor_tag_ids, args.frontend.mask_tag_pad
-    )
 
   def walk_front() -> tuple[int, list[list[TagDetection]], list[Frame]]:
     """One banded walk for tags and loop-closure ORB, the ORB empty with closure off."""
@@ -500,13 +479,8 @@ def prepare_tracker(args: TrackerArgs, tags: GripperTags) -> PreparedTracker:
       band: list[np.ndarray],
     ) -> list[tuple[list[TagDetection], Frame]]:
       tags = detect_all_tags(band)
-      rects = tag_masks(band[0].shape[:2], tags)
       orb = parallel_map(
-        lambda f, m: detect_orb(
-          f, args.frontend.orb_n_features, 20, mask_plane(f.shape[:2], m)
-        ),
-        band,
-        rects,
+        lambda f: detect_orb(f, args.frontend.orb_n_features, 20), band
       )
       return list(zip(tags, orb, strict=True))
 
@@ -544,16 +518,8 @@ def prepare_tracker(args: TrackerArgs, tags: GripperTags) -> PreparedTracker:
   del raw_imu
 
   front = _LensPrep(side="front", setup=front_lens, tags=front_tags_per_kf)
-  rear = _LensPrep(
-    side="rear",
-    setup=rear_lens,
-    tags=rear_tags_per_kf,
-    # The rear frontend applies the rects, so a run without rear landmarks records none.
-    static_mask_rects=(
-      list(args.frontend.mask_rear_rects) if args.frontend.rear_landmarks else []
-    ),
-  )
-  # Front lens only, since prep has not solved the rear seat; the corner factors gate.
+  rear = _LensPrep(side="rear", setup=rear_lens, tags=rear_tags_per_kf)
+  # Front lens only: the rear seat is a solved variable, so prep never reads it.
   obs_by_tag = {
     tag_id: anchor_pose_from_tags(
       front.tags, tag_id, args.anchor.tag_size, front.setup.params
@@ -574,14 +540,10 @@ def prepare_tracker(args: TrackerArgs, tags: GripperTags) -> PreparedTracker:
   def run_lens(ch: _LensPrep, video: LensVideo, rows: npt.NDArray[np.int64]) -> None:
     """Decode this lens, take what downstream needs from its pixels, then drop them."""
     frames = LensFrames(video, rows, band=_PREP_BAND)
-    shape = frames[0].shape[:2]
-    masks = tag_masks(shape, ch.tags)
-    apply_static_mask_rects(masks, ch.static_mask_rects, shape)
     ch.keypoints, tracks = run_lens_frontend(
       frames,
       ch.setup.params,
       args.frontend,
-      masks=masks,
       label=f"{name}/{ch.side}",
       band=frames.band,
     )
@@ -595,11 +557,9 @@ def prepare_tracker(args: TrackerArgs, tags: GripperTags) -> PreparedTracker:
     release_freed_memory()
 
   run_lens(front, front_video, front_rows)
-  if args.frontend.rear_landmarks:
-    run_lens(rear, rear_video, rear_kf_rows)
 
   body_poses_prealign, anchor_seed_used = _seed_body_poses(
-    name, front, rear, n_keyframes, anchor_obs_per_kf, args.frontend
+    name, front, n_keyframes, anchor_obs_per_kf, args.frontend
   )
 
   imu, bias0, gravity_world_initial = _imu_and_initial_gravity(
@@ -610,16 +570,15 @@ def prepare_tracker(args: TrackerArgs, tags: GripperTags) -> PreparedTracker:
     body_poses_prealign,
   )
 
-  for ch in (front, rear):
-    ch.landmarks_prealign = triangulate_lens(
-      ch.kept,
-      body_poses_prealign,
-      ch.setup.extrinsic,
-      ch.setup.params,
-      args.frontend.min_track_length,
-      min_landmark_depth=0.01,
-      max_landmark_depth=1000.0,
-    )
+  front.landmarks_prealign = triangulate_lens(
+    front.kept,
+    body_poses_prealign,
+    front.setup.extrinsic,
+    front.setup.params,
+    args.frontend.min_track_length,
+    min_landmark_depth=0.01,
+    max_landmark_depth=1000.0,
+  )
 
   # Scale: 1.0 for an anchor seed, else from a visible anchor, else floated on the IMU.
   anchor_scale = _anchor_metric_scale(
@@ -666,20 +625,17 @@ def prepare_tracker(args: TrackerArgs, tags: GripperTags) -> PreparedTracker:
   release_freed_memory()
 
   if anchor_obs_per_kf:
-    for ch in (front, rear):
-      ch.points = triangulate_lens(
-        {t: ch.kept[t] for t in ch.kept if t in ch.landmarks_prealign},
-        body_poses,
-        ch.setup.extrinsic,
-        ch.setup.params,
-        args.frontend.min_track_length,
-        max_landmark_depth=args.frontend.max_landmark_depth,
-      )
-      ch.points = cap_landmarks(
-        ch.points, ch.kept, args.frontend.max_landmarks_per_lens
-      )
+    front.points = triangulate_lens(
+      {t: front.kept[t] for t in front.kept if t in front.landmarks_prealign},
+      body_poses,
+      front.setup.extrinsic,
+      front.setup.params,
+      args.frontend.min_track_length,
+      max_landmark_depth=args.frontend.max_landmark_depth,
+    )
+    front.points = cap_landmarks(front.points, front.kept, args.frontend.max_landmarks)
     if loop_tracks:
-      # Merge after the cap so the per-lens budget never culls the revisit landmarks.
+      # After the cap, so the revisit landmarks survive the landmark budget.
       add_loop_landmarks(
         front.points,
         front.kept,
@@ -693,17 +649,15 @@ def prepare_tracker(args: TrackerArgs, tags: GripperTags) -> PreparedTracker:
         else None,
       )
   else:
-    for ch in (front, rear):
-      ch.points = {
-        tid: prealign_to_world @ xyz for tid, xyz in ch.landmarks_prealign.items()
-      }
-
-  for ch in (front, rear):
-    ch.tracks = {
-      t: subsample_obs(ch.kept[t], args.frontend.max_obs_per_track)
-      for t in ch.points
-      if t in ch.kept
+    front.points = {
+      tid: prealign_to_world @ xyz for tid, xyz in front.landmarks_prealign.items()
     }
+
+  front.tracks = {
+    t: subsample_obs(front.kept[t], args.frontend.max_obs_per_track)
+    for t in front.points
+    if t in front.kept
+  }
 
   v_max = float(max(np.linalg.norm(v) for v in velocities))
   print(f"  [{name}/vi] LSQ |v|max={v_max:.2f} m/s")

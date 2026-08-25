@@ -219,7 +219,6 @@ def main(args: Args) -> None:
     estimate=estimate,
     summary=summary,
     anchor_tag_size=args.anchor.tag_size,
-    mask_pad_px=args.frontend.mask_tag_pad if args.frontend.mask_tags else -1,
     urdf_path=urdf_path,
     session_id=session.session_id,
     open_viewer=args.open_viewer,

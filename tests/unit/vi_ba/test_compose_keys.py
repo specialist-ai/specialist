@@ -12,15 +12,13 @@ from specialist.vi_ba.compose import (
 )
 
 
-def test_the_lens_slots_do_not_overlap() -> None:
+def test_the_tracker_slots_do_not_overlap() -> None:
   keys = TrackerKeys(["tracker_0", "tracker_1"])
   issued = {
     keys.front_landmark_key("tracker_0", 7),
-    keys.rear_landmark_key("tracker_0", 7),
     keys.front_landmark_key("tracker_1", 7),
-    keys.rear_landmark_key("tracker_1", 7),
   }
-  assert len(issued) == 4
+  assert len(issued) == 2
 
 
 def test_a_track_id_that_outgrows_its_slot_is_refused() -> None:
@@ -33,7 +31,7 @@ def test_a_track_id_that_outgrows_its_slot_is_refused() -> None:
 
 
 def test_the_collision_it_prevents_is_real() -> None:
-  """An id one past the front slot produces exactly the rear slot's key."""
+  """An id one slot past a tracker produces exactly the next tracker's key."""
   keys = TrackerKeys(["tracker_0", "tracker_1"])
   overflowed = int(gtsam.symbol(LANDMARK_CHAR, _MAX_LANDMARKS_PER_TRACKER + 5))
-  assert overflowed == keys.rear_landmark_key("tracker_0", 5)
+  assert overflowed == keys.front_landmark_key("tracker_1", 5)
