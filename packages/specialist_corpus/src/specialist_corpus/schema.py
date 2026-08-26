@@ -268,6 +268,7 @@ def slots_in(paths: Iterable[str]) -> list[str]:
 
 # The stored spelling of the components a consumer selects on, addressed as
 # "/entity/path:Component:field".
+SCALARS = "Scalars:scalars"
 POSE_TRANSLATION = "Transform3D:translation"
 POSE_QUATERNION = "Transform3D:quaternion"
 
