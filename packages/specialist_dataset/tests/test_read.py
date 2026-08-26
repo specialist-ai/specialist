@@ -2,13 +2,12 @@
 
 from pathlib import Path
 
-import numpy as np
 import pytest
 import rerun as rr
-from rerun.experimental import Chunk, RrdReader, send_chunks
+from rerun.experimental import Chunk, send_chunks
 from specialist_dataset import schema
 from specialist_dataset.read import (
-  newest_values,
+  Recording,
   read_anchors,
   read_grippers,
   read_lens,
@@ -50,9 +49,7 @@ def _write(rrd: Path, chunks: list[Chunk]) -> None:
     send_chunks(chunks, recording=stream)
 
 
-def test_entity_row_takes_the_newest_write_regardless_of_file_order(
-  tmp_path: Path,
-) -> None:
+def test_a_static_written_twice_resolves_to_one_value(tmp_path: Path) -> None:
   def calibration(fx: float) -> Chunk:
     return Chunk.from_columns(
       schema.lens("cam00", "front"),
@@ -64,10 +61,8 @@ def test_entity_row_takes_the_newest_write_regardless_of_file_order(
   newer = calibration(2.0)
   rrd = tmp_path / "base.rrd"
   _write(rrd, [newer, older])
-  store = RrdReader(str(rrd)).store()
-  content = f"/{schema.lens('cam00', 'front')}"
-  row = newest_values(store.stream().filter(content=content).to_chunks())
-  assert float(np.asarray(row["fx"]).reshape(-1)[0]) == 2.0
+  row = Recording(rrd).row(schema.lens("cam00", "front"))
+  assert list(row["fx"]) == [1.0]
 
 
 def test_a_lens_reads_back_at_the_decode_resolution(tmp_path: Path) -> None:
