@@ -12,6 +12,7 @@ from pathlib import Path
 import gtsam
 import numpy as np
 import tyro
+from specialist_dataset import schema
 
 from specialist.record.layer import write_estimate_layers
 from specialist.record.session import SessionRecording
@@ -97,8 +98,8 @@ def main(args: Args) -> None:
   validate(args)
   if args.solver.gpu == "require":
     assert_backend()
-  rrd_path = args.output_dir / "estimate" / f"{session.session_id}.rrd"
-  viz_path = args.output_dir / "viz" / f"{session.session_id}.rrd"
+  rrd_path = schema.layer_rrd(args.output_dir, schema.ESTIMATE, session.session_id)
+  viz_path = schema.layer_rrd(args.output_dir, schema.VIZ, session.session_id)
   existing = [p for p in (rrd_path, viz_path) if p.exists()]
   if existing and not args.overwrite:
     raise SystemExit(

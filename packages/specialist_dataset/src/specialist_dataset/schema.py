@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
+from pathlib import Path
 
 import numpy as np
 import numpy.typing as npt
@@ -26,7 +27,20 @@ CAMERA_ROOT = "camera"
 WORLD = "world"
 # A world quantity under a posed parent must name this frame, or it rides that pose.
 WORLD_FRAME = "world"
+BASE = "base"
 ESTIMATE = "estimate"
+VIZ = "viz"
+MOCAP = "mocap"
+
+
+def layer_dir(dataset: Path, layer: str) -> Path:
+  """Where one layer's recordings sit in a layer-first dataset."""
+  return dataset / layer
+
+
+def layer_rrd(dataset: Path, layer: str, session: str) -> Path:
+  """Where one session's layer sits in a layer-first dataset."""
+  return layer_dir(dataset, layer) / f"{session}.rrd"
 
 
 def camera_slots(serials: Sequence[str]) -> list[str]:
