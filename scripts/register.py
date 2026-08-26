@@ -28,9 +28,11 @@ from rerun.experimental import RrdReader
 from specialist_corpus.read import check_frame_alignment
 from specialist_corpus.schema import (
   APPLICATION_ID,
+  BASE,
   ESTIMATE,
   anchor_id_of,
   anchor_ids_in,
+  layer_dir,
   slots_in,
 )
 
@@ -79,7 +81,7 @@ def corpus_layers(root: Path) -> tuple[list[Path], dict[str, list[Path]]]:
   """Discover ``(base_files, {layer_name: files})`` from a layer-first root.
   Every directory holding rrds is a layer named after itself; ``base`` defines
   the segments the others attach to."""
-  bases = sorted((root / "base").glob("*.rrd"))
+  bases = sorted(layer_dir(root, BASE).glob("*.rrd"))
   if not bases:
     raise SystemExit(f"{root / 'base'} holds no .rrd; a corpus needs its base layer")
   layers = {

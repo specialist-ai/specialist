@@ -22,6 +22,7 @@ A session is indexed by four clocks:
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
+from pathlib import Path
 
 import numpy as np
 import numpy.typing as npt
@@ -46,7 +47,20 @@ WORLD = "world"
 # The frame every world-referenced quantity names. An entity under a posed
 # parent must declare it, or it rides a pose it is not expressed in.
 WORLD_FRAME = "world"
+BASE = "base"
 ESTIMATE = "estimate"
+VIZ = "viz"
+MOCAP = "mocap"
+
+
+def layer_dir(corpus: Path, layer: str) -> Path:
+  """Where one layer's recordings sit in a layer-first corpus."""
+  return corpus / layer
+
+
+def layer_rrd(corpus: Path, layer: str, session: str) -> Path:
+  """Where one session's layer sits in a layer-first corpus."""
+  return layer_dir(corpus, layer) / f"{session}.rrd"
 
 
 def camera_slots(serials: Sequence[str]) -> list[str]:
