@@ -1,36 +1,37 @@
-"""The single source of record entity paths, timeline names and timeline decoding."""
+"""The single source of dataset entity paths, timeline names and timeline decoding."""
 
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
-from typing import Literal
 
 import numpy as np
 import numpy.typing as npt
 import pyarrow as pa
+from specialist_camera import SIDES as SIDES
+from specialist_camera import Side as Side
 
 Float64Array = npt.NDArray[np.float64]
 Int64Array = npt.NDArray[np.int64]
 
-# The two sides of a stitched dual-fisheye capture.
-Side = Literal["front", "rear"]
-SIDES: tuple[Side, Side] = ("front", "rear")
-
 APPLICATION_ID = "specialist"
+# One property group per layer: a name has exactly one writer after a merge.
+BASE_PROPERTIES = "base"
+ESTIMATE_PROPERTIES = "estimate"
+VIZ_PROPERTIES = "viz"
 TIMELINE = "video_time"
-# Sequence timeline: frame ``i`` carries keyframe index ``ceil(i / stride)``.
 KEYFRAME_TIMELINE = "keyframe"
 NS_PER_SECOND = 1_000_000_000
 
 CAMERA_ROOT = "camera"
 WORLD = "world"
-# The frame a world-frame entity under a posed parent must declare.
+# A world quantity under a posed parent must name this frame, or it rides that pose.
 WORLD_FRAME = "world"
 ESTIMATE = "estimate"
 
 
 def camera_slots(serials: Sequence[str]) -> list[str]:
-  """Slots by serial rank in the take; refuses missing or shared serials."""
+  """One handle per capture: the rank of its serial among the take's serials, so a slot
+  never identifies a camera across takes."""
   if not all(serials) or len(set(serials)) != len(serials):
     raise ValueError(f"cameras need one distinct serial each, got {list(serials)}")
   rank = {serial: i for i, serial in enumerate(sorted(serials))}
@@ -38,7 +39,7 @@ def camera_slots(serials: Sequence[str]) -> list[str]:
 
 
 def keyframe_stride(fps: float) -> int:
-  """The auto keyframe interval in frames, ``max(1, round(fps / 10))`` (about 0.1 s)."""
+  """The auto keyframe interval: ``round(fps / 10)`` frames, about 0.10 s."""
   return max(1, round(fps / 10.0))
 
 
@@ -51,7 +52,7 @@ def keyframe_index(
 
 
 def times_ns(column: pa.Array | pa.ChunkedArray) -> Int64Array:
-  """A duration column as int64 nanoseconds; the numpy read raises if it would copy."""
+  """A duration column as integer nanoseconds; raises when the read would copy."""
   values = column.combine_chunks() if isinstance(column, pa.ChunkedArray) else column
   out: Int64Array = values.to_numpy(zero_copy_only=True).astype("int64")
   return out
@@ -64,7 +65,7 @@ def seconds(column: pa.Array | pa.ChunkedArray) -> Float64Array:
 
 
 def camera(slot: str) -> str:
-  """The camera body frame; world-frame entities under it must name ``WORLD_FRAME``."""
+  """The camera body, whose solved pose defines the body frame every child rides."""
   return f"{CAMERA_ROOT}/{slot}"
 
 
@@ -74,7 +75,7 @@ def lens(slot: str, side: str) -> str:
 
 
 def video(slot: str, side: str) -> str:
-  """A lens's encoded frames; a leaf that must hold no temporal children."""
+  """A lens's encoded frames, a leaf with no temporal children."""
   return f"{lens(slot, side)}/video"
 
 
@@ -90,7 +91,7 @@ OVERLAY_KINDS = (TAG_AXES_OVERLAY, LANDMARK_REPROJECTION_OVERLAY, STATIC_MASK_OV
 
 
 def detection(slot: str, side: str, kind: str) -> str:
-  """What the lens measured in its own pixels: the pixels a factor reads."""
+  """What the lens measured, in its own pixels."""
   return f"{lens(slot, side)}/detection/{kind}"
 
 
@@ -133,12 +134,12 @@ def lin_vel(slot: str) -> str:
 
 
 def base_tag(slot: str) -> str:
-  """The gripper tag bolted to the camera, a child of the body it is measured from."""
+  """The gripper tag bolted to the camera body, its tag id stored as a value."""
   return f"{camera(slot)}/base_tag"
 
 
 def joint_model(slot: str, joint: str) -> str:
-  """What the model says about one revolute joint, on a child of the link."""
+  """What the model says about one revolute joint."""
   return f"{gripper_part(slot, joint)}/model"
 
 
@@ -148,7 +149,8 @@ def joint_tag(slot: str, joint: str) -> str:
 
 
 def state_frame(slot: str) -> str:
-  """The body frame the solved keyframe pose defines, apart from the propagated one."""
+  """The frame the solved keyframe pose defines, named apart from the camera's
+  propagated frame because Rerun allows one definition per frame."""
   return f"{slot}_state_body"
 
 
@@ -168,7 +170,7 @@ def gripper_part(slot: str, part: str) -> str:
 
 
 def fit(slot: str, metric: str | None = None) -> str:
-  """The camera's whole-take solve quality, and one per-keyframe series per child."""
+  """Whole-take fit numbers, or with ``metric`` that metric's per-keyframe series."""
   return f"{camera(slot)}/fit/{metric}" if metric else f"{camera(slot)}/fit"
 
 
@@ -187,7 +189,7 @@ def trajectory(slot: str) -> str:
 
 
 def anchor(tag_id: int) -> str:
-  """A world-static tag by id; a component on it says whether it pins the gauge."""
+  """A world-static tag, addressed by the tag it is."""
   return f"{WORLD}/anchor/{tag_id}"
 
 
@@ -214,3 +216,18 @@ def slot_of(path: str) -> str | None:
 def slots_in(paths: Iterable[str]) -> list[str]:
   """The camera slots a recording holds, read off its entity paths."""
   return sorted({slot for slot in map(slot_of, paths) if slot})
+
+
+# Stored component spellings, addressed as "/entity/path:Component:field".
+POSE_TRANSLATION = "Transform3D:translation"
+POSE_QUATERNION = "Transform3D:quaternion"
+
+
+def selector(entity: str, component: str) -> str:
+  """One field of one entity, fully qualified."""
+  return f"/{entity}:{component}"
+
+
+def pose_selectors(entity: str) -> tuple[str, str]:
+  """The translation and quaternion of a stored pose, in that order."""
+  return selector(entity, POSE_TRANSLATION), selector(entity, POSE_QUATERNION)

@@ -7,12 +7,12 @@ from dataclasses import dataclass
 import gtsam
 import numpy as np
 import numpy.typing as npt
+from specialist_camera import mei_project
+from specialist_dataset.fiducials import tag_corners_in_frame
 
-from specialist.loader.mei_model import mei_project
 from specialist.vi_ba.anchor_detection import (
   TagDetection,
   estimate_camera_to_tag_pose,
-  tag_corners_in_frame,
 )
 from specialist.vi_ba.build import LensSetup
 from specialist.vi_ba.compose import (
@@ -306,7 +306,7 @@ def _base_tag_corners_world(
   """Each tracker's base-tag corners in the world, per keyframe."""
   return {
     t.name: [
-      tag_corners_in_frame(pose.compose(t.body_T_base_tag), tag_size)
+      tag_corners_in_frame(pose.compose(t.body_T_base_tag).matrix(), tag_size)
       for pose in optimized_body_poses[t.name]
     ]
     for t in trackers
@@ -338,7 +338,7 @@ def build_run_estimate(
     **solve.secondary_anchor_world,
   }
   anchor_corners_by_tag = {
-    tag_id: tag_corners_in_frame(pose, args.anchor.tag_size)
+    tag_id: tag_corners_in_frame(pose.matrix(), args.anchor.tag_size)
     for tag_id, pose in anchor_poses_world.items()
   }
   base_tag_corners = _base_tag_corners_world(

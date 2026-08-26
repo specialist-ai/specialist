@@ -2,17 +2,18 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
 import gtsam
 import numpy as np
 import numpy.typing as npt
-from rerun.experimental import Chunk, RrdReader
+from rerun.experimental import RrdReader
+from specialist_camera import Side
+from specialist_dataset import frames, schema
+from specialist_dataset.poses import quats_to_matrices
+from specialist_dataset.read import lens_from_row, newest_values
 
-from specialist.loader.mei_model import MeiParams
-from specialist.record import frames, schema
 from specialist.vi_ba.build import LensSetup
 from specialist.vi_ba.imu import ImuSamples
 
@@ -24,7 +25,6 @@ __all__ = [
   "covered_rows",
   "fps_from_times",
   "nearest_rows",
-  "newest_values",
 ]
 
 
@@ -65,34 +65,6 @@ def covered_rows(
   hi = min(front[-1], rear[-1], imu[-1]) + half_frame
   rows: Int64Array = np.flatnonzero((front >= lo) & (front <= hi)).astype(np.int64)
   return rows
-
-
-def newest_values(chunks: Iterable[Chunk]) -> dict[str, Any]:
-  """Component name -> the value with the highest row id over ``chunks``."""
-  out: dict[str, Any] = {}
-  newest: dict[str, bytes] = {}
-  for chunk in chunks:
-    batch = chunk.to_record_batch()
-    names = batch.schema.names
-    row_ids = batch.column(names.index("rerun.controls.RowId")).to_pylist()
-    for name, column in zip(names, batch.columns, strict=True):
-      if name.startswith("rerun.controls.") or name == schema.TIMELINE:
-        continue
-      for i, value in enumerate(column.to_pylist()):
-        if value is not None and row_ids[i] > newest.get(name, b""):
-          newest[name] = row_ids[i]
-          out[name] = value
-  return out
-
-
-def _rot3(row: dict[str, Any]) -> gtsam.Rot3:
-  x, y, z, w = np.asarray(row["Transform3D:quaternion"], dtype=np.float64).reshape(4)
-  return gtsam.Rot3.Quaternion(w, x, y, z)
-
-
-def _pose(row: dict[str, Any]) -> gtsam.Pose3:
-  translation = np.asarray(row["Transform3D:translation"], dtype=np.float64).reshape(3)
-  return gtsam.Pose3(_rot3(row), gtsam.Point3(*translation))
 
 
 class SessionRecording:
@@ -159,24 +131,9 @@ class SessionRecording:
       self._lens_setup(slot, "rear", decoded_width),
     )
 
-  def _lens_setup(self, slot: str, side: str, decoded_width: int) -> LensSetup:
-    row = self._entity_row(schema.lens(slot, side))
-
-    def scalar(name: str) -> float:
-      return float(np.asarray(row[name], dtype=np.float64).reshape(-1)[0])
-
-    # Rear-lens raw ``cx`` is measured from the stitched-frame left edge.
-    frame_width = scalar("frame_width")
-    scale = 2 * decoded_width / frame_width
-    left_edge = frame_width / 2.0 if side == "rear" else 0.0
-    params = MeiParams(
-      fx=scalar("fx") * scale,
-      fy=scalar("fy") * scale,
-      cx=(scalar("cx") - left_edge) * scale,
-      cy=scalar("cy") * scale,
-      **{name: scalar(name) for name in ("k1", "k2", "k3", "p1", "p2", "xi")},
-    )
-    return LensSetup(extrinsic=_pose(row), params=params)
+  def _lens_setup(self, slot: str, side: Side, decoded_width: int) -> LensSetup:
+    lens = lens_from_row(self._entity_row(schema.lens(slot, side)), decoded_width, side)
+    return LensSetup(extrinsic=gtsam.Pose3(lens.body_from_lens), params=lens.params)
 
   def _scalar_rows(self, entity: str) -> tuple[Float64Array, Float64Array]:
     """One entity's scalar series sorted by time; raises ValueError when it has none."""
@@ -211,7 +168,7 @@ class SessionRecording:
   def imu_to_body(self, slot: str) -> Float64Array:
     """The IMU mounting rotation, raw IMU axes -> body."""
     row = self._entity_row(schema.imu(slot))
-    matrix: Float64Array = _rot3(row).matrix()
+    matrix: Float64Array = quats_to_matrices(row[schema.POSE_QUATERNION])[0]
     return matrix
 
   def factory_bias(self, slot: str) -> gtsam.imuBias.ConstantBias:

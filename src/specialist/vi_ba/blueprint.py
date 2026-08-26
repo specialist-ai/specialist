@@ -8,8 +8,7 @@ from typing import Any
 import numpy as np
 import rerun as rr
 import rerun.blueprint as rrb
-
-from specialist.record import schema
+from specialist_dataset import schema
 
 __all__ = [
   "TRAJECTORY_TRAIL_DURATION",

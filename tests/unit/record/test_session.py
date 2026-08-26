@@ -8,8 +8,9 @@ import gtsam
 import numpy as np
 import pytest
 from rerun.experimental import RrdReader
+from specialist_dataset import schema
+from specialist_dataset.frames import LensFrames
 
-from specialist.record import schema
 from specialist.record.base import (
   IMU_TO_BODY,
   calibration_chunks,
@@ -18,7 +19,6 @@ from specialist.record.base import (
   imu_chunks,
   write_base_recording,
 )
-from specialist.record.frames import LensFrames
 from specialist.record.session import (
   SessionRecording,
   covered_rows,

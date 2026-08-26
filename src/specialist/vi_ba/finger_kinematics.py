@@ -7,13 +7,13 @@ from dataclasses import dataclass
 import gtsam
 import numpy as np
 import numpy.typing as npt
+from specialist_camera import mei_project
+from specialist_dataset.fiducials import tag_corners_in_frame
 
-from specialist.loader.mei_model import mei_project
 from specialist.vi_ba.anchor_detection import (
   TagDetection,
   anchor_pose_from_tags,
   tag_center_bearing,
-  tag_corners_in_frame,
 )
 from specialist.vi_ba.build import LensSetup
 from specialist.vi_ba.geometry import average_pose, rotate_about_z
@@ -89,7 +89,7 @@ def build_finger_reproj(
   assert joint.joint_T_tag0 is not None
   base_T_joint = joint.base_T_joint
   body_T_joint_seed = body_T_base_tag.compose(base_T_joint)
-  corners_in_pivot = tag_corners_in_frame(joint.joint_T_tag0, tag_size)
+  corners_in_pivot = tag_corners_in_frame(joint.joint_T_tag0.matrix(), tag_size)
   observations: dict[int, FingerKfObs] = {}
   for kf in range(min(n_keyframes, len(tags_per_kf))):
     det = next((d for d in tags_per_kf[kf] if d.tag_id == finger_tag_id), None)
@@ -142,7 +142,7 @@ def frame_finger_angles(
   """``(frame indices, angles)`` from detections alone, per frame that sees the tag."""
   assert joint.joint_T_tag0 is not None
   body_T_joint = body_T_base_tag.compose(joint.base_T_joint)
-  corners_in_pivot = tag_corners_in_frame(joint.joint_T_tag0, tag_size)
+  corners_in_pivot = tag_corners_in_frame(joint.joint_T_tag0.matrix(), tag_size)
   frames: list[int] = []
   angles: list[float] = []
   for i, dets in enumerate(tags_per_frame):

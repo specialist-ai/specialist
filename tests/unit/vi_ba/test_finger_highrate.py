@@ -40,9 +40,10 @@ def test_nan_keyframes_leave_the_raw_series_untouched() -> None:
 def test_frame_angles_recover_a_dense_synthetic_motion() -> None:
   """Angles come back within scan resolution, and undetected frames stay absent."""
   import gtsam
+  from specialist_camera import MeiParams, mei_project
+  from specialist_dataset.fiducials import tag_corners_in_frame
 
-  from specialist.loader.mei_model import MeiParams, mei_project
-  from specialist.vi_ba.anchor_detection import TagDetection, tag_corners_in_frame
+  from specialist.vi_ba.anchor_detection import TagDetection
   from specialist.vi_ba.build import LensSetup
   from specialist.vi_ba.finger_kinematics import frame_finger_angles
   from specialist.vi_ba.urdf_joints import RevoluteJoint
@@ -66,7 +67,7 @@ def test_frame_angles_recover_a_dense_synthetic_motion() -> None:
     body_T_tag = joint_pose.compose(
       gtsam.Pose3(gtsam.Rot3.Rz(float(th)), gtsam.Point3(0, 0, 0))
     ).compose(joint_T_tag0)
-    px = mei_project(tag_corners_in_frame(body_T_tag, 0.05), params)
+    px = mei_project(tag_corners_in_frame(body_T_tag.matrix(), 0.05), params)
     dets.append([TagDetection(tag_id=2004, center=px.mean(0), corners=px)])
 
   frames, angles = frame_finger_angles(joint, dets, lens, 2004, gtsam.Pose3(), 0.05)

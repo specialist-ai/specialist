@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+from specialist_camera import MeiParams, mei_project, mei_unproject
 
-from specialist.loader.mei_model import MeiParams, mei_project, mei_unproject
 from specialist.vi_ba.tracks import (
   filter_tracks_by_parallax,
   unproject_tracks,
