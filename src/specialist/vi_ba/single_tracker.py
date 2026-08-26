@@ -618,7 +618,6 @@ def prepare_tracker(args: TrackerArgs, tags: GripperTags) -> PreparedTracker:
       body_poses,
       front_lens,
       max(front.kept, default=0),
-      args.frontend,
     )
   # Nothing past loop closure reads the ORB frames, the descriptors' last holder.
   front_orb.clear()

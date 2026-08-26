@@ -150,9 +150,7 @@ def test_the_propagated_gripper_frame_is_what_the_trajectory_rides(
   assert rotations.shape == (5, 3, 3)
 
   chunks: list[Chunk] = []
-  _trajectory_streams(
-    Layers(chunks.append, chunks.append), data, indexes, gripper_hr, (1, 2, 3)
-  )
+  _trajectory_streams(Layers(chunks.append, chunks.append), data, gripper_hr, (1, 2, 3))
   offset = np.asarray(data.trajectory_offset_in_gripper)
   expected = translations + rotations @ offset
   strips = _strips(chunks)

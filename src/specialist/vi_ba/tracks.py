@@ -208,7 +208,6 @@ def loop_closure_tracks(
   body_poses: list[gtsam.Pose3],
   lens: LensSetup,
   base_track_id: int,
-  cfg: FrontendCfg,
 ) -> dict[int, dict[int, Float64Array]]:
   """Tracks that ORB loop closure recovers between close, non-adjacent keyframes."""
   centers = np.asarray([translation(p.compose(lens.extrinsic)) for p in body_poses])

@@ -742,7 +742,6 @@ def _joint_streams(
 def _trajectory_streams(
   layers: Layers,
   data: CameraEstimate,
-  indexes: _Indexes,
   gripper_hr: tuple[Float64Array, Float64Array],
   trajectory_color: tuple[int, int, int],
 ) -> None:
@@ -901,7 +900,7 @@ def _send_camera(
       _dense_indexes(opening_times, frame_period),
       opening_values,
     )
-  _trajectory_streams(layers, data, indexes, gripper_hr, trajectory_color)
+  _trajectory_streams(layers, data, gripper_hr, trajectory_color)
   _factor_line_streams(layers, data, indexes)
   _lens_streams(layers, data, indexes, anchor_tag_ids)
   _bias_streams(layers, data, indexes)
