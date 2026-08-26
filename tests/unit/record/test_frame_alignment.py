@@ -9,11 +9,11 @@ from pathlib import Path
 import gtsam
 import numpy as np
 import pytest
+from specialist_corpus import schema
+from specialist_corpus.frames import LensVideo
+from specialist_corpus.read import check_frame_alignment
 
-from specialist.record import schema
 from specialist.record.base import write_base_recording
-from specialist.record.frames import LensVideo
-from specialist.record.read import check_frame_alignment
 from specialist.record.session import SessionRecording
 from specialist.record.video import normalize_h264, video_chunks
 from specialist.vi_ba.viz import CameraEstimate

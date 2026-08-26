@@ -24,9 +24,9 @@ jobs:
         with:
           enable-cache: true
       - name: Run ruff check
-        run: uvx ruff@0.15.0 check --diff src/ tests/ scripts/
+        run: uvx ruff@0.15.0 check --diff src/ tests/ scripts/ packages/
       - name: Run ruff format
-        run: uvx ruff@0.15.0 format --diff src/ tests/ scripts/
+        run: uvx ruff@0.15.0 format --diff src/ tests/ scripts/ packages/
 
   typecheck:
     runs-on: ubuntu-latest

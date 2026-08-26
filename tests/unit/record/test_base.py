@@ -6,6 +6,7 @@ from typing import Any
 import numpy as np
 import pytest
 from rerun.experimental import Chunk, LazyChunkStream, RrdReader
+from specialist_corpus import schema
 
 from specialist.record.base import (
   calibration_chunks,
@@ -96,7 +97,7 @@ def test_write_base_recording_identity_and_properties(tmp_path: Path) -> None:
     "ft005",
     [LazyChunkStream.from_iter(chunks)],
     [],
-    {"base": {"task": "fold_towel", "date": "2026-08-23"}},
+    {schema.BASE_PROPERTIES: {"task": "fold_towel", "date": "2026-08-23"}},
   )
   reader = RrdReader(str(out))
   entries = reader.recordings()
@@ -104,7 +105,7 @@ def test_write_base_recording_identity_and_properties(tmp_path: Path) -> None:
   chunk_paths = {c.entity_path for c in reader.store().stream().to_chunks()}
   assert "/camera/cam00/imu/gyro" in chunk_paths
   # entity_paths() hides internal paths; properties live under /__properties/.
-  assert "/__properties/base" in chunk_paths
+  assert f"/__properties/{schema.BASE_PROPERTIES}" in chunk_paths
 
 
 def test_write_base_recording_failure_leaves_no_final_file(

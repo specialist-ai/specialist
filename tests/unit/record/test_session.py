@@ -10,8 +10,9 @@ import gtsam
 import numpy as np
 import pytest
 from rerun.experimental import RrdReader
+from specialist_corpus import schema
+from specialist_corpus.frames import RecordingKeyframes
 
-from specialist.record import schema
 from specialist.record.base import (
   IMU_TO_BODY,
   calibration_chunks,
@@ -20,7 +21,6 @@ from specialist.record.base import (
   imu_chunks,
   write_base_recording,
 )
-from specialist.record.frames import RecordingKeyframes
 from specialist.record.session import (
   SessionRecording,
   covered_rows,

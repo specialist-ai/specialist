@@ -3,12 +3,9 @@ trace-only quaternion formula loses the vector part."""
 
 import gtsam
 import numpy as np
+from specialist_corpus.poses import quats_to_matrices
 
-from specialist.vi_ba.geometry import (
-  matrices_to_quats,
-  quat_xyzw,
-  quats_to_matrices,
-)
+from specialist.vi_ba.geometry import matrices_to_quats, quat_xyzw
 
 
 def test_quat_xyzw_is_scipy_order() -> None:

@@ -1,0 +1,39 @@
+"""The corpus pose convention.
+
+A stored pose is a translation and an xyzw quaternion, the transform from the
+entity's parent frame to its own. It reads back as a ``(4, 4)`` float64 matrix.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import numpy.typing as npt
+
+Float64Array = npt.NDArray[np.float64]
+
+__all__ = ["matrices_from_poses", "quats_to_matrices"]
+
+
+def quats_to_matrices(quaternions: Float64Array) -> Float64Array:
+  """Batch xyzw quaternions to rotation matrices, ``(n, 4) -> (n, 3, 3)``."""
+  quats = np.asarray(quaternions, dtype=np.float64).reshape(-1, 4)
+  x, y, z, w = (quats / np.linalg.norm(quats, axis=1, keepdims=True)).T
+  return np.stack(
+    [
+      np.stack([1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)], -1),
+      np.stack([2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)], -1),
+      np.stack([2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)], -1),
+    ],
+    axis=1,
+  )
+
+
+def matrices_from_poses(
+  translations: Float64Array, quaternions: Float64Array
+) -> Float64Array:
+  """Stored translation and xyzw quaternion columns as ``(n, 4, 4)``."""
+  rotations = quats_to_matrices(quaternions)
+  out = np.tile(np.eye(4, dtype=np.float64), (len(rotations), 1, 1))
+  out[:, :3, :3] = rotations
+  out[:, :3, 3] = np.asarray(translations, dtype=np.float64).reshape(-1, 3)
+  return out

@@ -14,13 +14,13 @@ import gtsam
 import numpy as np
 import numpy.typing as npt
 from pupil_apriltags import Detector
+from specialist_camera import MeiParams, mei_unproject
+from specialist_corpus.fiducials import TAG_FAMILY, tag_corners_local
 
-from specialist.loader.mei_model import MeiParams, mei_unproject
 from specialist.vi_ba.features import Rect, cpu_budget
 
 Float64Array = npt.NDArray[np.float64]
 
-_TAG_FAMILY = "tagStandard41h12"
 # Cap on the detector's own thread pool.
 _DETECT_THREADS = 48
 _detect_slots = threading.Lock()
@@ -37,8 +37,6 @@ __all__ = [
   "estimate_camera_to_tag_pose",
   "non_anchor_tag_masks",
   "tag_center_bearing",
-  "tag_corners_in_frame",
-  "tag_corners_local",
   "tag_half_angle",
 ]
 
@@ -134,34 +132,16 @@ def _shared_detector() -> Detector:
     got = getattr(_local, "detector", None)
     if got is None:
       got = _OrderedTeardownDetector(
-        families=_TAG_FAMILY, nthreads=max(1, _detect_threads() // 2)
+        families=TAG_FAMILY, nthreads=max(1, _detect_threads() // 2)
       )
       _local.detector = got
     return got
   with _detect_slots:
     if _detector is None:
       _detector = _OrderedTeardownDetector(
-        families=_TAG_FAMILY, nthreads=_detect_threads()
+        families=TAG_FAMILY, nthreads=_detect_threads()
       )
     return _detector
-
-
-def tag_corners_local(tag_size: float) -> Float64Array:
-  """The tag's four corners in the tag frame, ``(4, 3)``.
-
-  pupil_apriltags corner order ``[BL, BR, TR, TL]`` (image-CCW from the
-  bottom-left); tag-frame axes ``+x right``, ``+y up``, ``+z out``.
-  """
-  half = float(tag_size / 2.0)
-  return np.array(
-    [
-      [-half, -half, 0.0],
-      [+half, -half, 0.0],
-      [+half, +half, 0.0],
-      [-half, +half, 0.0],
-    ],
-    dtype=np.float64,
-  )
 
 
 @dataclass(frozen=True)
@@ -171,15 +151,6 @@ class TagDetection:
   tag_id: int
   center: Float64Array  # (2,)
   corners: Float64Array  # (4, 2)
-
-
-def tag_corners_in_frame(pose: gtsam.Pose3, tag_size: float) -> Float64Array:
-  """A tag's four metric corners transformed by ``pose`` (e.g. a tag's world
-  pose, or a joint's tag-at-rest pose), ``(4, 3)``."""
-  return np.array(
-    [pose.transformFrom(gtsam.Point3(*c)) for c in tag_corners_local(tag_size)],
-    dtype=np.float64,
-  )
 
 
 def tag_center_bearing(det: TagDetection, params: MeiParams) -> Float64Array:

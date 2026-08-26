@@ -21,13 +21,12 @@ from functools import partial
 import gtsam
 import numpy as np
 import numpy.typing as npt
+from specialist_corpus.fiducials import tag_corners_in_frame, tag_corners_local
 
 from specialist.vi_ba.anchor_detection import (
   TagDetection,
   estimate_camera_to_tag_pose,
   tag_center_bearing,
-  tag_corners_in_frame,
-  tag_corners_local,
   tag_half_angle,
 )
 from specialist.vi_ba.build import (
@@ -448,7 +447,7 @@ def _add_all_anchor_corner_factors(
     3, args.anchor.secondary_corner_prior_sigma
   )
   for tag_id, world_T_tag in secondary_anchor_world.items():
-    seed_corners = tag_corners_in_frame(world_T_tag, args.anchor.tag_size)
+    seed_corners = tag_corners_in_frame(world_T_tag.matrix(), args.anchor.tag_size)
     corner_keys: list[int] | None = None
     if args.anchor.free_secondary:
       # The secondary's corners are graph variables held near the seed by a

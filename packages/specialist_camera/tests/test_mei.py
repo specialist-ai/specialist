@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-
-from specialist.loader.mei_model import (
+from specialist_camera import (
   MeiParams,
   mei_project,
   mei_unproject,
+  rescale,
 )
 
 
@@ -29,7 +29,7 @@ def _x3_like_params() -> MeiParams:
 
 
 def _undistorted_params() -> MeiParams:
-  """Pinhole on the unit sphere, no tangential, no distortion. Easy invariants."""
+  """Pinhole on the unit sphere, no distortion."""
   return MeiParams(
     fx=400.0,
     fy=400.0,
@@ -71,7 +71,6 @@ def _forward_rays(rng: np.random.Generator, n: int, half_angle: float) -> np.nda
 
 
 def test_mei_round_trip_with_distortion() -> None:
-  """ray -> pixel -> ray within tight tolerance, staying inside the camera FOV."""
   params = _x3_like_params()
   rng = np.random.default_rng(42)
   rays = _forward_rays(rng, n=80, half_angle=np.deg2rad(85.0))
@@ -83,7 +82,6 @@ def test_mei_round_trip_with_distortion() -> None:
 
 
 def test_mei_unit_bearings_have_unit_norm() -> None:
-  """Unprojected bearings are unit vectors when the source pixels are in-domain."""
   params = _x3_like_params()
   rng = np.random.default_rng(1)
   rays = _forward_rays(rng, n=20, half_angle=np.deg2rad(80.0))
@@ -103,3 +101,51 @@ def test_mei_unproject_rejects_bad_shape() -> None:
   params = _undistorted_params()
   with pytest.raises(ValueError):
     mei_unproject(np.zeros((3,)), params)
+
+
+def test_rescale_maps_stored_intrinsics_onto_the_decoded_frame() -> None:
+  raw = MeiParams(
+    fx=4663.0,
+    fy=4663.0,
+    cx=1440.0,
+    cy=1440.0,
+    k1=0.1,
+    k2=0.2,
+    k3=0.3,
+    p1=0.4,
+    p2=0.5,
+    xi=1.9,
+  )
+  front = rescale(raw, frame_width=5760.0, decoded_width=2880, side="front")
+  assert front.fx == pytest.approx(4663.0)
+  assert front.cx == pytest.approx(1440.0)
+  assert (front.k1, front.k2, front.k3, front.p1, front.p2, front.xi) == (
+    raw.k1,
+    raw.k2,
+    raw.k3,
+    raw.p1,
+    raw.p2,
+    raw.xi,
+  )
+
+  half = rescale(raw, frame_width=5760.0, decoded_width=1440, side="front")
+  assert half.fx == pytest.approx(4663.0 / 2)
+  assert half.cy == pytest.approx(720.0)
+
+
+def test_rescale_takes_the_rear_lens_off_the_stitched_left_edge() -> None:
+  raw = MeiParams(
+    fx=4663.0,
+    fy=4663.0,
+    cx=4320.0,
+    cy=1440.0,
+    k1=0.0,
+    k2=0.0,
+    k3=0.0,
+    p1=0.0,
+    p2=0.0,
+    xi=1.9,
+  )
+  rear = rescale(raw, frame_width=5760.0, decoded_width=2880, side="rear")
+  assert rear.cx == pytest.approx(1440.0)
+  assert rear.cy == pytest.approx(1440.0)

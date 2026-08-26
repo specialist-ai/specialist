@@ -14,8 +14,8 @@ from dataclasses import dataclass, replace
 
 import gtsam
 import numpy as np
+from specialist_corpus.fiducials import tag_corners_in_frame
 
-from specialist.vi_ba.anchor_detection import tag_corners_in_frame
 from specialist.vi_ba.compose import (
   CrossSighting,
   LandmarkKeep,
@@ -249,7 +249,7 @@ def _solve_joint_graph(
     keys,
     args,
     cross_obs,
-    tag_corners_in_frame(world_T_ref_anchor, args.anchor.tag_size),
+    tag_corners_in_frame(world_T_ref_anchor.matrix(), args.anchor.tag_size),
     seed,
   )
   result, landmark_keep = _solve_with_cull_reoptimize(

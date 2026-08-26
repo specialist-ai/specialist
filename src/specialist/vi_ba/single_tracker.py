@@ -16,10 +16,10 @@ from typing import NamedTuple, TypeVar
 import gtsam
 import numpy as np
 import numpy.typing as npt
+from specialist_camera import mei_unproject
+from specialist_corpus import schema
+from specialist_corpus.frames import LensVideo, RecordingKeyframes
 
-from specialist.loader.mei_model import mei_unproject
-from specialist.record import schema
-from specialist.record.frames import LensVideo, RecordingKeyframes
 from specialist.record.session import (
   SessionRecording,
   covered_rows,

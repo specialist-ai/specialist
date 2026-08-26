@@ -1,11 +1,4 @@
-"""Keyframe decoding straight out of a base recording's video stream.
-
-The recording stores the capture's H.264 samples exactly as they came off the
-camera, so a solve reads pixels from the same artifact a viewer plays: feed the
-packets from a band's anchoring keyframe through its last frame into one codec
-context and keep the selected rows' frames. Each packet is decoded once per
-band, and only one band of frames stays resident.
-"""
+"""Keyframe decoding out of a base recording's H.264 video stream."""
 
 from __future__ import annotations
 
@@ -18,15 +11,13 @@ import numpy.typing as npt
 import pyarrow as pa
 from rerun.experimental import RrdReader
 
-from specialist.record import schema
+from specialist_corpus import schema
 
 Float64Array = npt.NDArray[np.float64]
 Int64Array = npt.NDArray[np.int64]
 
 __all__ = ["LensVideo", "RecordingKeyframes", "lens_times"]
 
-# Frame threading decodes one frame across many cores. It delays output, which
-# is why the band flushes at its end.
 _DECODE_THREADS = 16
 
 
@@ -152,9 +143,7 @@ class LensVideo:
 def _packet_arrays(
   chunk: pa.ListArray,
 ) -> tuple[Int64Array, Int64Array, npt.NDArray[np.uint8]]:
-  """One chunk's ``(sample offsets, packet offsets, bytes)``. The bytes are one
-  flat buffer behind two offset levels, so a lookup is two integer reads and a
-  slice."""
+  """One chunk's ``(sample offsets, packet offsets, bytes)``."""
   packets = chunk.values
   return (
     chunk.offsets.to_numpy(),
@@ -177,12 +166,8 @@ def _iframe_rows(times_ns: Int64Array, iframe_ns: list[int]) -> Int64Array:
 class RecordingKeyframes(Sequence[np.ndarray]):
   """A lens's frames at chosen rows out of a base recording, one band at a time.
 
-  ``rows`` are ascending row indices into the lens's sample table (a stride for
-  a keyframe walk, PTS-matched rows for the rear lens). Indexing decodes the
-  band the index falls in and keeps only that band, so a full-length lens costs
-  one band of frames rather than every selected row. Readers that walk in order
-  pay one decode pass over the band's packets; a reader that jumps between
-  bands pays a band decode per jump.
+  ``rows`` are ascending row indices into the lens's sample table. Indexing
+  decodes the band the index falls in and keeps only that band.
   """
 
   def __init__(self, video: LensVideo, rows: Int64Array, band: int = 256) -> None:
@@ -201,9 +186,7 @@ class RecordingKeyframes(Sequence[np.ndarray]):
 
   @property
   def band(self) -> int:
-    """Frames resident per decode. The last frame of the band just left is
-    carried across a switch, so a pair walk's one-frame reach-back over a seam
-    is a cache hit rather than a redecode of the evicted band."""
+    """Frames resident per decode."""
     return self._band
 
   def _decode_band(self, first: int, span: int) -> list[np.ndarray]:
@@ -220,9 +203,7 @@ class RecordingKeyframes(Sequence[np.ndarray]):
 
     def take(decoded: object, at: int) -> None:
       if at in wanted:
-        # The stream is 4:2:0, so the first plane is the full-resolution luma:
-        # taking it directly skips a single-threaded swscale conversion that
-        # costs more than the decode itself.
+        # 4:2:0, so plane 0 is the full-resolution luma.
         plane = decoded.planes[0]  # type: ignore[attr-defined]
         height = int(decoded.height)  # type: ignore[attr-defined]
         width = int(decoded.width)  # type: ignore[attr-defined]

@@ -44,8 +44,8 @@ import gtsam
 import numpy as np
 import numpy.typing as npt
 import pytest
+from specialist_camera import MeiParams, mei_project, mei_unproject
 
-from specialist.loader.mei_model import MeiParams, mei_project, mei_unproject
 from tests.mei_fixtures import distorted_omni_params, unit_pixel_noise
 
 try:

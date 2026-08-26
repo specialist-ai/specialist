@@ -14,13 +14,13 @@ import cv2
 import gtsam
 import numpy as np
 import pytest
+from specialist_camera import MeiParams, mei_project, mei_unproject
+from specialist_corpus.fiducials import tag_corners_in_frame
 
-from specialist.loader.mei_model import MeiParams, mei_project, mei_unproject
 from specialist.vi_ba.anchor_detection import (
   TagDetection,
   anchor_pose_from_tags,
   estimate_camera_to_tag_pose,
-  tag_corners_in_frame,
   tag_corners_local,
 )
 
@@ -45,7 +45,7 @@ def _project_tag(
   cam_T_tag: gtsam.Pose3, tag_size: float, params: MeiParams
 ) -> np.ndarray:
   """Project the four tag corners in pupil_apriltags's order (BL, BR, TR, TL)."""
-  return mei_project(tag_corners_in_frame(cam_T_tag, tag_size), params)
+  return mei_project(tag_corners_in_frame(cam_T_tag.matrix(), tag_size), params)
 
 
 def _ippe_solutions(

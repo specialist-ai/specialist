@@ -1,4 +1,4 @@
-"""Shared numpy helpers for the fisheye camera-model loaders (MEI, KB)."""
+"""Row-wise numpy helpers for the projection."""
 
 from __future__ import annotations
 
@@ -16,6 +16,6 @@ def unit_rows(v: Float64Array) -> Float64Array:
 
 
 def require_2d(arr: Float64Array, cols: int, name: str) -> None:
-  """Validate that ``arr`` is ``(N, cols)``; raise ValueError otherwise."""
+  """Validate that ``arr`` is ``(N, cols)``."""
   if arr.ndim != 2 or arr.shape[1] != cols:
     raise ValueError(f"{name} must be (N, {cols}), got {arr.shape}")

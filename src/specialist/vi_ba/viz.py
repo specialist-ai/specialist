@@ -23,15 +23,16 @@ import pyarrow.compute as pc
 import rerun as rr
 import rerun.blueprint as rrb
 from rerun.experimental import Chunk
+from specialist_corpus import schema as record_schema
+from specialist_corpus.poses import quats_to_matrices
 
-from specialist.record import schema as record_schema
 from specialist.vi_ba.blueprint import (
   BODY_AXIS,
   TAG_AXIS,
   TRAJECTORY_TRAIL_DURATION,
   blueprint_for_slots,
 )
-from specialist.vi_ba.geometry import matrices_to_quats, quat_xyzw, quats_to_matrices
+from specialist.vi_ba.geometry import matrices_to_quats, quat_xyzw
 
 Float64Array = npt.NDArray[np.float64]
 

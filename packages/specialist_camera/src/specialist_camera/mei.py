@@ -1,26 +1,27 @@
-"""Pure-numpy Mei unified-omnidirectional projection.
+"""Mei unified-omnidirectional projection (Mei & Rives, 2007).
 
-The Mei model (Mei & Rives, 2007) projects a 3D point onto the unit sphere,
-shifts the sphere center by ``xi`` along the optical axis, then applies a
-pinhole projection with Brown-Conrady distortion. ``xi > 1`` enables the
-super-fisheye regime (fisheye lenses run around ``xi ~ 1.948``).
-
-Distortion order matches the convention stored in Insta360 ``.insv`` lens
-blocks: ``[k1, k2, k3, p1, p2, xi]``.
+A 3D point goes onto the unit sphere, the sphere centre shifts by ``xi`` along
+the optical axis, then a pinhole projection with Brown-Conrady distortion.
+Distortion order is the Insta360 ``.insv`` convention:
+``[k1, k2, k3, p1, p2, xi]``.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from typing import Literal
 
 import numpy as np
 import numpy.typing as npt
 
-from specialist.loader._camera_math import require_2d, unit_rows
+from specialist_camera._math import require_2d, unit_rows
 
 Float64Array = npt.NDArray[np.float64]
 
-__all__ = ["MeiParams", "mei_project", "mei_unproject"]
+__all__ = ["SIDES", "MeiParams", "Side", "mei_project", "mei_unproject", "rescale"]
+
+Side = Literal["front", "rear"]
+SIDES: tuple[Side, Side] = ("front", "rear")
 
 
 @dataclass(frozen=True)
@@ -39,11 +40,29 @@ class MeiParams:
   xi: float
 
 
+def rescale(
+  raw: MeiParams, frame_width: float, decoded_width: int, side: Side
+) -> MeiParams:
+  """Stored intrinsics at the decode resolution.
+
+  ``frame_width`` is the raw stitched width holding both square lenses side by
+  side; the rear lens's ``cx`` is measured from that frame's left edge.
+  """
+  scale = 2.0 * decoded_width / frame_width
+  left_edge = frame_width / 2.0 if side == "rear" else 0.0
+  return replace(
+    raw,
+    fx=raw.fx * scale,
+    fy=raw.fy * scale,
+    cx=(raw.cx - left_edge) * scale,
+    cy=raw.cy * scale,
+  )
+
+
 def mei_project(points_cam: Float64Array, params: MeiParams) -> Float64Array:
   """Project ``(N, 3)`` camera-frame points to ``(N, 2)`` pixel coordinates.
 
-  Points behind the unit-sphere mirror (``z + xi * |X| <= 0``) are returned
-  as NaN — callers decide whether to mask or report them.
+  Points behind the mirror (``z + xi * |X| <= 0``) come back NaN.
   """
   require_2d(points_cam, 3, "points_cam")
   sphere = unit_rows(points_cam)
@@ -64,12 +83,9 @@ def mei_project(points_cam: Float64Array, params: MeiParams) -> Float64Array:
 
 
 def mei_unproject(pixels: Float64Array, params: MeiParams) -> Float64Array:
-  """Lift ``(N, 2)`` pixels back to ``(N, 3)`` unit-sphere bearing vectors.
+  """Lift ``(N, 2)`` pixels to ``(N, 3)`` unit bearings in the camera frame.
 
-  Inverts the distorted-pinhole step iteratively (Newton on the radial
-  polynomial), then inverts the unit-sphere projection. Returns unit vectors
-  in the camera frame; pixels beyond the model's domain (negative
-  discriminant) come back NaN, matching ``mei_project``.
+  Pixels outside the model's domain come back NaN.
   """
   require_2d(pixels, 2, "pixels")
 
@@ -91,12 +107,9 @@ def mei_unproject(pixels: Float64Array, params: MeiParams) -> Float64Array:
       break
 
   r2 = x * x + y * y
-  # Invert the sphere shift: writing the sphere point as
-  # (factor * x, factor * y, factor - xi), unit norm makes factor a root of
-  # factor**2 * (r2 + 1) - 2 * factor * xi + xi**2 - 1 = 0. The larger root is
-  # the sphere intersection the forward projection came from; both roots are
-  # positive once xi > 1. A negative discriminant puts the pixel outside the
-  # model's domain, so the bearing comes back NaN.
+  # factor is the larger root of
+  # factor**2 * (r2 + 1) - 2 * factor * xi + xi**2 - 1 = 0: the sphere
+  # intersection the forward projection came from.
   disc = 1.0 + (1.0 - params.xi * params.xi) * r2
   disc = np.where(disc < 0.0, np.nan, disc)
   factor = (params.xi + np.sqrt(disc)) / (r2 + 1.0)

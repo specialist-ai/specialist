@@ -19,11 +19,11 @@ from pathlib import Path
 from typing import Any
 
 import tyro
+from specialist_corpus import schema
 
 from specialist.loader.audio_sync import sync_two_clips
 from specialist.loader.capture import probe_capture
 from specialist.loader.parse_insv import load_insv
-from specialist.record import schema
 from specialist.record.base import (
   calibration_chunks,
   capture_chunk,
@@ -131,7 +131,7 @@ def main(args: Args) -> None:
       "site": args.site,
     }
     properties: dict[str, dict[str, Any]] = {
-      "base": {key: value for key, value in selectors.items() if value}
+      schema.BASE_PROPERTIES: {key: value for key, value in selectors.items() if value}
     }
     out_path.parent.mkdir(parents=True, exist_ok=True)
     write_base_recording(out_path, args.session_id, video_streams, sidecars, properties)
