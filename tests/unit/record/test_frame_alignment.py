@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 from specialist_corpus import schema
 from specialist_corpus.frames import LensVideo
-from specialist_corpus.read import check_frame_alignment
+from specialist_corpus.read import Recording, check_frame_alignment
 
 from specialist.record.base import write_base_recording
 from specialist.record.session import SessionRecording
@@ -76,7 +76,7 @@ def _grid() -> np.ndarray:
 
 def test_base_holds_every_frame_not_just_the_idr_frames(base_rrd: Path) -> None:
   """The recording carries far more samples than IDR frames."""
-  video = LensVideo(base_rrd, "cam00", "front")
+  video = LensVideo(Recording(base_rrd), "cam00", "front")
   assert len(video.times) == _FRAMES
   assert 0 < len(video.iframe_rows) < _FRAMES
 
