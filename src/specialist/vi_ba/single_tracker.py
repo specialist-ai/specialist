@@ -672,7 +672,6 @@ def prepare_tracker(args: TrackerArgs, tags: GripperTags) -> PreparedTracker:
       body_poses,
       front_lens,
       max(front.kept, default=0),
-      args.frontend,
     )
   # The ORB frames are the last hold on the front lens's descriptors, ~385 kB a
   # keyframe, and nothing past loop closure reads them.

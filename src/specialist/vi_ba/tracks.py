@@ -219,7 +219,6 @@ def loop_closure_tracks(
   body_poses: list[gtsam.Pose3],
   lens: LensSetup,
   base_track_id: int,
-  cfg: FrontendCfg,
 ) -> dict[int, dict[int, Float64Array]]:
   """Recover tracks broken by fast lifts via ORB loop closure.
 

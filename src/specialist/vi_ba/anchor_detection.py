@@ -106,10 +106,14 @@ class TagDetection:
 
 
 def tag_center_bearing(det: TagDetection, params: MeiParams) -> Float64Array:
-  """Lens-frame bearing of a tag's center, the cheirality ray for MEI factors."""
+  """Lens-frame bearing of a tag's center, the cheirality ray for MEI factors.
+  A center the lens cannot unproject yields a zero bearing, which the factors
+  read as "no ray"."""
   bearing = mei_unproject(
     np.asarray(det.center, dtype=np.float64).reshape(1, 2), params
   )[0]
+  if not np.all(np.isfinite(bearing)):
+    return np.zeros(3, dtype=np.float64)
   return np.asarray(bearing, dtype=np.float64)
 
 

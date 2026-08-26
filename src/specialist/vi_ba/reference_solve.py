@@ -94,26 +94,27 @@ def _solve_with_cull_reoptimize(
     )
   first = result
   outlier_keys = _outlier_landmark_keys(trackers, keys, landmark_keep)
-  if not outlier_keys and result.iterations >= _PRECULL_MAX_ITERATIONS:
-    # Nothing to cull, but the ranking solve stopped at its own short budget
-    # rather than converging; finish on the full budget so the export never
-    # carries a deliberately under-iterated result.
-    result = optimize_graph(
-      graph, result.values, max_iterations=max_iterations, gpu=gpu
-    )
   if outlier_keys:
     pruned = _prune_factor_graph(graph, outlier_keys)
     kept_values = gtsam.Values(result.values)
     for key in outlier_keys:
       kept_values.erase(key)
     result = optimize_graph(pruned, kept_values, max_iterations=max_iterations, gpu=gpu)
-    result = replace(
+    print(f"  [solve] cull-reoptimize dropped {len(outlier_keys)} outlier landmarks")
+  elif result.iterations >= _PRECULL_MAX_ITERATIONS:
+    result = optimize_graph(
+      graph, result.values, max_iterations=max_iterations, gpu=gpu
+    )
+  else:
+    return result, landmark_keep
+  return (
+    replace(
       result,
       initial_error=first.initial_error,
       iterations=first.iterations + result.iterations,
-    )
-    print(f"  [solve] cull-reoptimize dropped {len(outlier_keys)} outlier landmarks")
-  return result, landmark_keep
+    ),
+    landmark_keep,
+  )
 
 
 def _solved_body_poses(
