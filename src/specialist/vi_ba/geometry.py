@@ -12,6 +12,7 @@ Float64Array = npt.NDArray[np.float64]
 __all__ = [
   "average_pose",
   "bounding_box_diagonal",
+  "canonical",
   "consensus_pose",
   "matrices_to_quats",
   "max_parallax",
@@ -66,7 +67,7 @@ def _agrees(a: gtsam.Pose3, b: gtsam.Pose3) -> bool:
   )
 
 
-def _canonical(quats: Float64Array) -> Float64Array:
+def canonical(quats: Float64Array) -> Float64Array:
   """Every quaternion as its ``w >= 0`` representative."""
   out: Float64Array = np.where((quats[:, 3] < 0.0)[:, None], -quats, quats)
   return out
@@ -77,13 +78,13 @@ def quat_xyzw(rotation: gtsam.Rot3) -> Float64Array:
   in the ``w >= 0`` half of the double cover."""
   q = rotation.toQuaternion()
   raw = np.array([[q.x(), q.y(), q.z(), q.w()]], dtype=np.float64)
-  out: Float64Array = _canonical(raw)[0]
+  out: Float64Array = canonical(raw)[0]
   return out
 
 
 def matrices_to_quats(matrices: Float64Array) -> Float64Array:
   """Batch rotation matrices to xyzw quaternions, ``(n, 3, 3) -> (n, 4)``."""
-  out: Float64Array = _canonical(Rotation.from_matrix(matrices).as_quat())
+  out: Float64Array = canonical(Rotation.from_matrix(matrices).as_quat())
   return out
 
 

@@ -63,6 +63,18 @@ def test_the_keyframe_bucket_lands_on_the_keyframe_row() -> None:
   assert rows[stride] == 1 and rows[2 * stride] == 2
 
 
+def test_a_state_layer_is_named_by_its_configuration() -> None:
+  """Several configurations sit side by side in one corpus, so the directory
+  carries the numbers; the entities inside do not, because one configuration
+  is registered at a time and a training field addresses one path."""
+  assert schema.state_layer(12, 3) == "state_s12_i3"
+  assert schema.state_layer(3, 3) == "state_s3_i3"
+  assert schema.HANDS == ("left", "right")
+  assert schema.state_image("left") == "state/left/image"
+  assert schema.state_pose("right") == "state/right/pose"
+  assert schema.slot_of(f"/{schema.state_image('left')}") is None
+
+
 def test_a_selector_names_the_field_a_query_addresses() -> None:
   assert (
     schema.selector(schema.state("cam00", "pose"), schema.POSE_TRANSLATION)

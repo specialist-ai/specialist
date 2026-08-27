@@ -29,10 +29,10 @@ from specialist.vi_ba.summary import CameraSummary, Summary
 from specialist.vi_ba.viz import Layers, estimate_chunks
 from specialist.vi_ba.viz_build import RunEstimate
 
-__all__ = ["write_estimate_layers"]
+__all__ = ["git_sha", "write_estimate_layers"]
 
 
-def _git_sha() -> str:
+def git_sha() -> str:
   """The commit this solve ran from, or ``unknown``. Never empty: an empty
   value writes no column."""
   try:
@@ -76,7 +76,7 @@ def _send_run_properties(
     rr.AnyValues(
       **asdict(summary),
       worst_rmse=max(measured) if measured else float("nan"),
-      git_sha=_git_sha(),
+      git_sha=git_sha(),
       estimated_at=estimated_at,
       rerun_version=rr.__version__,
     ),

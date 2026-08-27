@@ -19,6 +19,7 @@ from specialist_camera import Side
 from specialist_corpus import frames, schema
 from specialist_corpus.poses import quats_to_matrices
 from specialist_corpus.read import Recording, lens_from_row
+from specialist_corpus.state import nearest
 
 from specialist.vi_ba.build import LensSetup
 from specialist.vi_ba.imu import ImuSamples
@@ -55,19 +56,14 @@ def nearest_rows(times: Float64Array, grid: Float64Array) -> Int64Array:
   grid = np.asarray(grid, dtype=np.float64)
   if len(times) < 2:
     raise ValueError(f"need at least two frame times, got {len(times)}")
-  pos = np.searchsorted(times, grid)
-  lo = np.clip(pos - 1, 0, len(times) - 1)
-  hi = np.clip(pos, 0, len(times) - 1)
-  rows = np.where(np.abs(times[hi] - grid) < np.abs(times[lo] - grid), hi, lo)
-  deltas = np.abs(times[rows] - grid)
+  rows, deltas = nearest(times, grid)
   half_frame = 0.5 * float(np.median(np.diff(times)))
   if float(deltas.max()) > half_frame:
     raise ValueError(
       f"nearest-PTS match misses the grid by {float(deltas.max()):.4f} s, "
       f"more than half a frame ({half_frame:.4f} s)"
     )
-  out: Int64Array = rows.astype(np.int64)
-  return out
+  return rows
 
 
 def covered_rows(
@@ -129,11 +125,11 @@ class SessionRecording:
     """One lens's encoded samples, ready for banded decoding."""
     return frames.LensVideo(self._recording, slot, side)
 
-  def decoded_shape(self, slot: str) -> tuple[int, int]:
-    """``(height, width)`` of the decoded front-lens frames, from a one-frame
+  def decoded_shape(self, slot: str, side: Side = "front") -> tuple[int, int]:
+    """``(height, width)`` of one lens's decoded frames, from a one-frame
     decode."""
     frame = frames.RecordingKeyframes(
-      self.lens_video(slot, "front"), np.zeros(1, dtype=np.int64), band=1
+      self.lens_video(slot, side), np.zeros(1, dtype=np.int64), band=1
     )[0]
     return int(frame.shape[0]), int(frame.shape[1])
 
@@ -159,6 +155,11 @@ class SessionRecording:
     if not np.array_equal(t_gyro, t_accel):
       raise ValueError(f"{self.path}: gyro and accel rows disagree for {slot}")
     return ImuSamples(t=t_gyro, gyro=gyro, accel=accel)
+
+  @property
+  def started_at(self) -> int:
+    """Nanoseconds since the epoch at the first sample of the capture."""
+    return int(np.asarray(self._recording.property("RecordingInfo")["start_time"])[0])
 
   def imu_to_body(self, slot: str) -> Float64Array:
     """The IMU mounting rotation, raw IMU axes -> body."""

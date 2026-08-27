@@ -5,9 +5,12 @@ A camera slot (``cam00``, ``cam01``, …) is an opaque handle: which physical
 camera, gripper or arm it stands for is recorded as a value and may differ per
 take.
 
-A session is indexed by four clocks:
+A session is indexed by five clocks:
 
 1. ``video_time`` (``TIMELINE``) — seconds on the session clock.
+0. ``step`` (``STEP_TIMELINE``, state layers) — ``round(t * f_step)``, the
+   integer row of the state stream's lattice; the true time stays on
+   ``video_time`` beside it.
 2. Session frame row — ``round(t * fps)``, integer, phase-locked across
    cameras; ``keyframe_index`` maps it to the next clock.
 3. ``keyframe`` timeline bucket — ``ceil(row / stride)`` with
@@ -40,6 +43,7 @@ ESTIMATE_PROPERTIES = "estimate"
 VIZ_PROPERTIES = "viz"
 TIMELINE = "video_time"
 KEYFRAME_TIMELINE = "keyframe"
+STEP_TIMELINE = "step"
 NS_PER_SECOND = 1_000_000_000
 
 CAMERA_ROOT = "camera"
@@ -51,6 +55,13 @@ BASE = "base"
 ESTIMATE = "estimate"
 VIZ = "viz"
 MOCAP = "mocap"
+STATE = "state"
+
+
+def state_layer(scale: int, image_stride: int) -> str:
+  """The directory one state configuration lives in: ``state_s12_i3`` for
+  12 lens pixels per stored pixel and 3 capture frames per stored image."""
+  return f"{STATE}_s{scale}_i{image_stride}"
 
 
 def layer_dir(corpus: Path, layer: str) -> Path:
@@ -123,6 +134,41 @@ def lens_seat(slot: str, side: str) -> str:
 def video(slot: str, side: str) -> str:
   """A lens's encoded frames. A leaf: it carries no temporal children."""
   return f"{lens(slot, side)}/video"
+
+
+HANDS = ("left", "right")
+
+
+def state_hand(hand: str) -> str:
+  """What the policy sees of one hand; which camera it was rides on it as a
+  value."""
+  return f"{STATE}/{hand}"
+
+
+def state_image(hand: str) -> str:
+  """The hand's rear-lens images at the policy's resolution and rate, blanked
+  outside the fisheye disc."""
+  return f"{state_hand(hand)}/image"
+
+
+def state_pose(hand: str) -> str:
+  """The gripper's base-tag frame in the world."""
+  return f"{state_hand(hand)}/pose"
+
+
+def state_lin_vel(hand: str) -> str:
+  """The base-tag origin's velocity in the world frame, m/s."""
+  return f"{state_hand(hand)}/lin_vel"
+
+
+def state_ang_vel(hand: str) -> str:
+  """The gripper's angular velocity in the world frame, rad/s."""
+  return f"{state_hand(hand)}/ang_vel"
+
+
+def state_opening(hand: str) -> str:
+  """The coupled finger joint angle, rad, in the left finger's sign."""
+  return f"{state_hand(hand)}/opening"
 
 
 TAGS_DETECTION = "tags"
