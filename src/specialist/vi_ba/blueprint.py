@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from typing import Any
 
 import numpy as np
@@ -14,6 +14,8 @@ __all__ = [
   "TRAJECTORY_TRAIL_DURATION",
   "blueprint_for_slots",
   "segment_card_blueprint",
+  "state_blueprint",
+  "state_card_blueprint",
 ]
 
 # Seconds the trajectory ribbon trails the cursor; segments and time window share it.
@@ -34,7 +36,7 @@ _KEYFRAME_FPS = 10.0
 
 
 def _panels() -> tuple[rrb.BlueprintPanel, rrb.SelectionPanel, rrb.TimePanel]:
-  """The chrome both blueprints hide, and the clock they open on."""
+  """The chrome every dashboard hides, and the clock they open on."""
   return (
     rrb.BlueprintPanel(state=rrb.PanelState.Collapsed),
     rrb.SelectionPanel(state=rrb.PanelState.Collapsed),
@@ -122,13 +124,37 @@ def _hidden_overlay_overrides(
 
 
 def _without_pixels(slots: list[str]) -> list[str]:
-  """3D-view exclusions: each lens's pixel subtree, never the lens itself."""
+  """3D-view exclusions: lens pixel subtrees and hands' images, never a lens."""
   return [
     f"- /{schema.lens(slot, lens)}/{tail}"
     for slot in slots
     for lens in schema.SIDES
     for tail in ("video", "video/**", "overlay/**", "detection/**")
-  ]
+  ] + [f"- /{schema.state_image(hand)}" for hand in schema.HANDS]
+
+
+def _scene(
+  slots: list[str],
+  anchor_tag_ids: Iterable[int] = (),
+  anchor_tag_size: float = 0.1,
+  overrides: dict[rr.datatypes.EntityPath | str, Any] | None = None,
+) -> rrb.Spatial3DView:
+  """The shared 3D view of triads, anchors and ribbons; ``overrides`` add to these."""
+  hidden = rrb.EntityBehavior(visible=False)
+  all_overrides: dict[rr.datatypes.EntityPath | str, Any] = {**_trail_overrides(slots)}
+  all_overrides.update(_triad_overrides(slots, anchor_tag_ids, anchor_tag_size))
+  all_overrides.update(
+    {f"/{schema.landmark(s, lens)}": hidden for s in slots for lens in schema.SIDES}
+  )
+  all_overrides.update(overrides or {})
+  # Rerun matches a wildcard only as a trailing /**, so every path is literal.
+  return rrb.Spatial3DView(
+    name="3D",
+    origin="/",
+    contents=["+ /**", *_without_pixels(slots)],
+    overrides=all_overrides,
+    eye_controls=rrb.EyeControls3D(spin_speed=_SPIN_SPEED),
+  )
 
 
 def blueprint_for_slots(
@@ -136,14 +162,7 @@ def blueprint_for_slots(
   anchor_tag_ids: Iterable[int] = (),
   anchor_tag_size: float = 0.1,
 ) -> rrb.Blueprint:
-  """One image-pair column per camera and one all-camera plot per diagnostic series."""
-  hidden = rrb.EntityBehavior(visible=False)
-  overrides: dict[rr.datatypes.EntityPath | str, Any] = {**_trail_overrides(slots)}
-  overrides.update(_triad_overrides(slots, anchor_tag_ids, anchor_tag_size))
-  overrides.update(
-    {f"/{schema.landmark(s, lens)}": hidden for s in slots for lens in schema.SIDES}
-  )
-  pixels = _without_pixels(slots)
+  """A 3D view and per-series plots beside one image column per camera."""
   image_columns = [
     rrb.Vertical(
       *(
@@ -161,13 +180,7 @@ def blueprint_for_slots(
   return rrb.Blueprint(
     rrb.Horizontal(
       rrb.Tabs(
-        rrb.Spatial3DView(
-          name="3D",
-          origin="/",
-          contents=["+ /**", *pixels],
-          overrides=overrides,
-          eye_controls=rrb.EyeControls3D(spin_speed=_SPIN_SPEED),
-        ),
+        _scene(slots, anchor_tag_ids, anchor_tag_size),
         rrb.Grid(
           *(
             rrb.TimeSeriesView(
@@ -180,8 +193,91 @@ def blueprint_for_slots(
           name="plots",
         ),
       ),
-      rrb.Horizontal(*image_columns) if len(image_columns) > 1 else image_columns[0],
-      column_shares=[2, max(1, len(slots))],
+      rrb.Horizontal(*image_columns) if len(slots) > 1 else image_columns[0],
+      column_shares=[2, len(slots)],
+    ),
+    *_panels(),
+  )
+
+
+_STATE_PLOTTED: tuple[tuple[str, Callable[[str], str]], ...] = (
+  ("opening", schema.state_opening),
+  ("lin_vel", schema.state_lin_vel),
+  ("ang_vel", schema.state_ang_vel),
+)
+
+
+def state_blueprint(
+  slots: Sequence[str] = (),
+  anchor_tag_ids: Iterable[int] = (),
+  anchor_tag_size: float = 0.1,
+) -> rrb.Blueprint:
+  """Both hands' images beside a 3D view of hand triads and per-series state plots."""
+  return rrb.Blueprint(
+    rrb.Horizontal(
+      rrb.Tabs(
+        _scene(list(slots), anchor_tag_ids, anchor_tag_size, _state_triads()),
+        rrb.Grid(
+          *(
+            rrb.TimeSeriesView(
+              name=metric,
+              origin="/",
+              contents=[f"+ /{entity(hand)}" for hand in schema.HANDS],
+            )
+            for metric, entity in _STATE_PLOTTED
+          ),
+          name="plots",
+        ),
+      ),
+      _hands_column(),
+      column_shares=[3, 1],
+    ),
+    *_panels(),
+  )
+
+
+def _state_triads() -> dict[rr.datatypes.EntityPath | str, Any]:
+  return {
+    f"/{schema.state_pose(hand)}": rr.TransformAxes3D(BODY_AXIS)
+    for hand in schema.HANDS
+  }
+
+
+def _hands_column() -> rrb.Vertical:
+  return rrb.Vertical(
+    *(
+      rrb.Spatial2DView(name=hand, origin=f"/{schema.state_image(hand)}")
+      for hand in schema.HANDS
+    ),
+    name="state",
+  )
+
+
+def segment_card_blueprint(slots: list[str]) -> rrb.Blueprint:
+  """Segment-table card whose 3D view drops pixels, landmark clouds and factor lines."""
+  contents = ["+ /**", *_without_pixels(slots)]
+  for slot in slots:
+    for lens in schema.SIDES:
+      contents.append(f"- /{schema.landmark(slot, lens)}/**")
+    for kind in ("anchor", "cross_camera"):
+      contents.append(f"- /{schema.factor(slot, kind)}/**")
+  return rrb.Blueprint(
+    rrb.Spatial3DView(
+      name="3D", origin="/", contents=contents, overrides=_trail_overrides(slots)
+    ),
+    *_panels(),
+  )
+
+
+def state_card_blueprint(frame_width: int) -> rrb.Blueprint:
+  """Segment-table card of a state catalog dataset: both hands' images side by side."""
+  w = float(frame_width)
+  return rrb.Blueprint(
+    rrb.Spatial2DView(
+      name="state",
+      origin=f"/{schema.STATE}",
+      contents=[f"+ /{schema.state_image(h)}" for h in schema.HANDS],
+      visual_bounds=rrb.VisualBounds2D(x_range=(0.0, 2.0 * w), y_range=(0.0, w)),
     ),
     *_panels(),
   )
@@ -197,20 +293,4 @@ def _trail_window() -> rrb.VisibleTimeRanges:
         end=rrb.TimeRangeBoundary.cursor_relative(),
       )
     ]
-  )
-
-
-def segment_card_blueprint(slots: list[str]) -> rrb.Blueprint:
-  """Segment-table card: the solved bodies and anchors alone."""
-  contents = ["+ /**", *_without_pixels(slots)]
-  for slot in slots:
-    contents.append(f"- /{schema.landmark(slot, 'front')}/**")
-    contents.append(f"- /{schema.landmark(slot, 'rear')}/**")
-    contents.append(f"- /{schema.factor(slot, 'anchor')}/**")
-    contents.append(f"- /{schema.factor(slot, 'cross_camera')}/**")
-  return rrb.Blueprint(
-    rrb.Spatial3DView(
-      name="3D", origin="/", contents=contents, overrides=_trail_overrides(slots)
-    ),
-    *_panels(),
   )

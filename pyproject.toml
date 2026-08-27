@@ -107,6 +107,7 @@ files = [
   "src/specialist",
   "scripts/estimate.py",
   "scripts/convert.py",
+  "scripts/state.py",
   "scripts/register.py",
   "scripts/_probe.py",
   "scripts/imu.py",

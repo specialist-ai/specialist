@@ -21,6 +21,9 @@ ESTIMATE_PROPERTIES = "estimate"
 VIZ_PROPERTIES = "viz"
 TIMELINE = "video_time"
 KEYFRAME_TIMELINE = "keyframe"
+ROW_TIMELINE = "row"
+# An image's own capture instant on the row lattice, a value beside its blob.
+CAPTURE_ROW = "capture_row"
 NS_PER_SECOND = 1_000_000_000
 
 CAMERA_ROOT = "camera"
@@ -31,6 +34,12 @@ BASE = "base"
 ESTIMATE = "estimate"
 VIZ = "viz"
 MOCAP = "mocap"
+STATE = "state"
+
+
+def state_layer(scale: int, f_row: float) -> str:
+  """A state configuration's directory: ``state_s12_r100`` is scale 12 at 100 rows/s."""
+  return f"{STATE}_s{scale}_r{round(f_row)}"
 
 
 def layer_dir(dataset: Path, layer: str) -> Path:
@@ -96,6 +105,39 @@ def lens_seat(slot: str, side: str) -> str:
 def video(slot: str, side: str) -> str:
   """A lens's encoded frames, a leaf with no temporal children."""
   return f"{lens(slot, side)}/video"
+
+
+HANDS = ("left", "right")
+
+
+def state_hand(hand: str) -> str:
+  """What the policy sees of one hand, with the camera slot as a value."""
+  return f"{STATE}/{hand}"
+
+
+def state_image(hand: str) -> str:
+  """Rear-lens images at the policy's resolution, blanked outside the fisheye disc."""
+  return f"{state_hand(hand)}/image"
+
+
+def state_pose(hand: str) -> str:
+  """The gripper's base-tag frame in the world."""
+  return f"{state_hand(hand)}/pose"
+
+
+def state_lin_vel(hand: str) -> str:
+  """The base-tag origin's velocity in the world frame, m/s."""
+  return f"{state_hand(hand)}/lin_vel"
+
+
+def state_ang_vel(hand: str) -> str:
+  """The gripper's angular velocity in the world frame, rad/s."""
+  return f"{state_hand(hand)}/ang_vel"
+
+
+def state_opening(hand: str) -> str:
+  """The coupled finger joint angle, rad, in the left finger's sign."""
+  return f"{state_hand(hand)}/opening"
 
 
 TAGS_DETECTION = "tags"
