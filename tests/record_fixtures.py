@@ -9,6 +9,7 @@ from pathlib import Path
 import gtsam
 import numpy as np
 import numpy.typing as npt
+from scipy.spatial.transform import Rotation
 
 from specialist.loader.audio_sync import resolve_ffmpeg
 from specialist.loader.parse_insv import InsvData
@@ -72,10 +73,11 @@ def encode_clip(
   rate: float = 30.0,
   gop: int | None = None,
   bframes: bool = False,
+  pattern: str = "testsrc",
 ) -> Path:
-  """A tiny H.264 test pattern. ``gop`` sets the keyframe interval; ``bframes``
-  leaves the encoder's B-frames on, so decode order is not presentation
-  order."""
+  """A tiny H.264 clip of one lavfi ``pattern``. ``gop`` sets the keyframe
+  interval; ``bframes`` leaves the encoder's B-frames on, so decode order is not
+  presentation order."""
   options = ([] if gop is None else ["-g", str(gop)]) + (
     [] if bframes else ["-bf", "0"]
   )
@@ -88,7 +90,7 @@ def encode_clip(
       "-f",
       "lavfi",
       "-i",
-      f"testsrc=duration={n_frames / rate}:size=64x64:rate={rate:g}",
+      f"{pattern}=duration={n_frames / rate}:size=64x64:rate={rate:g}",
       "-c:v",
       "libx264",
       "-pix_fmt",
@@ -101,24 +103,41 @@ def encode_clip(
   return path
 
 
-def camera_estimate(slot: str, *, offset: float = 0.0, n: int = 4) -> CameraEstimate:
+# The dense trajectory turns about world z at SPIN rad/s from a body tilted
+# TILT about its own x, so its angular velocity in the world is SPIN about z.
+SPIN = 0.7
+TILT = 0.3
+
+
+def camera_estimate(
+  slot: str,
+  *,
+  offset: float = 0.0,
+  speed: float = 1.0,
+  n: int = 4,
+  rate: float = 1000.0,
+) -> CameraEstimate:
   """One solved camera carrying one of everything a layer can hold: keyframe
   poses on a 10 Hz grid, their velocities, the base-tag frame, the gripper
-  opening, and a landmark in each lens."""
+  opening, and a landmark in each lens. The dense trajectory, sampled at
+  ``rate`` Hz, slides along x at ``speed`` from ``offset`` while it turns."""
   times: npt.NDArray[np.float64] = np.arange(n, dtype=np.float64) * 0.1
   poses = [
     gtsam.Pose3(gtsam.Rot3.Ry(0.05 * i), gtsam.Point3(offset + 0.1 * i, 0.02 * i, 1.0))
     for i in range(n)
   ]
   opening: npt.NDArray[np.float64] = 0.06 - 0.01 * np.arange(n, dtype=np.float64)
-  hr_t = np.linspace(0.0, times[-1], 10 * n + 1)
+  hr_t = np.arange(round(times[-1] * rate) + 1) / rate
   zeros = np.zeros_like(hr_t)
+  turn = Rotation.from_rotvec(np.outer(SPIN * hr_t, [0.0, 0.0, 1.0])) * (
+    Rotation.from_rotvec([TILT, 0.0, 0.0])
+  )
   data = CameraEstimate(
     slot=slot,
     highrate_times=hr_t,
-    highrate_positions=np.stack([hr_t, zeros, zeros], axis=1),
-    highrate_quats=np.tile(np.array([0.0, 0.0, 0.0, 1.0]), (len(hr_t), 1)),
-    highrate_vels=np.ones((len(hr_t), 3)),
+    highrate_positions=np.stack([offset + speed * hr_t, zeros, zeros], axis=1),
+    highrate_quats=turn.as_quat(),
+    highrate_vels=np.tile([speed, 0.0, 0.0], (len(hr_t), 1)),
     body_poses=poses,
     keyframe_times=times,
     keyframe_rows=np.arange(n, dtype=np.int64) * 3,

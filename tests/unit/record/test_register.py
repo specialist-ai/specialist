@@ -8,6 +8,7 @@ from rerun.experimental import Chunk, send_chunks
 from scripts.register import (
   check_layers_attach,
   check_no_collisions,
+  check_state_current,
   corpus_layers,
   recording_id,
 )
@@ -43,6 +44,51 @@ def test_corpus_layers_discovers_by_directory(tmp_path: Path) -> None:
   bases, layers = corpus_layers(tmp_path)
   assert [p.name for p in bases] == ["s1.rrd"]
   assert sorted(layers) == ["estimate", "mocap"]
+
+
+def test_corpus_layers_registers_the_one_state_layer_named(
+  tmp_path: Path,
+) -> None:
+  """Every state configuration writes the same names, so a root holding
+  several registers the one asked for and none when none is asked for."""
+  for name in ("base", "estimate", "state_s12", "state_s8"):
+    _write_rrd((tmp_path / name).mkdir() or tmp_path / name / "s1.rrd", "s1")
+  _, layers = corpus_layers(tmp_path, state="state_s12")
+  assert sorted(layers) == ["estimate", "state_s12"]
+  _, layers = corpus_layers(tmp_path)
+  assert sorted(layers) == ["estimate"]
+  with pytest.raises(SystemExit, match="state_s4"):
+    corpus_layers(tmp_path, state="state_s4")
+
+
+def _stamped(path: Path, name: str, estimated_at: str) -> Path:
+  """A layer stamped with when its estimate was solved."""
+  path.parent.mkdir(parents=True, exist_ok=True)
+  with rr.RecordingStream("test", recording_id=path.stem, send_properties=False) as s:
+    s.save(str(path))
+    s.send_property(name, rr.AnyValues(estimated_at=estimated_at))
+  return path
+
+
+def test_a_state_layer_must_match_the_estimate_beside_it(tmp_path: Path) -> None:
+  solved = "2026-08-27T07:00:00+00:00"
+  _stamped(tmp_path / "estimate" / "s1.rrd", "estimate", solved)
+  _stamped(tmp_path / "estimate" / "s2.rrd", "estimate", solved)
+  fresh = _stamped(tmp_path / "state_s12" / "s1.rrd", "state", solved)
+  stale = _stamped(
+    tmp_path / "state_s12" / "s2.rrd", "state", "2026-08-01T00:00:00+00:00"
+  )
+  check_state_current([fresh], tmp_path)
+  with pytest.raises(SystemExit, match="s2"):
+    check_state_current([fresh, stale], tmp_path)
+
+
+def test_a_state_layer_alone_stands_as_the_segment(tmp_path: Path) -> None:
+  _write_rrd(
+    (tmp_path / "state_s12").mkdir() or tmp_path / "state_s12" / "s1.rrd", "s1"
+  )
+  bases, layers = corpus_layers(tmp_path, state="state_s12")
+  assert bases == [] and sorted(layers) == ["state_s12"]
 
 
 def test_corpus_layers_requires_a_base(tmp_path: Path) -> None:
