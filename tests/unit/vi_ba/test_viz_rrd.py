@@ -462,31 +462,6 @@ def test_a_model_that_fails_to_write_is_not_mistaken_for_a_missing_model(
     )
 
 
-def test_a_viewer_that_cannot_open_does_not_cost_the_run_its_layers(
-  tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-  """A viewer that cannot open still leaves the run's layers written.
-
-  The patch goes on ``rerun.spawn`` itself, which is what the writer calls;
-  patching the helper underneath it does nothing when ``spawn`` returns early,
-  and the writer then probes the viewer port for real.
-  """
-
-  def no_display(**kwargs: object) -> None:
-    raise RuntimeError("no display")
-
-  monkeypatch.setattr("rerun.spawn", no_display)
-  for path in write_run(
-    tmp_path,
-    "sess_headless",
-    _two_cameras(),
-    open_viewer=True,
-    urdf_path=urdf_file(tmp_path),
-    frame_period=1.0 / 30.0,
-  ):
-    assert path.exists()
-
-
 def test_every_number_the_summary_carries_reaches_the_layer(
   estimated_run: tuple[Path, Path],
 ) -> None:

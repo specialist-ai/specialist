@@ -131,7 +131,6 @@ class Args:
 
   output_dir: Path = Path("logs")
   urdf_path: Path | None = None
-  open_viewer: bool = True
   # Replace an existing track for this session; off refuses.
   overwrite: bool = False
 

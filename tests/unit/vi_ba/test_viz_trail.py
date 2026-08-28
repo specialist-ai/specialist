@@ -4,15 +4,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import gtsam
 import numpy as np
 import rerun as rr
 import rerun.blueprint as rrb
 from rerun.experimental import RrdReader
 
 from specialist.vi_ba.blueprint import blueprint_for_slots, segment_card_blueprint
-from specialist.vi_ba.viz import _trail_segments, run_blueprint
-from tests.record_fixtures import camera_estimate
+from specialist.vi_ba.viz import _trail_segments
 
 
 def test_each_sample_carries_the_step_that_reached_it() -> None:
@@ -70,16 +68,6 @@ def test_the_written_blueprint_carries_an_override_for_every_anchor(
   assert any(p.endswith("world/anchor/7/visualizers") for p in drawn), sorted(drawn)
   bare = _visualized(blueprint_for_slots(["cam00"]), tmp_path / "without.rrd")
   assert not any("anchor" in p for p in bare)
-
-
-def test_the_live_dashboard_draws_the_anchors_the_run_solved(tmp_path: Path) -> None:
-  """The blueprint the viewer gets after a solve is built from the run, so it
-  carries the anchors the solve placed."""
-  drawn = _visualized(
-    run_blueprint([camera_estimate("cam00")], {7: gtsam.Pose3()}.keys(), 0.1),
-    tmp_path / "live.rrd",
-  )
-  assert any(p.endswith("world/anchor/7/visualizers") for p in drawn), sorted(drawn)
 
 
 def test_every_view_that_draws_the_ribbon_sets_the_window(tmp_path: Path) -> None:

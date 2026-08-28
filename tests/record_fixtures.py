@@ -194,7 +194,6 @@ def write_run(
   per_camera: list[CameraSummary] | None = None,
   summary: Summary | None = None,
   urdf_path: Path,
-  open_viewer: bool = False,
   frame_period: float,
 ) -> tuple[Path, Path]:
   """Write both layers of a solved run under ``root`` in the corpus layout, and
@@ -230,7 +229,6 @@ def write_run(
     urdf_path=urdf_path,
     frame_period=frame_period,
     timeline_start=0.0,
-    open_viewer=open_viewer,
   )
   return estimate_path, viz_path
 
