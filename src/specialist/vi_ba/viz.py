@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Callable, Iterable
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -14,7 +14,6 @@ import numpy.typing as npt
 import pyarrow as pa
 import pyarrow.compute as pc
 import rerun as rr
-import rerun.blueprint as rrb
 from rerun.experimental import Chunk
 from specialist_dataset import schema
 from specialist_dataset.poses import quats_to_matrices
@@ -23,7 +22,6 @@ from specialist.vi_ba.blueprint import (
   BODY_AXIS,
   TAG_AXIS,
   TRAJECTORY_TRAIL_DURATION,
-  blueprint_for_slots,
 )
 from specialist.vi_ba.geometry import matrices_to_quats, quat_xyzw
 
@@ -44,7 +42,6 @@ __all__ = [
   "CameraEstimate",
   "Layers",
   "estimate_chunks",
-  "run_blueprint",
 ]
 
 
@@ -407,19 +404,6 @@ class CameraEstimate:
   joint_tags: dict[str, int] = field(default_factory=dict)
   # Gripper opening at the pinned finger cadence, as (times, meters).
   gripper_opening: tuple[Float64Array, Float64Array] | None = None
-
-
-def _gripper_points(data: CameraEstimate) -> Float64Array:
-  """Per-keyframe URDF root positions shifted by the gripper keypoint offset."""
-  offset = np.asarray(data.trajectory_offset_in_gripper, dtype=np.float64)
-  roots = [pose.compose(data.body_T_base_tag) for pose in data.body_poses]
-  return np.stack(
-    [
-      np.asarray(p.translation(), dtype=np.float64)
-      + np.asarray(p.rotation().matrix(), dtype=np.float64) @ offset
-      for p in roots
-    ]
-  )
 
 
 def _send_joint_transform(
@@ -935,21 +919,6 @@ _TRAJECTORY_PALETTE = (
   (220, 90, 200),
   _CYAN,
 )
-
-
-def run_blueprint(
-  cameras: list[CameraEstimate],
-  anchor_tag_ids: Iterable[int],
-  anchor_tag_size: float,
-) -> rrb.Blueprint:
-  """A solved run's dashboard, its floor grid at the lowest trajectory point."""
-  depths = [float(pts[:, 2].min()) for pts in map(_gripper_points, cameras) if len(pts)]
-  return blueprint_for_slots(
-    [c.slot for c in cameras],
-    min(depths) if depths else None,
-    anchor_tag_ids=anchor_tag_ids,
-    anchor_tag_size=anchor_tag_size,
-  )
 
 
 def estimate_chunks(
