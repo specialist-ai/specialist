@@ -108,7 +108,7 @@ files = [
   "scripts/estimate.py",
   "scripts/convert.py",
   "scripts/state.py",
-  "scripts/register.py",
+  "scripts/catalog.py",
   "scripts/_probe.py",
   "scripts/imu.py",
   "scripts/video_imu_timing.py",

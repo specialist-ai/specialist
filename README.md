@@ -66,11 +66,10 @@ need a full `.insv` skip cleanly when no capture is present.
 
 A session goes through four steps. The raw captures convert once into a base
 recording; every solve reads that recording and writes its two layers beside
-it; the state layer distils both into what a policy trains on;
-registration puts them all on a catalog. Records are laid out layer-first —
-one directory per layer, one file per session — so a whole layer registers
-with one glob and any layer can be refetched or regenerated without touching
-the rest:
+it; the state layer distils both into what a policy trains on and is the one
+layer a catalog serves. Records are laid out layer-first — one directory per
+layer, one file per session — so any layer can be refetched or regenerated
+without touching the rest:
 
 ```
 base/<session-id>.rrd          # remuxed per-lens video, IMU, calibration, offsets
@@ -120,7 +119,8 @@ meshes and the diagnostic scalars. Re-running a session refuses to overwrite
 either unless `--overwrite` is passed, so point experimental runs at their own
 `--output-dir`. To look at a session, load the layers beside their base — the
 shared id merges them — with
-`uv run rerun logs/base/<id>.rrd logs/estimate/<id>.rrd logs/viz/<id>.rrd`.
+`uv run rerun logs/blueprints/specialist.rbl logs/base/<id>.rrd
+logs/estimate/<id>.rrd logs/viz/<id>.rrd`.
 
 **3. State.** The layer holds the session's state, keyed by hand:
 *proprioceptive* — each hand's pose, twist and finger opening — and *object*,
@@ -159,20 +159,21 @@ entities inside are spelled the same in every one. The recording property
 captured, solved and written; how the layer was made rides on the `state`
 entity.
 
-**4. Register** (optional) the layers on a Rerun catalog, which installs the
-standard dashboard as the catalog dataset default. A layer whose recording id matches
-no base segment is refused; a layer attaches only to the base segment that
-shares its recording id. A root holding state layers registers the one
-`--state state_s12_r100` names and skips the rest, refusing one older than the
-estimate beside it. `--state` builds a training catalog dataset: the state layer as
-the segments themselves and nothing else, with the state dashboard - the two
-hands' images beside a 3D view of their base-tag frames and the state plots,
-written to `logs/blueprints/state.rbl` - as the default, and both hands'
-images side by side as the segment-table card.
+**4. Register** (optional) one state configuration on a Rerun catalog, for
+dataset inspection and training. The catalog dataset holds the state layer
+alone - the configuration's directory is the one argument, refusing a second
+configuration on a catalog dataset that already holds one; the catalog
+dataset is named after the dataset directory unless `--dataset` says
+otherwise - with the state dashboard (the two hands' images beside a 3D view
+of their base-tag frames and the state plots, written to
+`logs/blueprints/state.rbl`) as the default and both hands' images side by
+side as the segment-table card. Every other layer is opened per session,
+straight from its files, under `logs/blueprints/specialist.rbl`, which every
+solve refreshes.
 
 ```
-uv run python scripts/register.py --catalog-url rerun+http://host:port \
-  --dataset <catalog-dataset> --root logs
+uv run python scripts/catalog.py logs/state_s12_r100 \
+  --catalog-url rerun+http://host:port
 ```
 
 ## Layout
@@ -195,7 +196,7 @@ src/specialist/
 scripts/
 ├── convert.py          captures → one session base recording
 ├── estimate.py         the VI-BA driver (N ≥ 1 cameras) → estimate + viz layers
-├── register.py         a layer-first dataset root → a Rerun catalog dataset
+├── catalog.py          a dataset's state layer → a Rerun catalog dataset
 ├── imu.py              IMU rate / noise / Allan-deviation probe
 ├── video_imu_timing.py video↔IMU clock + rolling-shutter probe
 ```

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable
 from typing import Any
 
 import numpy as np
@@ -13,7 +13,6 @@ from specialist_dataset import schema
 __all__ = [
   "TRAJECTORY_TRAIL_DURATION",
   "blueprint_for_slots",
-  "segment_card_blueprint",
   "state_blueprint",
   "state_card_blueprint",
 ]
@@ -207,16 +206,12 @@ _STATE_PLOTTED: tuple[tuple[str, Callable[[str], str]], ...] = (
 )
 
 
-def state_blueprint(
-  slots: Sequence[str] = (),
-  anchor_tag_ids: Iterable[int] = (),
-  anchor_tag_size: float = 0.1,
-) -> rrb.Blueprint:
+def state_blueprint() -> rrb.Blueprint:
   """Both hands' images beside a 3D view of hand triads and per-series state plots."""
   return rrb.Blueprint(
     rrb.Horizontal(
       rrb.Tabs(
-        _scene(list(slots), anchor_tag_ids, anchor_tag_size, _state_triads()),
+        _scene([], overrides=_state_triads()),
         rrb.Grid(
           *(
             rrb.TimeSeriesView(
@@ -250,22 +245,6 @@ def _hands_column() -> rrb.Vertical:
       for hand in schema.HANDS
     ),
     name="state",
-  )
-
-
-def segment_card_blueprint(slots: list[str]) -> rrb.Blueprint:
-  """Segment-table card whose 3D view drops pixels, landmark clouds and factor lines."""
-  contents = ["+ /**", *_without_pixels(slots)]
-  for slot in slots:
-    for lens in schema.SIDES:
-      contents.append(f"- /{schema.landmark(slot, lens)}/**")
-    for kind in ("anchor", "cross_camera"):
-      contents.append(f"- /{schema.factor(slot, kind)}/**")
-  return rrb.Blueprint(
-    rrb.Spatial3DView(
-      name="3D", origin="/", contents=contents, overrides=_trail_overrides(slots)
-    ),
-    *_panels(),
   )
 
 
