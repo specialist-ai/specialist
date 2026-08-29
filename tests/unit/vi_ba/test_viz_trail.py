@@ -91,7 +91,7 @@ def _overrides(blueprint: rrb.Blueprint, rrd: Path, view: str) -> set[tuple[str,
 
 
 def test_the_state_dashboard_shows_each_hand_by_name(tmp_path: Path) -> None:
-  views = _views(state_blueprint(["cam00"]), tmp_path / "o.rrd")
+  views = _views(state_blueprint(), tmp_path / "o.rrd")
   assert views["left"] == "/state/left/image"
   assert views["right"] == "/state/right/image"
   assert not any(o.endswith(("/front", "/rear")) for o in views.values())
@@ -105,24 +105,12 @@ def test_the_state_card_is_one_pane_over_both_hands(tmp_path: Path) -> None:
   assert views == {"state": "/state"}
 
 
-def test_the_state_dashboard_keeps_the_standard_scene(tmp_path: Path) -> None:
-  """Every override the standard 3D view sets, hidden landmarks and anchor
-  outlines included, the state dashboard sets too, plus a triad on each
-  hand."""
-  plain = _overrides(
-    blueprint_for_slots(["cam00"], anchor_tag_ids=[7], anchor_tag_size=0.1),
-    tmp_path / "p.rrd",
-    "3D",
-  )
-  state = _overrides(
-    state_blueprint(["cam00"], anchor_tag_ids=[7], anchor_tag_size=0.1),
-    tmp_path / "o.rrd",
-    "3D",
-  )
-  assert ("camera/cam00/landmark/front", "EntityBehavior:visible") in plain
-  assert ("world/anchor/7", "LineStrips3D:strips") in plain
-  assert plain <= state
-  assert ("state/left/pose", "TransformAxes3D:axis_length") in state
+def test_the_state_dashboard_puts_a_triad_on_each_hand(tmp_path: Path) -> None:
+  """The 3D view draws each hand's base-tag frame; a bare ``Transform3D``
+  draws nothing, so the triad is an explicit override."""
+  overridden = _overrides(state_blueprint(), tmp_path / "s.rrd", "3D")
+  for hand in ("left", "right"):
+    assert ("state/" + hand + "/pose", "TransformAxes3D:axis_length") in overridden
 
 
 def _visualized(blueprint: rrb.Blueprint, rrd: Path) -> set[str]:
