@@ -30,6 +30,7 @@ from specialist_corpus import schema
 from specialist.record.layer import write_estimate_layers
 from specialist.record.session import SessionRecording
 from specialist.vi_ba.anchor_detection import configure_detector
+from specialist.vi_ba.blueprint import blueprint_for_slots
 from specialist.vi_ba.compose import (
   TrackerKeys,
   anchored_keyframes,
@@ -235,7 +236,17 @@ def main(args: Args) -> None:
     urdf_path=urdf_path,
     session_id=session.session_id,
   )
-  print(f"Wrote {rrd_path} and {viz_path}")
+  # The dashboard for sessions opened straight from their files, refreshed by
+  # every solve so it always matches the layers beside it.
+  blueprints_dir = args.output_dir / "blueprints"
+  blueprints_dir.mkdir(parents=True, exist_ok=True)
+  rbl = blueprints_dir / "specialist.rbl"
+  blueprint_for_slots(
+    [c.slot for c in estimate.cameras],
+    anchor_tag_ids=sorted(estimate.anchor_poses_world),
+    anchor_tag_size=args.anchor.tag_size,
+  ).save(schema.APPLICATION_ID, str(rbl))
+  print(f"Wrote {rrd_path}, {viz_path} and {rbl}")
 
 
 if __name__ == "__main__":
