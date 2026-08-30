@@ -1,6 +1,6 @@
-"""Catalog a corpus's state layer as a Rerun dataset.
+"""Register a state layer as a Rerun catalog dataset.
 
-The catalog serves corpus inspection and training, and a training dataset
+The catalog serves inspection and training, and a training dataset
 holds the state layer alone: ``state_<cfg>/<session>.rrd`` registers as the
 segments themselves, with the state dashboard as the default and both hands'
 frames side by side as the segment-table card. Every other layer is opened
@@ -10,7 +10,7 @@ per session, straight from its files:
         <root>/estimate/<id>.rrd <root>/viz/<id>.rrd
 
 Usage:
-    uv run python scripts/catalog.py corpus/state_s12_i3 \
+    uv run python scripts/catalog.py dataset/state_s12_i3 \
         --catalog-url rerun+http://host:port
 """
 
@@ -24,8 +24,8 @@ from pathlib import Path
 
 import tyro
 from rerun.catalog import CatalogClient, DatasetEntry, OnDuplicateSegmentLayer
-from specialist_corpus.read import Recording
-from specialist_corpus.schema import (
+from specialist_dataset.read import Recording
+from specialist_dataset.schema import (
   APPLICATION_ID,
   HANDS,
   POSE_TRANSLATION,
@@ -40,12 +40,12 @@ from specialist.vi_ba.blueprint import state_blueprint, state_card_blueprint
 class Args:
   """Catalog registration of one state configuration."""
 
-  # One configuration's directory, e.g. corpus/state_s12_i3. The directory
+  # One configuration's directory, e.g. dataset/state_s12_i3. The directory
   # name is the configuration, and the blueprints land beside it.
   state: tyro.conf.Positional[Path]
   # The catalog server, e.g. rerun+http://host:port.
   catalog_url: str
-  # Dataset to register into, created if absent; the corpus directory's name
+  # Dataset to register into, created if absent; the dataset root's name
   # unless given.
   dataset: str | None = None
 

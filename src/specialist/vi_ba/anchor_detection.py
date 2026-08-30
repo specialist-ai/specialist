@@ -15,7 +15,7 @@ import numpy as np
 import numpy.typing as npt
 from pupil_apriltags import Detector
 from specialist_camera import MeiParams, mei_project, mei_unproject
-from specialist_corpus.fiducials import TAG_FAMILY, tag_corners_local
+from specialist_dataset.fiducials import TAG_FAMILY, tag_corners_local
 
 from specialist.vi_ba.features import cpu_budget
 

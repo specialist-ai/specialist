@@ -64,14 +64,14 @@ def state_layer(scale: int, image_stride: int) -> str:
   return f"{STATE}_s{scale}_i{image_stride}"
 
 
-def layer_dir(corpus: Path, layer: str) -> Path:
-  """Where one layer's recordings sit in a layer-first corpus."""
-  return corpus / layer
+def layer_dir(root: Path, layer: str) -> Path:
+  """Where one layer's recordings sit in a layer-first dataset."""
+  return root / layer
 
 
-def layer_rrd(corpus: Path, layer: str, session: str) -> Path:
-  """Where one session's layer sits in a layer-first corpus."""
-  return layer_dir(corpus, layer) / f"{session}.rrd"
+def layer_rrd(root: Path, layer: str, session: str) -> Path:
+  """Where one session's layer sits in a layer-first dataset."""
+  return layer_dir(root, layer) / f"{session}.rrd"
 
 
 def camera_slots(serials: Sequence[str]) -> list[str]:

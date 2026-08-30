@@ -8,7 +8,7 @@ import gtsam
 import numpy as np
 import pytest
 from specialist_camera import MeiParams, mei_project
-from specialist_corpus.fiducials import tag_corners_in_frame
+from specialist_dataset.fiducials import tag_corners_in_frame
 
 from specialist.vi_ba.anchor_detection import (
   TagDetection,

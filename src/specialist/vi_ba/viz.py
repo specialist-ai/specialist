@@ -4,7 +4,7 @@ biases, gripper, landmarks, tags, reprojections, URDF, ...) under that camera's
 slot, handing each chunk to a sink as it is made; the layer writer in
 ``specialist.record.layer`` decides which file each one belongs in.
 
-Every path is minted by ``specialist_corpus.schema``, which is the only place
+Every path is minted by ``specialist_dataset.schema``, which is the only place
 that decides what an entity is called."""
 
 from __future__ import annotations
@@ -22,8 +22,8 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import rerun as rr
 from rerun.experimental import Chunk
-from specialist_corpus import schema as record_schema
-from specialist_corpus.poses import quats_to_matrices
+from specialist_dataset import schema as record_schema
+from specialist_dataset.poses import quats_to_matrices
 
 from specialist.vi_ba.blueprint import (
   BODY_AXIS,

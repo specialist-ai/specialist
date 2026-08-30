@@ -3,7 +3,7 @@ trace-only quaternion formula loses the vector part."""
 
 import gtsam
 import numpy as np
-from specialist_corpus.poses import quats_to_matrices
+from specialist_dataset.poses import quats_to_matrices
 
 from specialist.vi_ba.geometry import (
   average_pose,

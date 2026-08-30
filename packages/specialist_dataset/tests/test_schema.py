@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-from specialist_corpus import schema
+from specialist_dataset import schema
 
 
 def test_the_slot_is_the_serial_rank_not_the_argument_order() -> None:
@@ -48,7 +48,7 @@ def test_the_keyframe_bucket_lands_on_the_keyframe_row() -> None:
 
 
 def test_a_state_layer_is_named_by_its_configuration() -> None:
-  """Several configurations sit side by side in one corpus, so the directory
+  """Several configurations sit side by side in one dataset root, so the directory
   carries the numbers; the entities inside do not, because one configuration
   is registered at a time and a training field addresses one path."""
   assert schema.state_layer(12, 3) == "state_s12_i3"

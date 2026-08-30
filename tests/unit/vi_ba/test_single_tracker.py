@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 import gtsam
 import numpy as np
 from specialist_camera import mei_project
-from specialist_corpus import schema
+from specialist_dataset import schema
 
 from specialist.vi_ba.build import LensSetup
 from specialist.vi_ba.configs import FrontendCfg

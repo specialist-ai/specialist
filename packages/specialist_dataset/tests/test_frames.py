@@ -5,8 +5,8 @@ from pathlib import Path
 import pytest
 import rerun as rr
 from rerun.experimental import Chunk, send_chunks
-from specialist_corpus import frames, schema
-from specialist_corpus.read import Recording
+from specialist_dataset import frames, schema
+from specialist_dataset.read import Recording
 
 
 def _base_with_video(tmp_path: Path, *, keyframes: bool) -> Path:

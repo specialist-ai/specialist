@@ -19,7 +19,7 @@ dependencies = [
   "allantools>=2024.6",
   "robot-descriptions",
   "specialist-camera",
-  "specialist-corpus",
+  "specialist-dataset",
   # Wheel-bundled static ffmpeg: audio sync needs no system install.
   "imageio-ffmpeg>=0.5",
 ]
@@ -63,7 +63,7 @@ default-groups = ["dev", "gpu"]
 [tool.uv.sources]
 robot-descriptions = { git = "ssh://git@github.com/T-K-233/specialist_description.git" }
 specialist-camera = { workspace = true }
-specialist-corpus = { workspace = true }
+specialist-dataset = { workspace = true }
 # CUDA 12.9 builds: Blackwell (sm_120) kernels, on the CUDA 12 toolkit the
 # cuDSS solver wheel pins. The CUDA 13 builds are unsatisfiable alongside it.
 torch = [{ index = "pytorch-cu129", marker = "sys_platform == 'linux'" }]
@@ -106,7 +106,7 @@ python_version = "3.12"
 strict = true
 files = [
   "packages/specialist_camera/src/specialist_camera",
-  "packages/specialist_corpus/src/specialist_corpus",
+  "packages/specialist_dataset/src/specialist_dataset",
   "src/specialist",
   "scripts/estimate.py",
   "scripts/convert.py",
@@ -121,7 +121,7 @@ files = [
 mypy_path = [
   "src",
   "packages/specialist_camera/src",
-  "packages/specialist_corpus/src",
+  "packages/specialist_dataset/src",
 ]
 explicit_package_bases = true
 # The vendored DIS kernels are untyped research code.

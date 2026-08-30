@@ -1,4 +1,4 @@
-"""Query a corpus layer: what a recording holds, as numpy.
+"""Query a dataset layer: what a recording holds, as numpy.
 
 Columns are addressed by the selectors ``schema`` mints.
 """
@@ -16,8 +16,8 @@ import pyarrow as pa
 import rerun as rr
 from specialist_camera import MeiParams, Side, rescale
 
-from specialist_corpus import schema
-from specialist_corpus.poses import matrices_from_poses, quats_to_matrices
+from specialist_dataset import schema
+from specialist_dataset.poses import matrices_from_poses, quats_to_matrices
 
 Float64Array = npt.NDArray[np.float64]
 
@@ -30,7 +30,7 @@ __all__ = [
 ]
 
 # Past this, a keyframe pairs its overlays with the wrong video frame.
-_DATASET = "corpus"
+_DATASET = "recording"
 _ANCHOR = re.compile(rf"/{schema.WORLD}/anchor/(\d+):")
 
 
@@ -53,7 +53,7 @@ def _rows_with(table: pa.Table, column: str) -> pa.Table:
 
 
 class Recording:
-  """One layer of a corpus, open for queries.
+  """One layer of a dataset, open for queries.
 
   Dropping it closes the dataset, so a reader holds it for as long as it reads.
   """

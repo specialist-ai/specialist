@@ -45,7 +45,7 @@ def test_frame_angles_recover_a_dense_synthetic_motion() -> None:
   resolution, with undetected frames absent."""
   import gtsam
   from specialist_camera import MeiParams, mei_project
-  from specialist_corpus.fiducials import tag_corners_in_frame
+  from specialist_dataset.fiducials import tag_corners_in_frame
 
   from specialist.vi_ba.anchor_detection import TagDetection
   from specialist.vi_ba.build import LensSetup

@@ -15,7 +15,7 @@ import numpy as np
 import numpy.typing as npt
 import rerun as rr
 from rerun.experimental import Chunk, LazyChunkStream, OptimizationProfile, send_chunks
-from specialist_corpus import schema
+from specialist_dataset import schema
 
 from specialist.loader.parse_insv import InsvData
 from specialist.vi_ba.extrinsics import LensOffset, parse_insv_extrinsics

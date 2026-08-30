@@ -15,7 +15,7 @@ prerelease-mode = "allow"
 members = [
     "specialist",
     "specialist-camera",
-    "specialist-corpus",
+    "specialist-dataset",
 ]
 
 [[package]]
@@ -1390,7 +1390,7 @@ dependencies = [
     { name = "robot-descriptions" },
     { name = "scipy" },
     { name = "specialist-camera" },
-    { name = "specialist-corpus" },
+    { name = "specialist-dataset" },
     { name = "telemetry-parser" },
     { name = "tyro" },
 ]
@@ -1424,7 +1424,7 @@ requires-dist = [
     { name = "robot-descriptions", git = "ssh://git@github.com/T-K-233/specialist_description.git" },
     { name = "scipy", specifier = ">=1.11" },
     { name = "specialist-camera", editable = "packages/specialist_camera" },
-    { name = "specialist-corpus", editable = "packages/specialist_corpus" },
+    { name = "specialist-dataset", editable = "packages/specialist_dataset" },
     { name = "telemetry-parser", specifier = ">=0.3" },
     { name = "tyro", specifier = ">=0.9" },
 ]
@@ -1457,9 +1457,9 @@ dependencies = [
 requires-dist = [{ name = "numpy", specifier = ">=1.26" }]
 
 [[package]]
-name = "specialist-corpus"
+name = "specialist-dataset"
 version = "0.1.0"
-source = { editable = "packages/specialist_corpus" }
+source = { editable = "packages/specialist_dataset" }
 dependencies = [
     { name = "av" },
     { name = "datafusion" },

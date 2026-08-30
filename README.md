@@ -67,7 +67,7 @@ need a full `.insv` skip cleanly when no capture is present.
 A session goes through four steps. The raw captures convert once into a base
 recording; every solve reads that recording and writes its two layers beside
 it; the state layer distils both into what a policy trains on and is the one
-layer a catalog serves. Records are laid out layer-first — one directory per
+layer a catalog serves. Recordings are laid out layer-first — one directory per
 layer, one file per session — so any layer can be refetched or regenerated
 without touching the rest:
 
@@ -153,17 +153,17 @@ uv run python scripts/state.py --base logs/base/<session-id>.rrd --output-dir lo
 ```
 
 The layer lands in `logs/state_s12_i3/<session-id>.rrd`: the directory names
-the configuration, so several sit side by side in one corpus, while the
+the configuration, so several sit side by side in one dataset root, while the
 entities inside are spelled the same in every one. The recording property
 `state` records the configuration, the row rate, and when the session was
 captured, solved and written; how the layer was made rides on the `state`
 entity.
 
 **4. Register** (optional) one state configuration on a Rerun catalog, for
-corpus inspection and training. The dataset holds the state layer alone -
+inspection and training. The catalog dataset holds the state layer alone -
 the configuration's directory is the one argument, refusing a second
 configuration on a dataset that already holds one; the dataset is named after
-the corpus directory unless `--dataset` says otherwise - with the state dashboard (the two hands' images beside a 3D view of
+the dataset root unless `--dataset` says otherwise - with the state dashboard (the two hands' images beside a 3D view of
 their base-tag frames and the state plots, written to
 `logs/blueprints/state.rbl`) as the default and both hands' images side by
 side as the segment-table card. Every other layer is opened per session,
@@ -195,7 +195,7 @@ src/specialist/
 scripts/
 ├── convert.py          captures → one session base recording
 ├── estimate.py         the VI-BA driver (N ≥ 1 cameras) → estimate + viz layers
-├── catalog.py          a corpus's state layer → a Rerun catalog dataset
+├── catalog.py          a state layer → a Rerun catalog dataset
 ├── imu.py              IMU rate / noise / Allan-deviation probe
 ├── video_imu_timing.py video↔IMU clock + rolling-shutter probe
 ```

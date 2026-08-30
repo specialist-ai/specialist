@@ -23,7 +23,7 @@ import gtsam
 import numpy as np
 import numpy.typing as npt
 from specialist_camera import MeiParams
-from specialist_corpus.fiducials import tag_corners_local
+from specialist_dataset.fiducials import tag_corners_local
 
 from specialist.vi_ba.anchor_detection import (
   TagDetection,

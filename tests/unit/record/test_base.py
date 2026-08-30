@@ -6,7 +6,7 @@ from typing import Any
 import numpy as np
 import pytest
 from rerun.experimental import Chunk, LazyChunkStream, RrdReader
-from specialist_corpus import schema
+from specialist_dataset import schema
 
 from specialist.record.base import (
   calibration_chunks,

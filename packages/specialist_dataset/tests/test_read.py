@@ -5,8 +5,8 @@ from pathlib import Path
 import pytest
 import rerun as rr
 from rerun.experimental import Chunk, send_chunks
-from specialist_corpus import schema
-from specialist_corpus.read import Recording, lens_from_row
+from specialist_dataset import schema
+from specialist_dataset.read import Recording, lens_from_row
 
 
 def _lens_chunk() -> Chunk:

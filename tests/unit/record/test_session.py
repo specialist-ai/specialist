@@ -10,8 +10,8 @@ import gtsam
 import numpy as np
 import pytest
 from rerun.experimental import RrdReader
-from specialist_corpus import schema
-from specialist_corpus.frames import RecordingKeyframes
+from specialist_dataset import schema
+from specialist_dataset.frames import RecordingKeyframes
 
 from specialist.record.base import (
   IMU_TO_BODY,

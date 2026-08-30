@@ -9,8 +9,8 @@ from importlib.metadata import packages_distributions
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent.parent
-_SOURCE = _ROOT / "src" / "specialist_corpus"
-_OWN = "specialist_corpus"
+_SOURCE = _ROOT / "src" / "specialist_dataset"
+_OWN = "specialist_dataset"
 # rerun-sdk ships its module inside a ``rerun_sdk`` directory.
 _ALIASES = {"rerun": "rerun_sdk"}
 

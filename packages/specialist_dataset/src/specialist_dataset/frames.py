@@ -11,8 +11,8 @@ import numpy as np
 import numpy.typing as npt
 import pyarrow as pa
 
-from specialist_corpus import schema
-from specialist_corpus.read import Recording
+from specialist_dataset import schema
+from specialist_dataset.read import Recording
 
 Float64Array = npt.NDArray[np.float64]
 Int64Array = npt.NDArray[np.int64]

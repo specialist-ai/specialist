@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 import tyro
-from specialist_corpus import schema
+from specialist_dataset import schema
 
 from specialist.loader.audio_sync import sync_two_clips
 from specialist.loader.capture import probe_capture
@@ -42,7 +42,7 @@ class Args:
   input_insvs: tuple[Path, ...]
   # Recording id shared by this session's base recording and its layers.
   session_id: str
-  # Corpus root; the base recording lands as ``base/<session-id>.rrd``.
+  # Dataset root; the base recording lands as ``base/<session-id>.rrd``.
   output_dir: Path = Path("logs")
   # Where the remuxed per-lens MP4s stage; needs roughly the session's video
   # size free until the write finishes.
@@ -54,7 +54,7 @@ class Args:
   overwrite: bool = False
 
   # Catalog selectors, stored as segment properties so a query can narrow the
-  # corpus before opening any recording.
+  # dataset before opening any recording.
   task: str = ""
   date: str = ""
   operator: str = ""

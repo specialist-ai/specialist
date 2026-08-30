@@ -26,8 +26,8 @@ the session was captured, solved and written; how the layer was made rides on
 the ``state`` entity.
 
 Usage:
-    uv run python scripts/state.py --base corpus/base/<session-id>.rrd \
-        --output-dir corpus
+    uv run python scripts/state.py --base dataset/base/<session-id>.rrd \
+        --output-dir dataset
 """
 
 from __future__ import annotations
@@ -47,10 +47,10 @@ import tyro
 from rerun.experimental import Chunk, LazyChunkStream, OptimizationProfile, send_chunks
 from scipy.spatial.transform import Rotation
 from specialist_camera import MASK_RADIUS, to_image
-from specialist_corpus import schema
-from specialist_corpus.frames import LensVideo, decode_rows
-from specialist_corpus.read import Recording, read_keyframe_poses
-from specialist_corpus.state import finger, hands, image_rows, lattice_mean, opening
+from specialist_dataset import schema
+from specialist_dataset.frames import LensVideo, decode_rows
+from specialist_dataset.read import Recording, read_keyframe_poses
+from specialist_dataset.state import finger, hands, image_rows, lattice_mean, opening
 
 from specialist.record.layer import git_sha
 from specialist.record.session import SessionRecording, fps_from_times
@@ -82,7 +82,7 @@ class Args:
   # the base.
   estimate: Path | None = None
 
-  # Corpus root; the layer lands as state_s<scale>_i<image-stride>/<session-id>.rrd.
+  # Dataset root; the layer lands as state_s<scale>_i<image-stride>/<session-id>.rrd.
   output_dir: Path = Path("logs")
 
   # Lens pixels per stored pixel.

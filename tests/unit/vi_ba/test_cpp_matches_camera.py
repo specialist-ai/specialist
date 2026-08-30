@@ -2,7 +2,7 @@
 
 The solve reprojects through ``mei_factor.cpp`` and everything else through
 ``mei_project``. This sweeps the distortion polynomial across the ``xi`` range
-the corpus spans.
+the dataset spans.
 """
 
 from __future__ import annotations

@@ -1,4 +1,4 @@
-"""The corpus pose convention.
+"""The dataset pose convention.
 
 A stored pose is a translation and an xyzw quaternion, the transform from the
 entity's parent frame to its own. It reads back as a ``(4, 4)`` float64 matrix.

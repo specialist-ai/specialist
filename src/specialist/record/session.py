@@ -16,10 +16,10 @@ import numpy as np
 import numpy.typing as npt
 from rerun.experimental import RrdReader
 from specialist_camera import Side
-from specialist_corpus import frames, schema
-from specialist_corpus.poses import quats_to_matrices
-from specialist_corpus.read import Recording, lens_from_row
-from specialist_corpus.state import nearest
+from specialist_dataset import frames, schema
+from specialist_dataset.poses import quats_to_matrices
+from specialist_dataset.read import Recording, lens_from_row
+from specialist_dataset.state import nearest
 
 from specialist.vi_ba.build import LensSetup
 from specialist.vi_ba.imu import ImuSamples

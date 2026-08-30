@@ -10,7 +10,7 @@ import gtsam
 import numpy as np
 import pytest
 from rerun.experimental import Chunk, ChunkStore, RrdReader
-from specialist_corpus import schema
+from specialist_dataset import schema
 
 from specialist.vi_ba.blueprint import (
   _hidden_overlay_overrides,
@@ -432,7 +432,7 @@ def test_no_layer_embeds_a_blueprint(
   estimated_run: tuple[Path, Path],
 ) -> None:
   """An embedded blueprint would freeze its solve date's layout and shadow
-  the corpus .rbl on direct opens."""
+  the dataset's .rbl on direct opens."""
   estimate_path, viz_path = estimated_run
   assert not RrdReader(str(viz_path)).blueprints()
   assert not RrdReader(str(estimate_path)).blueprints()

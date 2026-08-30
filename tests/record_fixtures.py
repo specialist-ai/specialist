@@ -210,7 +210,7 @@ def write_run(
   urdf_path: Path,
   frame_period: float,
 ) -> tuple[Path, Path]:
-  """Write both layers of a solved run under ``root`` in the corpus layout, and
+  """Write both layers of a solved run under ``root`` in the dataset layout, and
   return the estimate and viz paths."""
   if per_camera is None:
     per_camera = [

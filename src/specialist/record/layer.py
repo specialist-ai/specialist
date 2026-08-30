@@ -23,7 +23,7 @@ from rerun.experimental import (
   OptimizationProfile,
   send_chunks,
 )
-from specialist_corpus import schema
+from specialist_dataset import schema
 
 from specialist.vi_ba.summary import CameraSummary, Summary
 from specialist.vi_ba.viz import Layers, estimate_chunks

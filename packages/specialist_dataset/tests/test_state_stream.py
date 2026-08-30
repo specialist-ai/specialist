@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-from specialist_corpus.state import (
+from specialist_dataset.state import (
   finger,
   hands,
   image_rows,

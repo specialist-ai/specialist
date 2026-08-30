@@ -15,7 +15,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 from rerun.experimental import Chunk, LazyChunkStream, Mp4Reader
-from specialist_corpus import schema
+from specialist_dataset import schema
 
 from specialist.loader.audio_sync import resolve_ffmpeg
 

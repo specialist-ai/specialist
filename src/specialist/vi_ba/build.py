@@ -12,7 +12,7 @@ import gtsam
 import numpy as np
 import numpy.typing as npt
 from specialist_camera import MeiParams
-from specialist_corpus import schema
+from specialist_dataset import schema
 
 from specialist.vi_ba.anchor_detection import TagDetection
 

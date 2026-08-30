@@ -4,7 +4,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from specialist_corpus import schema
+from specialist_dataset import schema
 
 from specialist.record.video import normalize_h264, video_chunks
 from tests.record_fixtures import encode_clip

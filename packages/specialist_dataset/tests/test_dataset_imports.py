@@ -1,4 +1,4 @@
-"""Reading a corpus does not import the solve's stack."""
+"""Reading a dataset does not import the solve's stack."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ _FORBIDDEN = ("gtsam", "cv2", "torch", "av", "scipy", "specialist")
 
 def test_importing_the_corpus_leaves_the_solve_behind() -> None:
   probe = (
-    "import sys, specialist_corpus;"
+    "import sys, specialist_dataset;"
     f"print([m for m in {_FORBIDDEN!r} if m in sys.modules])"
   )
   found = subprocess.run(

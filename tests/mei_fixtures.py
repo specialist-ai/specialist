@@ -7,7 +7,7 @@ import gtsam
 import numpy as np
 from gtsam.symbol_shorthand import B, L, V, X
 from specialist_camera import MeiParams, mei_project
-from specialist_corpus.fiducials import tag_corners_in_frame
+from specialist_dataset.fiducials import tag_corners_in_frame
 
 from specialist.vi_ba.anchor_detection import TagDetection
 from specialist.vi_ba.build import LensSetup, add_mei_factor

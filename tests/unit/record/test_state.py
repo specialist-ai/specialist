@@ -12,9 +12,9 @@ from PIL import Image
 from scipy.spatial.transform import Rotation
 from scripts.state import F_STEP, Args, Cut, main
 from specialist_camera import disc_mask, to_image
-from specialist_corpus import schema
-from specialist_corpus.frames import LensVideo, decode_rows
-from specialist_corpus.read import Recording
+from specialist_dataset import schema
+from specialist_dataset.frames import LensVideo, decode_rows
+from specialist_dataset.read import Recording
 
 from specialist.record.base import (
   calibration_chunks,

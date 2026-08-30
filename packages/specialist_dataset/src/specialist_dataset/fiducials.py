@@ -1,4 +1,4 @@
-"""The corpus fiducial convention: the tag family, and where corners sit."""
+"""The dataset fiducial convention: the tag family, and where corners sit."""
 
 from __future__ import annotations
 
