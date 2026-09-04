@@ -137,10 +137,11 @@ state ──┬── images ───── augment ── normalize ───�
 
 `state.py` writes it from the base recording and the estimate, keyed by hand
 under `state/left` and `state/right`: the rear lens block-averaged to 240x240
-(`--scale 12`), blanked outside the fisheye disc, every frame on a state row
-inside the span `--cut.head` / `--cut.tail` seconds leave, one PNG each; the
-gripper's base-tag pose and twist in the world frame on every row, between
-the estimate's samples; and the coupled finger angle.
+(`--scale 12`), blanked outside the fisheye disc, every frame inside the usable
+window, one PNG each; the gripper's base-tag pose and twist in the world frame
+on every row, between the estimate's samples; and the coupled finger angle. The window is read from the operator's
+bracket gestures, a hold at the start and a tap at the end, with `--margin`
+seconds kept clear of each.
 Which camera rode which hand is detected from the estimate's keyframe poses
 (`--left <slot>` overrides it) and the slot rides on each hand as a value.
 A trainer indexes the layer by the integer `row` timeline, `round(t * --f-row)`;

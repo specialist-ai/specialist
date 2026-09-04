@@ -1,4 +1,4 @@
-"""Numpy state-stream helpers: kept frames, row lattice, opening and hands."""
+"""Numpy state-stream helpers: kept frames, row lattice, opening, hands and gestures."""
 
 from __future__ import annotations
 
@@ -14,17 +14,100 @@ Int64Array = npt.NDArray[np.int64]
 __all__ = [
   "finger",
   "hands",
+  "hold",
   "image_frames",
   "lattice_brackets",
   "lerp",
   "nearest",
   "opening",
+  "tap",
 ]
 
 MAX_BRACKET = 0.0025
 _PAIR_TOLERANCE = 0.05
 _MIN_ANGLE = 3.0
 _MIN_AGREEMENT = 0.75
+_HOLD_SPEED = 0.15
+_HOLD_MIN_DURATION = 0.4
+_HOLD_HEAD = 0.1
+_TAP_Z = 12.0
+_TAP_BURST_GAP = 0.5
+_TAP_TAIL = 0.9
+
+
+def hold(
+  times: Float64Array,
+  anchor_distance: Float64Array,
+  speed: Float64Array,
+  span: tuple[float, float],
+) -> float:
+  """When the start hold ends; refuses one too short or ending past the first tenth."""
+  slow = speed <= _HOLD_SPEED
+  if not slow.any():
+    raise ValueError("the gripper never slows near an anchor")
+  i = int(np.argmin(np.where(slow, anchor_distance, np.inf)))
+  lo, hi = i, i
+  while lo > 0 and slow[lo - 1]:
+    lo -= 1
+  while hi < len(slow) - 1 and slow[hi + 1]:
+    hi += 1
+  if times[hi] - times[lo] < _HOLD_MIN_DURATION:
+    raise ValueError(
+      f"the closest slow anchor approach lasts {times[hi] - times[lo]:.2f} s, "
+      f"under the {_HOLD_MIN_DURATION} s hold"
+    )
+  at = (times[hi] - span[0]) / (span[1] - span[0])
+  if at > _HOLD_HEAD:
+    raise ValueError(f"the hold ends at {at:.0%} of the capture, past its first tenth")
+  return float(times[hi])
+
+
+def _spike_times(
+  times: Float64Array, accel: Float64Array
+) -> tuple[Float64Array, Float64Array]:
+  """Peak time and robust z-score of each acceleration-norm run above ``_TAP_Z``."""
+  norm = np.linalg.norm(accel, axis=1)
+  spread = 1.4826 * np.median(np.abs(norm - np.median(norm)))
+  z = (norm - np.median(norm)) / spread
+  above = np.concatenate(([False], z > _TAP_Z, [False]))
+  edges = np.flatnonzero(np.diff(above.astype(np.int8)))
+  peaks = np.array(
+    [
+      lo + int(np.argmax(z[lo:hi]))
+      for lo, hi in zip(edges[::2], edges[1::2], strict=True)
+    ],
+    dtype=np.int64,
+  )
+  return times[peaks], z[peaks]
+
+
+def tap(times: dict[str, Float64Array], accel: dict[str, Float64Array]) -> float:
+  """When the end tap starts; refuses a tap before the recording's last tenth."""
+  bursts: list[list[tuple[float, str, float]]] = [[]]
+  for event in sorted(
+    (t, slot, score)
+    for slot in times
+    for t, score in zip(*_spike_times(times[slot], accel[slot]), strict=True)
+  ):
+    if bursts[-1] and event[0] - bursts[-1][-1][0] > _TAP_BURST_GAP:
+      bursts.append([])
+    bursts[-1].append(event)
+  shared = [b for b in bursts if {e[1] for e in b} == set(times)]
+  if not shared:
+    raise ValueError("no burst of acceleration spikes reaches every camera")
+  strongest = max(
+    shared,
+    key=lambda b: min(max(e[2] for e in b if e[1] == slot) for slot in times),
+  )
+  t0 = min(float(t[0]) for t in times.values())
+  t1 = max(float(t[-1]) for t in times.values())
+  strike = strongest[0][0]
+  if strike < t0 + _TAP_TAIL * (t1 - t0):
+    raise ValueError(
+      f"the strongest tap burst sits at {(strike - t0) / (t1 - t0):.0%} of "
+      "the recording, before its last tenth"
+    )
+  return float(strike)
 
 
 def nearest(

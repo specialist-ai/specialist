@@ -11,7 +11,7 @@ import sys
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -26,14 +26,16 @@ from scipy.spatial.transform import Rotation, Slerp
 from specialist_camera import MASK_RADIUS, to_image
 from specialist_dataset import schema
 from specialist_dataset.frames import LensVideo, decode_rows
-from specialist_dataset.read import Recording, read_keyframe_poses
+from specialist_dataset.read import Recording, read_anchors, read_keyframe_poses
 from specialist_dataset.state import (
   finger,
   hands,
+  hold,
   image_frames,
   lattice_brackets,
   lerp,
   opening,
+  tap,
 )
 
 from specialist.record.layer import git_sha
@@ -46,14 +48,6 @@ Int64Array = npt.NDArray[np.int64]
 State = tuple[Float64Array, Float64Array, Float64Array, Float64Array, Float64Array]
 
 _SIDE: schema.Side = "rear"
-
-
-@dataclass
-class Cut:
-  """Seconds dropped at each end of the session."""
-
-  head: float = 1.0
-  tail: float = 2.0
 
 
 @dataclass
@@ -74,7 +68,8 @@ class Args:
   # Rows per second: the rate a policy's loop runs at.
   f_row: float = 100.0
 
-  cut: Cut = field(default_factory=Cut)
+  # Seconds kept clear of the bracket gestures at each end of the window.
+  margin: float = 1.0
 
   # The slot on the operator's left; overrides the geometric detection.
   left: str | None = None
@@ -221,20 +216,24 @@ def gripper_state(estimate: Recording, slot: str) -> State:
 
 
 def usable_window(
-  cut: Cut,
+  hold_ends: list[float],
+  strike: float,
+  margin: float,
   times: dict[str, Float64Array],
   keyframes: dict[str, Float64Array],
   fingers: dict[str, tuple[Any, Any]],
 ) -> tuple[float, float]:
-  """The kept span: the cut, covered by every lens, keyframe span and solved finger."""
+  """The kept span, a margin inside the hold and strike and covered by every series."""
   return (
     max(
-      max(float(t[0]) for t in times.values()) + cut.head,
+      max(hold_ends) + margin,
+      max(float(t[0]) for t in times.values()),
       max(k[0] for k in keyframes.values()),
       max(float(t[0]) for pair in fingers.values() for t, _ in pair),
     ),
     min(
-      min(float(t[-1]) for t in times.values()) - cut.tail,
+      strike - margin,
+      min(float(t[-1]) for t in times.values()),
       min(k[-1] for k in keyframes.values()),
       min(float(t[-1]) for pair in fingers.values() for t, _ in pair),
     ),
@@ -317,38 +316,32 @@ def _one(value: Any) -> str:
 
 
 def layer_account(
-  estimate: Recording, converted_at: int, layer: str, f_row: float
+  args: Args,
+  estimate: Recording,
+  slot: str,
+  converted_at: int,
+  layer: str,
+  window: tuple[float, float],
+  covered: float,
 ) -> dict[str, Any]:
-  """Catalog fields: configuration, row rate and the convert, solve and write times."""
-  run = {
-    **estimate.row(schema.ESTIMATE),
-    **estimate.property(schema.ESTIMATE_PROPERTIES),
-  }
+  """The ``state`` recording property: config, provenance, stamps and kept fraction."""
+  run = estimate.property(schema.ESTIMATE_PROPERTIES)
   return {
     "config": layer,
-    "f_row": f_row,
-    "converted_at": converted_at,
-    "estimated_at": _one(run["estimated_at"]),
-    "written_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-  }
-
-
-def layer_settings(args: Args, estimate: Recording, slot: str) -> dict[str, Any]:
-  """How the layer was made, on the ``state`` entity."""
-  run = {
-    **estimate.row(schema.ESTIMATE),
-    **estimate.property(schema.ESTIMATE_PROPERTIES),
-  }
-  return {
+    "f_row": args.f_row,
     "scale": args.scale,
     "mask_radius": MASK_RADIUS,
     "side": _SIDE,
-    "cut_head": args.cut.head,
-    "cut_tail": args.cut.tail,
+    "margin": args.margin,
+    "duration": window[1] - window[0],
+    "kept": (window[1] - window[0]) / covered,
     "git_sha": git_sha(),
     "rerun_version": rr.__version__,
     "estimate_git_sha": _one(run["git_sha"]),
     "urdf_sha": _one(estimate.row(schema.gripper(slot)).get("urdf_sha", ["unknown"])),
+    "converted_at": converted_at,
+    "estimated_at": _one(run["estimated_at"]),
+    "written_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
   }
 
 
@@ -356,7 +349,6 @@ def write_layer(
   path: Path,
   session_id: str,
   account: dict[str, Any],
-  settings: dict[str, Any],
   chunks: list[Chunk],
 ) -> None:
   """Write the layer under the session's id, renaming a partial file once complete."""
@@ -371,7 +363,6 @@ def write_layer(
     ) as stream:
       stream.set_sinks(rr.FileSink(partial))
       stream.send_property(schema.STATE, rr.AnyValues(**account))
-      rr.log(schema.STATE, rr.AnyValues(**settings), static=True, recording=stream)
       send_chunks(store, recording=stream)
     partial.replace(path)
   finally:
@@ -401,14 +392,32 @@ def main(args: Args) -> None:
     raise SystemExit(f"{out_path} exists; pass --overwrite to replace it")
 
   estimate = Recording(estimate_path)
+  anchors = np.stack(
+    [pose[:3, 3] for pose in read_anchors(estimate_path).poses.values()]
+  )
+  imus = {slot: session.imu(slot) for slot in slots}
+  span = (
+    min(float(imu.t[0]) for imu in imus.values()),
+    max(float(imu.t[-1]) for imu in imus.values()),
+  )
   grippers: dict[str, State] = {}
   fingers: dict[str, tuple[Any, Any]] = {}
+  hold_ends: list[float] = []
   for slot in slots:
     with refusing(slot):
       fingers[slot] = finger_pair(estimate, slot)
-    grippers[slot] = gripper_state(estimate, slot)
+      gripper = grippers[slot] = gripper_state(estimate, slot)
+      distance = np.linalg.norm(gripper[1][:, None] - anchors[None], axis=2).min(axis=1)
+      hold_ends.append(
+        hold(gripper[0], distance, np.linalg.norm(gripper[3], axis=1), span)
+      )
+  with refusing():
+    strike = tap(
+      {slot: imu.t for slot, imu in imus.items()},
+      {slot: imu.accel for slot, imu in imus.items()},
+    )
 
-  window = usable_window(args.cut, times, keyframes, fingers)
+  window = usable_window(hold_ends, strike, args.margin, times, keyframes, fingers)
   with refusing():
     frames = image_frames(times, fps, window)
   left, right = hand_slots(
@@ -419,8 +428,12 @@ def main(args: Args) -> None:
     f"{window[1]:.2f}] s, left {left}, right {right}"
   )
 
-  account = layer_account(estimate, session.converted_at, layer, args.f_row)
-  settings = layer_settings(args, estimate, left)
+  covered = min(float(t[-1]) for t in times.values()) - max(
+    float(t[0]) for t in times.values()
+  )
+  account = layer_account(
+    args, estimate, left, session.converted_at, layer, window, covered
+  )
 
   states: dict[str, tuple[Int64Array, State]] = {}
   for slot in slots:
@@ -460,7 +473,7 @@ def main(args: Args) -> None:
       f"  {hand} ({slot}): {len(blobs)} images, {sum(map(len, blobs)) / 1e6:.1f} MB, "
       f"rows [{lo}, {hi}], {time.time() - started:.0f} s"
     )
-  write_layer(out_path, session.session_id, account, settings, chunks)
+  write_layer(out_path, session.session_id, account, chunks)
   print(f"Wrote {out_path} ({out_path.stat().st_size / 1e6:.1f} MB)")
 
 
