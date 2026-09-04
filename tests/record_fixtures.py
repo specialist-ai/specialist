@@ -115,12 +115,16 @@ def camera_estimate(
   offset: float = 0.0,
   speed: float = 1.0,
   n: int = 4,
+  hold: float = 0.0,
   rate: float = 1000.0,
 ) -> CameraEstimate:
   """One solved camera carrying one of everything a layer can hold: keyframe
   poses on a 10 Hz grid, their velocities, the base-tag frame, the gripper
   opening, and a landmark in each lens. The dense trajectory, sampled at
-  ``rate`` Hz, slides along x at ``speed`` from ``offset`` while it turns."""
+  ``rate`` Hz, slides along x at
+  ``speed`` from ``offset`` while it turns; ``hold`` seconds parked at
+  ``offset``, ending half a second before the first keyframe, precede it as
+  the operator's start gesture."""
   times: npt.NDArray[np.float64] = np.arange(n, dtype=np.float64) * 0.1
   poses = [
     gtsam.Pose3(gtsam.Rot3.Ry(0.05 * i), gtsam.Point3(offset + 0.1 * i, 0.02 * i, 1.0))
@@ -128,6 +132,8 @@ def camera_estimate(
   ]
   opening: npt.NDArray[np.float64] = 0.06 - 0.01 * np.arange(n, dtype=np.float64)
   hr_t = np.arange(round(times[-1] * rate) + 1) / rate
+  if hold:
+    hr_t = np.concatenate([np.arange(-0.5 - hold, -0.5 + 1e-9, 0.025), hr_t])
   zeros = np.zeros_like(hr_t)
   turn = Rotation.from_rotvec(np.outer(SPIN * hr_t, [0.0, 0.0, 1.0])) * (
     Rotation.from_rotvec([TILT, 0.0, 0.0])
@@ -135,9 +141,11 @@ def camera_estimate(
   data = CameraEstimate(
     slot=slot,
     highrate_times=hr_t,
-    highrate_positions=np.stack([offset + speed * hr_t, zeros, zeros], axis=1),
+    highrate_positions=np.stack(
+      [offset + speed * np.maximum(hr_t, 0.0), zeros, zeros], axis=1
+    ),
     highrate_quats=turn.as_quat(),
-    highrate_vels=np.tile([speed, 0.0, 0.0], (len(hr_t), 1)),
+    highrate_vels=np.stack([speed * (hr_t >= 0.0), zeros, zeros], axis=1),
     body_poses=poses,
     keyframe_times=times,
     keyframe_rows=np.arange(n, dtype=np.int64) * 3,

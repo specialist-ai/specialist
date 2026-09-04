@@ -4,13 +4,14 @@
 from __future__ import annotations
 
 import io
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
 import pytest
 from PIL import Image
 from scipy.spatial.transform import Rotation
-from scripts.state import Args, Cut, main
+from scripts.state import Args, main
 from specialist_camera import disc_mask, to_image
 from specialist_corpus import schema
 from specialist_corpus.frames import LensVideo, decode_rows
@@ -36,7 +37,7 @@ from tests.record_fixtures import (
 _FPS = 30
 # Rows 0..11; the estimate fixture's keyframes sit on rows 0, 3, 6, 9.
 _FRAMES = 12
-_WINDOW = (-1.0, 10.0)
+_WINDOW = (-1.0, 31.0)
 _SCALE = 4
 _F_ROW = 1000.0
 # The second camera's clock sits a sub-frame offset off the first's, as two
@@ -44,13 +45,25 @@ _F_ROW = 1000.0
 _SHIFT = {"cam00": 0.0, "cam01": -0.0043}
 # One tracker slower than the lattice and one faster, as two real IMUs are.
 _RATE = {"cam00": 997.0, "cam01": 1003.0}
+# In the last tenth of the IMU span; the holds end at -0.5 s, inside its
+# first tenth, so a zero margin leaves the keyframe span untouched.
+_STRIKE = 29.0
 
 
 @pytest.fixture(scope="module")
 def corpus(tmp_path_factory: pytest.TempPathFactory) -> Path:
   """A layer-first root: a two-camera base with rear lenses, and its estimate."""
   root = tmp_path_factory.mktemp("corpus")
-  insv = synthetic_insv()
+  imu_t = np.arange(-1.0, 30.0, 0.005)
+  accel = np.zeros((len(imu_t), 3))
+  accel[:, 2] = 9.81 + 0.05 * np.sin(20.0 * imu_t)
+  accel[np.abs(imu_t - _STRIKE) < 0.003, 2] += 200.0
+  insv = replace(
+    synthetic_insv(),
+    imu_timestamps=imu_t,
+    gyro_deg=np.zeros((len(imu_t), 3)),
+    accel=accel,
+  )
   clip = normalize_h264(
     encode_clip(root / "clip.mp4", _FRAMES, rate=_FPS, gop=4), root / "clean.mp4"
   )
@@ -62,8 +75,8 @@ def corpus(tmp_path_factory: pytest.TempPathFactory) -> Path:
   base.parent.mkdir()
   write_base_recording(base, "sess", streams, sidecars, {})
   cameras = [
-    camera_estimate("cam00", rate=_RATE["cam00"]),
-    camera_estimate("cam01", offset=1.0, rate=_RATE["cam01"]),
+    camera_estimate("cam00", hold=0.7, rate=_RATE["cam00"]),
+    camera_estimate("cam01", offset=1.0, hold=0.7, rate=_RATE["cam01"]),
   ]
   write_run(root, "sess", cameras, urdf_path=urdf_file(root), frame_period=1.0 / _FPS)
   return root
@@ -121,7 +134,7 @@ def _expected_state(offset: float, rate: float) -> dict[int, dict[str, np.ndarra
 
 
 def test_the_layer_holds_each_hand_by_name(corpus: Path) -> None:
-  out = _state(corpus, corpus, cut=Cut(0.0, 0.0))
+  out = _state(corpus, corpus, margin=0.0)
   base = Recording(schema.layer_rrd(corpus, schema.BASE, "sess"))
   with Recording(out) as recording:
     # The left hand is cam00 by the anchor rule; each hand's frames keep their
@@ -160,6 +173,8 @@ def test_the_layer_holds_each_hand_by_name(corpus: Path) -> None:
     }
     assert account["config"] == schema.state_layer(_SCALE, _F_ROW)
     assert account["f_row"] == _F_ROW
+    assert account["duration"] == pytest.approx(0.3, abs=1e-3)
+    assert account["kept"] == pytest.approx(0.3 / (11 / 30 - 0.0043), abs=1e-3)
     assert int(account["converted_at"]) > 0
     assert (
       account["estimated_at"]
@@ -169,9 +184,9 @@ def test_the_layer_holds_each_hand_by_name(corpus: Path) -> None:
         )["estimated_at"]
       ).reshape(-1)[0]
     )
-    settings = recording.row(schema.STATE)
-    assert np.asarray(settings["scale"]).reshape(-1)[0] == _SCALE
-    assert np.asarray(settings["side"]).reshape(-1)[0] == "rear"
+    assert recording.row(schema.STATE) == {}
+    assert account["scale"] == _SCALE
+    assert account["side"] == "rear"
   with pytest.raises(SystemExit, match="--overwrite"):
     _state(corpus, corpus)
 
@@ -182,7 +197,7 @@ def test_the_state_is_the_base_tag_frame_on_a_dense_row_lattice(
   """Both hands cover the same dense row range; each row is the estimate's
   trajectory composed with the tag's mounting at the row's own millisecond,
   between the two samples that bracket it."""
-  out = _state(corpus, tmp_path, cut=Cut(0.0, 0.0))
+  out = _state(corpus, tmp_path, margin=0.0)
   with Recording(out) as recording:
     for hand, slot, offset in (("left", "cam00", 0.0), ("right", "cam01", 1.0)):
       expected = _expected_state(offset, _RATE[slot])
@@ -214,7 +229,7 @@ def test_the_state_is_the_base_tag_frame_on_a_dense_row_lattice(
 def test_a_frame_whose_capture_row_leaves_the_state_rows_goes_for_both_hands(
   corpus: Path, tmp_path: Path
 ) -> None:
-  out = _state(corpus, tmp_path, cut=Cut(0.0985, 0.0))
+  out = _state(corpus, tmp_path, margin=0.5985)
   with Recording(out) as recording:
     for hand, slot in (("left", "cam00"), ("right", "cam01")):
       times, rows, captured, _ = _frames(recording, hand)
@@ -225,11 +240,11 @@ def test_a_frame_whose_capture_row_leaves_the_state_rows_goes_for_both_hands(
       assert captured.min() >= 99
 
 
-def test_the_cut_and_the_left_override_apply(corpus: Path, tmp_path: Path) -> None:
-  out = _state(corpus, tmp_path, cut=Cut(0.05, 0.1), left="cam01")
+def test_the_margin_and_the_left_override_apply(corpus: Path, tmp_path: Path) -> None:
+  out = _state(corpus, tmp_path, margin=0.61, left="cam01")
   with Recording(out) as recording:
     np.testing.assert_allclose(
-      _frames(recording, "right")[0] / 1e9, np.arange(2, 8) / _FPS, atol=1e-6
+      _frames(recording, "right")[0] / 1e9, np.arange(4, 9) / _FPS, atol=1e-6
     )
     assert recording.row(schema.state_hand("left"))["slot"] == ["cam01"]
 
@@ -237,8 +252,8 @@ def test_the_cut_and_the_left_override_apply(corpus: Path, tmp_path: Path) -> No
 def test_the_writer_refuses_what_it_cannot_honour(corpus: Path, tmp_path: Path) -> None:
   for message, kwargs in (
     ("does not divide", {"scale": 7}),
-    ("--left must name", {"left": "cam99", "cut": Cut(0.0, 0.0)}),
-    ("window", {"cut": Cut(0.0, 100.0)}),
+    ("--left must name", {"left": "cam99", "margin": 0.0}),
+    ("window", {"margin": 100.0}),
   ):
     with pytest.raises(SystemExit, match=message):
       _state(corpus, tmp_path, **kwargs)
