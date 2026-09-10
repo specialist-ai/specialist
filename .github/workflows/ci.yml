@@ -41,9 +41,7 @@ jobs:
       - name: Install Boost headers (the native MEI factor build needs them)
         run: sudo apt-get update && sudo apt-get install -y libboost-all-dev
       - name: Install dependencies
-        # robot-descriptions is a private SSH git dep (URDF assets) used only
-        # lazily in scripts/estimate.py; CI has no SSH creds and doesn't need it.
-        run: uv sync --no-group gpu --no-install-package robot-descriptions
+        run: uv sync --no-group gpu --no-install-package specialist-description
       - name: Run mypy
         run: uv run --no-sync mypy
 
@@ -62,8 +60,6 @@ jobs:
       - name: Install FFmpeg (rerun's Mp4Reader shells out to it in the video tests)
         run: sudo apt-get install -y ffmpeg
       - name: Install dependencies
-        # robot-descriptions is a private SSH git dep (URDF assets) used only
-        # lazily in scripts/estimate.py; CI has no SSH creds and doesn't need it.
-        run: uv sync --no-group gpu --no-install-package robot-descriptions
+        run: uv sync --no-group gpu --no-install-package specialist-description
       - name: Run tests
         run: uv run --no-sync pytest || [ $? -eq 5 ]
