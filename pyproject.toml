@@ -17,7 +17,7 @@ dependencies = [
   "opencv-python>=4.10",
   "pupil-apriltags>=1.0.4",
   "allantools>=2024.6",
-  "robot-descriptions",
+  "specialist-description",
   "specialist-camera",
   "specialist-corpus",
   # Wheel-bundled static ffmpeg: audio sync needs no system install.
@@ -61,7 +61,7 @@ prerelease = "allow"
 default-groups = ["dev", "gpu"]
 
 [tool.uv.sources]
-robot-descriptions = { git = "ssh://git@github.com/T-K-233/specialist_description.git" }
+specialist-description = { git = "ssh://git@github.com/specialist-ai/specialist_description.git", branch = "main" }
 specialist-camera = { workspace = true }
 specialist-corpus = { workspace = true }
 # CUDA 12.9 builds: Blackwell (sm_120) kernels, on the CUDA 12 toolkit the
@@ -142,7 +142,7 @@ module = [
   "allantools", "allantools.*",
   "imageio_ffmpeg", "imageio_ffmpeg.*",
   "torch", "torch.*", "triton", "triton.*",
-  "robot_descriptions", "robot_descriptions.*",
+  "specialist_description", "specialist_description.*",
 ]
 ignore_missing_imports = true
 
