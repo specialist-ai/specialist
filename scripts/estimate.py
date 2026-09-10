@@ -44,20 +44,14 @@ from specialist.vi_ba.viz_build import build_run_estimate
 
 
 def _resolve_urdf_path(explicit: Path | None) -> Path:
-  """The gripper URDF: an explicit path, else the cached/downloaded asset."""
+  """The gripper URDF: an explicit path, else the installed description asset."""
   if explicit is not None:
     return explicit
   try:
-    from robot_descriptions import load_asset
+    from specialist_description import urdf_path
 
-    return Path(
-      load_asset(
-        "robots/specialist_gripper/urdf/gripper.urdf",
-        repo_url="https://github.com/T-K-233/specialist_description",
-        cache_dir=str(Path.home() / ".cache" / "specialist_description"),
-      )
-    )
-  except Exception as exc:
+    return Path(urdf_path("specialist_handheld"))
+  except (ImportError, ValueError, FileNotFoundError) as exc:
     raise SystemExit(
       f"the gripper URDF is unavailable ({exc}); pass --urdf-path"
     ) from exc
