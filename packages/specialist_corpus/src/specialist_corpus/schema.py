@@ -245,6 +245,15 @@ def joint_tag(slot: str, joint: str) -> str:
   return f"{gripper_part(slot, joint)}/tag"
 
 
+def joint_transform(slot: str, joint: str) -> str:
+  """The edge one revolute joint turns, an entity of its own.
+
+  A frame edge needs its own entity: two joints sharing one write a row each
+  at the same instant on the same clock, and the second silently replaces the
+  first, leaving that joint with only the samples the other never covered."""
+  return f"{gripper_part(slot, 'transforms')}/{joint}"
+
+
 def state_frame(slot: str) -> str:
   """The frame the solved keyframe pose defines, named apart from the
   propagated one: Rerun takes one definition per frame."""

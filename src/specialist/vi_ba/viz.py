@@ -762,7 +762,7 @@ def _joint_streams(
     # The pinned frame-rate series passes through the solved keyframe angles.
     times, angles = _send_joint_transform(
       layers.estimate,
-      record_schema.gripper_part(data.slot, "transforms"),
+      record_schema.joint_transform(data.slot, joint_name),
       joint,
       *frame_series,
       indexes,

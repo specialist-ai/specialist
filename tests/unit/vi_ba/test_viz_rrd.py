@@ -11,6 +11,7 @@ import numpy as np
 import pytest
 from rerun.experimental import Chunk, ChunkStore, RrdReader
 from specialist_corpus import schema
+from specialist_corpus.read import Recording
 
 from specialist.vi_ba.blueprint import (
   _hidden_overlay_overrides,
@@ -267,6 +268,40 @@ def test_what_the_camera_pose_carries_is_only_what_is_mounted_on_it(
   painted = drawable | {f"/{path}" for path in _blueprint_draws_on(["cam00", "cam01"])}
   inert = sorted(e for e in declared - painted if e.startswith("/camera/"))
   assert not inert, f"frame declared on an entity holding nothing drawable: {inert}"
+
+
+def test_each_joint_keeps_every_sample_of_the_edge_it_turns(
+  estimated_run: tuple[Path, Path],
+) -> None:
+  """Two joints turning on one clock need an entity each. Written to one
+  entity, both put a row at the same instant, the later write replaces the
+  earlier, and that joint is left with only the instants the other never
+  covered - while its angle series, which has an entity per joint, still reads
+  complete."""
+  estimate_path, _ = estimated_run
+  fixture = camera_estimate("cam00")
+  # Read it back the way a reader does: both writes survive as chunks on disk,
+  # and it is the query that resolves one row per entity per instant. So count
+  # each edge wherever it is written - what must hold is that no sample is
+  # lost, not that the rows sit at any particular path.
+  kept: dict[str, int] = {}
+  with Recording(estimate_path) as recording:
+    for entity in sorted(recording.entity_paths()):
+      table = recording.series(f"/{entity}")
+      column = schema.selector(entity, "Transform3D:child_frame")
+      if column not in table.schema.names:
+        continue
+      for row in table.column(column).combine_chunks().to_pylist():
+        for frame in row or []:
+          kept[frame] = kept.get(frame, 0) + 1
+  for joint in ("left_finger", "right_finger"):
+    frame = f"cam00_{joint}"
+    wanted = len(fixture.joint_frame_angles[joint][0])
+    # Padding may add one sample back to the timeline's start, never drop one.
+    assert kept.get(frame, 0) >= wanted, (
+      f"{frame} kept {kept.get(frame, 0)} of {wanted} samples"
+    )
+  assert kept["cam00_left_finger"] == kept["cam00_right_finger"], kept
 
 
 def test_every_tag_the_solve_used_is_named_in_the_layer(
