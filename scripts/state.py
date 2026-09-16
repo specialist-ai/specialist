@@ -150,8 +150,11 @@ def hand_slots(
   slots: list[str],
   keyframes: dict[str, Any],
   places: dict[str, Any],
-) -> tuple[str, str]:
-  """Which slot rode the operator's left hand, and which the right."""
+) -> tuple[str | None, str]:
+  """Which slot rode the operator's left hand, and which the right. A lone
+  camera rode the right."""
+  if len(slots) == 1:
+    return None, slots[0]
   if chosen is None:
     try:
       return hands(keyframes, places)
@@ -423,8 +426,8 @@ def main(args: Args) -> None:
   sys.stdout.reconfigure(line_buffering=True)  # type: ignore[union-attr]
   session = SessionRecording(args.base)
   slots = session.slots
-  if len(slots) != 2:
-    raise SystemExit(f"the state layer takes a two-camera session, got {slots}")
+  if not 1 <= len(slots) <= 2:
+    raise SystemExit(f"the state layer takes one or two cameras, got {slots}")
   estimate_path = args.estimate or schema.layer_rrd(
     args.base.parent.parent, schema.ESTIMATE, session.session_id
   )
@@ -473,16 +476,17 @@ def main(args: Args) -> None:
   left, right = hand_slots(
     args.left, slots, keyframes, {s: poses.kf_translations_by_slot[s] for s in slots}
   )
+  named = f"right {right}" if left is None else f"left {left}, right {right}"
   print(
     f"session {session.session_id}: {layer}, window [{window[0]:.2f}, "
-    f"{window[1]:.2f}] s, left {left}, right {right}"
+    f"{window[1]:.2f}] s, {named}"
   )
 
   covered = min(float(t[-1]) for t in times.values()) - max(
     float(t[0]) for t in times.values()
   )
   account = layer_account(
-    args, estimate, left, session.converted_at, layer, window, covered
+    args, estimate, right, session.converted_at, layer, window, covered
   )
 
   states: dict[str, tuple[Int64Array, State]] = {}
@@ -495,7 +499,8 @@ def main(args: Args) -> None:
   frames = {slot: picked[kept] for slot, picked in frames.items()}
 
   chunks: list[Chunk] = []
-  for hand, slot in zip(schema.HANDS, (left, right), strict=True):
+  rode = [(h, c) for h, c in zip(schema.HANDS, (left, right), strict=True) if c]
+  for hand, slot in rode:
     started = time.time()
     video = session.lens_video(slot, _SIDE)
     if not np.array_equal(video.times, times[slot]):
