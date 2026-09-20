@@ -1,4 +1,4 @@
-"""Turn one solved run into the payloads that leave the pipeline."""
+"""Each camera's estimate and summary from one solved joint graph."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from specialist_dataset.fiducials import tag_corners_in_frame
 
 from specialist.vi_ba.anchor_detection import (
   TagDetection,
-  estimate_camera_to_tag_pose,
+  estimate_camera_to_tag_poses,
 )
 from specialist.vi_ba.build import LensChannel, LensSetup
 from specialist.vi_ba.compose import (
@@ -125,43 +125,63 @@ def _gripper_opening(
   return times_a, opening
 
 
+def _axis_tips(size: float) -> Float64Array:
+  """The tag frame's three axis segments of length ``size``, as endpoint pairs."""
+  return np.array(
+    [
+      [0.0, 0.0, 0.0],
+      [size, 0.0, 0.0],
+      [0.0, 0.0, 0.0],
+      [0.0, size, 0.0],
+      [0.0, 0.0, 0.0],
+      [0.0, 0.0, size],
+    ],
+    dtype=np.float64,
+  )
+
+
 def _project_tag_axes_per_kf(
   tags_per_kf: list[list[TagDetection]],
   lens: LensSetup,
   tag_size_by_id: dict[int, float],
 ) -> list[Float64Array]:
-  out: list[Float64Array] = []
-  for tags in tags_per_kf:
-    strips: list[Float64Array] = []
-    for det in tags:
-      size = tag_size_by_id.get(int(det.tag_id))
-      if size is None:
+  """Per keyframe, the pixel segments of each sized tag's frame axes."""
+  sightings = [
+    (kf, order, det, size)
+    for kf, tags in enumerate(tags_per_kf)
+    for order, det in enumerate(tags)
+    if (size := tag_size_by_id.get(int(det.tag_id))) is not None
+  ]
+  poses: dict[tuple[int, int], gtsam.Pose3] = {}
+  for size in sorted({size for _, _, _, size in sightings}):
+    mine = [s for s in sightings if s[3] == size]
+    solved = estimate_camera_to_tag_poses(
+      np.stack([det.corners for _, _, det, _ in mine]), size, lens.params
+    )
+    for (kf, order, _, _), pose in zip(mine, solved, strict=True):
+      if pose is not None:
+        poses[kf, order] = pose
+  strips: dict[int, list[Float64Array]] = {}
+  if poses:
+    keys = sorted(poses)
+    pts_cam = np.concatenate(
+      [
+        (poses[key].rotation().matrix() @ _axis_tips(size).T).T
+        + np.asarray(poses[key].translation(), dtype=np.float64)
+        for key, size in (
+          (key, tag_size_by_id[int(tags_per_kf[key[0]][key[1]].tag_id)]) for key in keys
+        )
+      ]
+    ).reshape(len(keys), 6, 3)
+    pix = mei_project(pts_cam.reshape(-1, 3), lens.params).reshape(len(keys), 6, 2)
+    for i, (kf, _) in enumerate(keys):
+      if np.any(pts_cam[i, :, 2] <= 1e-3) or not np.all(np.isfinite(pix[i])):
         continue
-      pose = estimate_camera_to_tag_pose(det.corners, size, lens.params)
-      if pose is None:
-        continue
-      tips = np.array(
-        [
-          [0.0, 0.0, 0.0],
-          [size, 0.0, 0.0],
-          [0.0, 0.0, 0.0],
-          [0.0, size, 0.0],
-          [0.0, 0.0, 0.0],
-          [0.0, 0.0, size],
-        ],
-        dtype=np.float64,
-      )
-      rmat = pose.rotation().matrix()
-      tvec = np.asarray(pose.translation(), dtype=np.float64)
-      pts_cam = (rmat @ tips.T).T + tvec
-      if np.any(pts_cam[:, 2] <= 1e-3):
-        continue
-      pix = mei_project(pts_cam, lens.params)
-      if not np.all(np.isfinite(pix)):
-        continue
-      strips.append(pix.reshape(3, 2, 2))
-    out.append(np.concatenate(strips) if strips else np.empty((0, 2, 2)))
-  return out
+      strips.setdefault(kf, []).append(pix[i].reshape(3, 2, 2))
+  return [
+    np.concatenate(strips[kf]) if kf in strips else np.empty((0, 2, 2))
+    for kf in range(len(tags_per_kf))
+  ]
 
 
 def _build_camera_estimate(

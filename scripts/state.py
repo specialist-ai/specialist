@@ -8,6 +8,7 @@ Usage:
 from __future__ import annotations
 
 import sys
+import tempfile
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -373,7 +374,9 @@ def write_layer(
 
 def main(args: Args) -> None:
   sys.stdout.reconfigure(line_buffering=True)  # type: ignore[union-attr]
-  session = SessionRecording(args.base)
+  args.output_dir.mkdir(parents=True, exist_ok=True)
+  stage = tempfile.TemporaryDirectory(prefix="lenses-", dir=args.output_dir)
+  session = SessionRecording(args.base, Path(stage.name))
   slots = session.slots
   if not 1 <= len(slots) <= 2:
     raise SystemExit(f"the state layer takes one or two cameras, got {slots}")
@@ -478,6 +481,8 @@ def main(args: Args) -> None:
       f"rows [{lo}, {hi}], {time.time() - started:.0f} s"
     )
   write_layer(out_path, session.session_id, account, chunks)
+  session.close()
+  stage.cleanup()
   print(f"Wrote {out_path} ({out_path.stat().st_size / 1e6:.1f} MB)")
 
 

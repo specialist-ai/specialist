@@ -127,7 +127,7 @@ def _expected_state(offset: float, rate: float) -> dict[int, dict[str, np.ndarra
   }
 
 
-def test_the_layer_holds_each_hand_by_name(dataset: Path) -> None:
+def test_the_layer_holds_each_hand_by_name(dataset: Path, tmp_path: Path) -> None:
   out = _state(dataset, dataset, margin=0.0)
   base = Recording(schema.layer_rrd(dataset, schema.BASE, "sess"))
   with Recording(out) as recording:
@@ -147,7 +147,7 @@ def test_the_layer_holds_each_hand_by_name(dataset: Path) -> None:
       np.testing.assert_array_equal(
         placed, [0.0 if hand == "left" else width, 0.0, 0.0]
       )
-      video = LensVideo(base, slot, "rear")
+      video = LensVideo(base, slot, "rear", tmp_path)
       frames = np.arange(1, 9)
       for image, (_, frame) in zip(images, decode_rows(video, frames), strict=True):
         np.testing.assert_array_equal(

@@ -21,6 +21,7 @@ __all__ = [
   "GripperTags",
   "TagDiscoveryError",
   "discover_gripper_tags",
+  "discovery_rows",
   "uniform_sample_rows",
   "validate_discovered",
 ]
@@ -67,6 +68,11 @@ def uniform_sample_rows(
     return np.arange(n, dtype=np.int64)
   lo, hi = int(n * trim), int(n * (1.0 - trim)) - 1
   return np.unique(np.linspace(lo, max(lo, hi), count).round().astype(np.int64))
+
+
+def discovery_rows(iframe_rows: npt.NDArray[np.int64]) -> npt.NDArray[np.int64]:
+  """``SAMPLE_COUNT`` of the lens's I-frame rows, spread uniformly."""
+  return iframe_rows[uniform_sample_rows(len(iframe_rows))]
 
 
 def _tag_tracks(

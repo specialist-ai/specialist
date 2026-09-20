@@ -91,3 +91,30 @@ def test_seeds_theta_and_reprojects() -> None:
         fr.observations[kf].obs_bearing,
       )
       assert np.linalg.norm(f.unwhitenedError(vals)) < 0.5, (kf, j)
+
+
+def test_batched_theta_seeds_are_the_per_sighting_scans() -> None:
+  from specialist.vi_ba.finger_kinematics import _seed_thetas, _theta_scan
+
+  rng = np.random.default_rng(23)
+  lens = LensSetup(
+    extrinsic=gtsam.Pose3(
+      gtsam.Rot3.Expmap(np.array([0.1, -0.2, 0.05])), gtsam.Point3(0.02, 0.0, -0.01)
+    ),
+    params=wide_mei_params(),
+    calibrated_radius=WIDE_CALIBRATED_RADIUS,
+  )
+  body_T_joint = gtsam.Pose3(
+    gtsam.Rot3.Expmap(np.array([0.0, 0.3, 0.0])), gtsam.Point3(0.0, 0.05, 0.3)
+  )
+  corners_in_pivot = rng.uniform(-0.02, 0.02, (4, 3))
+  thetas, projected = _theta_scan(corners_in_pivot, body_T_joint, lens, -0.5, 1.2)
+  pixels = projected[rng.integers(0, len(thetas), 30)] + rng.normal(
+    0.0, 2.0, (30, 4, 2)
+  )
+  pixels[7] = np.nan
+  got = _seed_thetas(pixels, corners_in_pivot, body_T_joint, lens, -0.5, 1.2)
+  for i in range(30):
+    errors = np.sum((projected - pixels[i]) ** 2, axis=(1, 2))
+    want = thetas[int(np.argmin(np.where(np.isnan(errors), np.inf, errors)))]
+    assert got[i] == want
