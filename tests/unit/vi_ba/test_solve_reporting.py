@@ -25,7 +25,8 @@ def _canned(passes: list[OptimizeResult], monkeypatch: pytest.MonkeyPatch) -> li
     graph: gtsam.NonlinearFactorGraph,
     initial_values: gtsam.Values,
     max_iterations: int,
-    gpu: str = "off",
+    *,
+    initial_lambda: float | None = None,
   ) -> OptimizeResult:
     budgets.append(max_iterations)
     return passes[len(budgets) - 1]
@@ -42,7 +43,6 @@ def _run() -> OptimizeResult:
     [],
     TrackerKeys([]),
     _MAX_ITERATIONS,
-    "off",
   )
   return result
 

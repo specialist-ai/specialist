@@ -2,46 +2,18 @@
 
 from __future__ import annotations
 
-import os
 import time
-import traceback
-from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Iterator
 
 import gtsam
 import numpy as np
 
-from specialist.vi_ba.configs import GpuMode
+from specialist.vi_ba.gpu_lm import lm_solve
 
 __all__ = ["OptimizeResult", "optimize_graph"]
 
-# oneTBB sizes its arena from the process affinity mask. No-op where affinity
-# is unsupported.
-_SOLVE_CORES = 16
-
 # Stop once an accepted step improves the error by less than this fraction.
 _RELATIVE_ERROR_TOL = 1e-4
-
-
-_get_affinity = getattr(os, "sched_getaffinity", None)
-_set_affinity = getattr(os, "sched_setaffinity", None)
-
-
-@contextmanager
-def _bounded_solve_affinity() -> Iterator[None]:
-  if _get_affinity is None or _set_affinity is None:
-    yield
-    return
-  previous = _get_affinity(0)
-  if len(previous) <= _SOLVE_CORES:
-    yield
-    return
-  _set_affinity(0, set(sorted(previous)[:_SOLVE_CORES]))
-  try:
-    yield
-  finally:
-    _set_affinity(0, previous)
 
 
 @dataclass(frozen=True)
@@ -50,18 +22,18 @@ class OptimizeResult:
   iterations: int
   initial_error: float
   final_error: float
+  # The damping of the last accepted step.
+  final_lambda: float | None = None
 
 
 def optimize_graph(
   graph: gtsam.NonlinearFactorGraph,
   initial_values: gtsam.Values,
   max_iterations: int,
-  gpu: GpuMode = "off",
+  *,
+  initial_lambda: float | None = None,
 ) -> OptimizeResult:
-  """Run Levenberg-Marquardt and return values + run stats. ``gpu`` selects
-  the Schur/cuDSS path: ``"require"`` raises when the backend cannot load or
-  its solve fails; ``"auto"`` falls back to gtsam with a notice; ``"off"``
-  never tries the GPU."""
+  """The Schur LM solve of ``graph`` from ``initial_values`` with its run stats."""
   initial_error = float(graph.error(initial_values))
   if not np.isfinite(initial_error):
     raise RuntimeError(
@@ -69,49 +41,16 @@ def optimize_graph(
       "the initial values, so the optimizer would silently return them"
     )
   begin = time.perf_counter()
-  values: gtsam.Values | None = None
-  note = ""
-  if gpu != "off":
-    try:
-      from specialist.vi_ba.gpu_lm import lm_solve
-
-      with _bounded_solve_affinity():
-        values, iterations, _initial_error, final_error = lm_solve(
-          graph,
-          initial_values,
-          max_iterations,
-          _RELATIVE_ERROR_TOL,
-          initial_error=initial_error,
-        )
-      note = " (gpu)"
-    except ImportError as exc:
-      if gpu == "require":
-        raise RuntimeError(
-          f"gpu solver required but its backend cannot load: {exc}"
-        ) from exc
-      print(f"  [warn] [solve] gpu backend unavailable ({exc}); using gtsam")
-    except Exception:
-      if gpu == "require":
-        raise
-      traceback.print_exc()
-      print("  [warn] [solve] gpu solve failed; using gtsam")
-  if values is None:
-    params = gtsam.LevenbergMarquardtParams()
-    params.setMaxIterations(max_iterations)
-    params.setRelativeErrorTol(_RELATIVE_ERROR_TOL)
-    optimizer = gtsam.LevenbergMarquardtOptimizer(graph, initial_values, params)
-    begin = time.perf_counter()  # exclude any failed gpu attempt from the timing
-    with _bounded_solve_affinity():
-      values = optimizer.optimize()
-    iterations = int(optimizer.iterations())
-    final_error = float(optimizer.error())
+  values, iterations, _, final_error, final_lambda = lm_solve(
+    graph,
+    initial_values,
+    max_iterations,
+    _RELATIVE_ERROR_TOL,
+    initial_error=initial_error,
+    initial_lambda=initial_lambda,
+  )
   print(
     f"  [solve] {iterations} iters in {time.perf_counter() - begin:.1f}s, "
-    f"error {initial_error:.0f} -> {final_error:.0f}{note}"
+    f"error {initial_error:.0f} -> {final_error:.0f}"
   )
-  return OptimizeResult(
-    values=values,
-    iterations=iterations,
-    initial_error=initial_error,
-    final_error=final_error,
-  )
+  return OptimizeResult(values, iterations, initial_error, final_error, final_lambda)

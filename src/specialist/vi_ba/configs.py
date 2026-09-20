@@ -8,7 +8,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
 
 import numpy as np
 
@@ -18,14 +17,11 @@ __all__ = [
   "AnchorCfg",
   "Args",
   "FrontendCfg",
-  "GpuMode",
   "GripperCfg",
   "SolverCfg",
   "TrackerArgs",
   "validate",
 ]
-
-GpuMode = Literal["require", "auto", "off"]
 
 
 @dataclass
@@ -95,10 +91,6 @@ class GripperCfg:
 class SolverCfg:
   max_iterations: int = 30
   velocity_prior_sigma: float = 0.1
-
-  # Schur/cuDSS solver mode. "require" aborts when the backend cannot load;
-  # "auto" falls back to the CPU optimizer with a notice; "off" never tries it.
-  gpu: GpuMode = "require"
 
 
 @dataclass
