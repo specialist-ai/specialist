@@ -260,3 +260,15 @@ def test_a_minority_of_flipped_frames_does_not_lose_the_finger() -> None:
       )
     samples.append([d for d in dets if d is not None])
   assert _discover(samples) == GripperTags(2000, (2001, 2002))
+
+
+def test_discovery_rows_are_iframes_spread_over_the_lens() -> None:
+  """Every sampled row is an I-frame row, at most ``SAMPLE_COUNT`` of them,
+  spanning the lens."""
+  from specialist.vi_ba.tag_discovery import SAMPLE_COUNT, discovery_rows
+
+  iframes = np.arange(0, 3000, 16, dtype=np.int64)
+  rows = discovery_rows(iframes)
+  assert len(rows) <= SAMPLE_COUNT
+  assert set(rows.tolist()) <= set(iframes.tolist())
+  assert rows[0] < 200 and rows[-1] > 2700

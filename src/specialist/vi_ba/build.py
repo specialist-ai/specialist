@@ -1,11 +1,9 @@
-"""Assemble a VI-BA ``NonlinearFactorGraph``: one ``Pose3`` per keyframe, one
-``Point3`` per landmark the front lens triangulates, one MEI projection factor
-per observation, and IMU preintegration factors between consecutive
-keyframes."""
+"""The VI-BA factor graph: a pose per keyframe, a point per landmark, a MEI factor
+per observation and IMU factors between keyframes."""
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 
 import gtsam
@@ -18,6 +16,7 @@ from specialist.vi_ba.anchor_detection import TagDetection
 
 try:
   from specialist.vi_ba._mei_factor_cpp import (
+    add_mei_factors_cpp,
     make_mei_anchor_tag_factor_cpp,
     make_mei_factor_cpp,
     make_mei_seated_base_tag_factor_cpp,
@@ -122,10 +121,8 @@ def add_mei_factor(
   lens: LensSetup,
   obs_bearing: Float64Array | None = None,
 ) -> None:
-  """Push one native MEI reprojection factor tying ``pose_key`` to ``point_key``
-  through ``lens``'s extrinsic and intrinsics. ``obs_bearing`` is the lens-frame
-  direction the point was seen along; passing it arms the behind-camera
-  cheirality guard."""
+  """Push one MEI reprojection factor of ``point_key`` seen from ``pose_key`` through
+  ``lens``; ``obs_bearing`` arms the cheirality guard."""
   graph.push_back(
     make_mei_factor_cpp(
       pose_key,
@@ -136,6 +133,30 @@ def add_mei_factor(
       *_mei_intrinsics(lens.params),
       np.zeros(3) if obs_bearing is None else _as_vec3(obs_bearing),
     )
+  )
+
+
+def add_mei_factors(
+  graph: gtsam.NonlinearFactorGraph,
+  pose_keys: Sequence[int],
+  point_keys: Sequence[int],
+  pixels: Sequence[Float64Array],
+  noise: gtsam.noiseModel.Base,
+  lens: LensSetup,
+) -> None:
+  """``add_mei_factor`` per row, cheirality guard unarmed, in one native call."""
+  n = len(pose_keys)
+  if n == 0:
+    return
+  add_mei_factors_cpp(
+    graph,
+    np.asarray(pose_keys, dtype=np.int64),
+    np.asarray(point_keys, dtype=np.int64),
+    np.asarray(pixels, dtype=np.float64).reshape(n, 2),
+    noise,
+    lens.extrinsic,
+    *_mei_intrinsics(lens.params),
+    np.zeros((n, 3)),
   )
 
 
@@ -150,10 +171,8 @@ def add_mei_anchor_tag_factor(
   obs_bearing: Float64Array,
   seat_key: int | None = None,
 ) -> None:
-  """Push one native MEI reprojection factor on the observing pose and the
-  anchor's world pose: the tag-frame ``corner`` reprojects as
-  ``pose⁻¹ · anchor · corner`` through ``lens`` onto ``pixel``. ``seat_key``
-  makes the lens's seat rotation a Rot3 variable; its translation stays baked."""
+  """Push one MEI reprojection factor of the anchor's tag-frame ``corner`` seen from
+  ``pose_key``; ``seat_key`` makes the lens seat rotation a variable."""
   graph.push_back(
     make_mei_anchor_tag_factor_cpp(
       pose_key,
@@ -297,12 +316,18 @@ def _add_projection_factors(
   pixel_noise: gtsam.noiseModel.Base,
   pose_key_fn: Callable[[int], int],
 ) -> None:
+  pose_keys: list[int] = []
+  point_keys: list[int] = []
+  pixels: list[Float64Array] = []
   for tid, xyz in channel.points.items():
     lm_key = landmark_key_fn(tid)
     if not values.exists(lm_key):
       values.insert(lm_key, _as_point3(xyz))
     for kf, pt in channel.tracks[tid].items():
-      add_mei_factor(graph, pose_key_fn(kf), lm_key, pt, pixel_noise, channel.setup)
+      pose_keys.append(pose_key_fn(kf))
+      point_keys.append(lm_key)
+      pixels.append(pt)
+  add_mei_factors(graph, pose_keys, point_keys, pixels, pixel_noise, channel.setup)
 
 
 def build_vi_graph(
@@ -321,10 +346,8 @@ def build_vi_graph(
   graph: gtsam.NonlinearFactorGraph,
   values: gtsam.Values,
 ) -> tuple[gtsam.NonlinearFactorGraph, gtsam.Values]:
-  """Visual-inertial graph: the front lens's MEI projection factors plus
-  ``preintegrated[i]`` covering ``(t_i, t_{i+1}]`` between consecutive
-  keyframes, with Gaussian priors on ``V(0)`` / ``B(0)``. The caller grounds
-  the poses."""
+  """The front lens's MEI factors plus the IMU factors between consecutive
+  keyframes, with priors on ``V(0)`` and ``B(0)``."""
   n = len(body_poses)
   if n < 2:
     raise ValueError("build_vi_graph needs at least two keyframes")

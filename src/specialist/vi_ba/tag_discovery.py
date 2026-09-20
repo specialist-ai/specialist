@@ -1,10 +1,5 @@
-"""Discover which rear-lens tags are this tracker's own base and finger tags.
-
-Tags whose corners barely move nominate the gripper's base; the URDF finger
-arcs then assign the roles, accepting a base only when a distinct tag rides each
-revolute joint. Anything but one surviving assignment raises with the per-tag
-evidence.
-"""
+"""Which rear-lens tags are this tracker's base and finger tags: still corners
+nominate the base, the URDF finger arcs assign the fingers."""
 
 from __future__ import annotations
 
@@ -27,6 +22,7 @@ __all__ = [
   "GripperTags",
   "TagDiscoveryError",
   "discover_gripper_tags",
+  "discovery_rows",
   "uniform_sample_rows",
   "validate_discovered",
 ]
@@ -73,6 +69,11 @@ def uniform_sample_rows(
     return np.arange(n, dtype=np.int64)
   lo, hi = int(n * trim), int(n * (1.0 - trim)) - 1
   return np.unique(np.linspace(lo, max(lo, hi), count).round().astype(np.int64))
+
+
+def discovery_rows(iframe_rows: npt.NDArray[np.int64]) -> npt.NDArray[np.int64]:
+  """``SAMPLE_COUNT`` of the lens's I-frame rows, spread uniformly."""
+  return iframe_rows[uniform_sample_rows(len(iframe_rows))]
 
 
 def _tag_tracks(

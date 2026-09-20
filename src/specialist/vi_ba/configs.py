@@ -50,11 +50,11 @@ class FrontendCfg:
   # Max metric depth (m) for kept landmarks in the final (scaled) triangulation.
   max_landmark_depth: float = 5.0
 
-  init_min_shared_tracks: int = 30
-  vo_min_registered_ratio: float = 0.7
   # Re-match ORB features between spatially-close, non-adjacent keyframes to
   # recover tracks the intervening motion breaks.
   loop_closure: bool = True
+  # Keyframes a landmark's observations may span; 0 is unbounded.
+  loop_closure_window: int = 300
 
   # Triangulate the revisit loop landmarks from the anchor-covisible views alone.
   anchored_loop_closure: bool = True
@@ -63,7 +63,7 @@ class FrontendCfg:
   # Cap on reprojection observations per track fed to the joint BA (endpoints +
   # evenly-spaced middle).
   max_obs_per_track: int = 8
-  # Per-thread AprilTag detectors so concurrent tag walks overlap.
+  # Per-thread AprilTag detectors; off, one detector serves every walk in turn.
   parallel_tag_detect: bool = True
 
 
@@ -112,9 +112,8 @@ class TrackerArgs:
   joints: dict[str, RevoluteJoint]
   frontend: FrontendCfg
   gripper: GripperCfg
-  # True when sibling captures prepare concurrently; gates per-thread AprilTag
-  # detectors.
-  parallel_siblings: bool = False
+  # Where the lenses' encoded samples stage; unset, a temporary directory.
+  stage: Path | None = None
 
 
 @dataclass
@@ -133,6 +132,8 @@ class Args:
   urdf_path: Path | None = None
   # Replace an existing track for this session; off refuses.
   overwrite: bool = False
+  # Where the lenses' encoded samples stage; unset, under output_dir.
+  tmpdir: Path | None = None
 
   frontend: FrontendCfg = field(default_factory=FrontendCfg)
   gripper: GripperCfg = field(default_factory=GripperCfg)

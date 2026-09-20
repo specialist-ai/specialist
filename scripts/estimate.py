@@ -1,24 +1,11 @@
-"""VI-BA driver for any number of trackers (N ≥ 1).
-
-Reads one session's base recording, runs the per-tracker prep (decode →
-frontend → anchor PnP → VI alignment), aligns every tracker into the reference
-anchor's world, and solves one joint bundle over:
-
-- Anchor observations: every static anchor is a pose variable seeded from the
-  prep; the known tag size pins absolute scale and the reference carries the
-  datum.
-- Base + finger tags: each tracker's tags reproject through one shared
-  base-tag pose variable, recovering the finger joint angles.
-- Cross-tracker observations (N ≥ 2): tracker O sighting tracker W's base tag
-  ties the two trajectories.
-"""
+"""VI-BA driver: per-tracker prep, alignment into the reference anchor's world, and
+one joint bundle over anchor, gripper-tag and cross-tracker observations."""
 
 from __future__ import annotations
 
 import sys
-import time
+import tempfile
 from collections import Counter
-from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -26,6 +13,7 @@ import gtsam
 import numpy as np
 import tyro
 from specialist_corpus import schema
+from specialist_corpus.frames import release_videos
 
 from specialist.record.layer import write_estimate_layers
 from specialist.record.session import SessionRecording
@@ -46,14 +34,19 @@ from specialist.vi_ba.reference_solve import (
 )
 from specialist.vi_ba.single_tracker import (
   PreparedTracker,
+  bound_malloc_arenas,
   captures_that_fit,
   discover_tracker_tags,
   prepare_tracker,
+  stage_timer,
 )
 from specialist.vi_ba.summary import Summary
 from specialist.vi_ba.tag_discovery import GripperTags, validate_discovered
 from specialist.vi_ba.urdf_joints import read_revolute_joints
 from specialist.vi_ba.viz_build import build_run_estimate
+
+# Arenas the C allocator may spread the walks' threads over.
+_MALLOC_ARENAS = 8
 
 
 def _resolve_urdf_path(explicit: Path | None) -> Path:
@@ -68,18 +61,6 @@ def _resolve_urdf_path(explicit: Path | None) -> Path:
     raise SystemExit(
       f"the gripper URDF is unavailable ({exc}); pass --urdf-path"
     ) from exc
-
-
-def _stage_timer() -> Callable[[str], None]:
-  last = time.perf_counter()
-
-  def mark(stage: str) -> None:
-    nonlocal last
-    now = time.perf_counter()
-    print(f"  [timing] {stage} +{now - last:.1f}s")
-    last = now
-
-  return mark
 
 
 def _print_capture_diagnostics(
@@ -101,7 +82,11 @@ def _print_capture_diagnostics(
 
 def main(args: Args) -> None:
   sys.stdout.reconfigure(line_buffering=True)  # type: ignore[union-attr]
-  session = SessionRecording(args.base)
+  args.output_dir.mkdir(parents=True, exist_ok=True)
+  stage = tempfile.TemporaryDirectory(
+    prefix="lenses-", dir=args.tmpdir if args.tmpdir is not None else args.output_dir
+  )
+  session = SessionRecording(args.base, Path(stage.name))
   names = tuple(session.slots)
   validate(args)
   if args.solver.gpu == "require":
@@ -117,7 +102,8 @@ def main(args: Args) -> None:
     )
   rrd_path.parent.mkdir(parents=True, exist_ok=True)
   viz_path.parent.mkdir(parents=True, exist_ok=True)
-  mark = _stage_timer()
+  mark = stage_timer()
+  bound_malloc_arenas(_MALLOC_ARENAS)
   print(f"session {session.session_id}: trackers {list(names)}")
 
   urdf_path = _resolve_urdf_path(args.urdf_path)
@@ -133,9 +119,9 @@ def main(args: Args) -> None:
       keyframe_every=args.keyframe_every,
       frontend=args.frontend,
       anchor=args.anchor,
-      parallel_siblings=concurrent > 1,
       gripper=args.gripper,
       joints=joints,
+      stage=Path(stage.name),
     )
     for name in names
   }
@@ -148,12 +134,17 @@ def main(args: Args) -> None:
         print(f"\n=== discover tracker {name!r} FAILED ===\n{exc}")
       raise
 
-  if concurrent == 1:
-    tags = {name: _discover_one(name) for name in names}
-  else:
-    configure_detector(args.frontend.parallel_tag_detect)
-    with ThreadPoolExecutor(max_workers=concurrent) as discovery_pool:
-      tags = dict(zip(names, discovery_pool.map(_discover_one, names), strict=True))
+  # The front lenses stage while discovery reads the rear ones.
+  with ThreadPoolExecutor(max_workers=len(names)) as prefetch:
+    front_loads = [prefetch.submit(session.lens_video, name, "front") for name in names]
+    if concurrent == 1:
+      tags = {name: _discover_one(name) for name in names}
+    else:
+      configure_detector(args.frontend.parallel_tag_detect)
+      with ThreadPoolExecutor(max_workers=concurrent) as discovery_pool:
+        tags = dict(zip(names, discovery_pool.map(_discover_one, names), strict=True))
+    for load in front_loads:
+      load.result()
   validate_discovered(tags)
   for name, found in tags.items():
     print(f"  {name}: base tag {found.base}, finger tags {found.fingers}")
@@ -167,10 +158,13 @@ def main(args: Args) -> None:
       if concurrent > 1:
         print(f"\n=== prep tracker {name!r} FAILED: {exc!r} ===")
       raise
+    front_obs = sum(len(obs) for obs in tracker.front.tracks.values())
+    rejected_obs = sum(len(obs) for obs in tracker.front.rejected.values())
     print(
       f"  [{name}/prep] kf={tracker.n_keyframes}  "
       f"anchor_obs={len(anchored_keyframes(tracker))}  "
-      f"front_pts={len(tracker.front.points)}  rear_pts={len(tracker.rear.points)}  "
+      f"front_pts={len(tracker.front.points)}  front_obs={front_obs}  "
+      f"rejected_obs={rejected_obs}  rear_pts={len(tracker.rear.points)}  "
       f"tags={tracker.tags.base}/{tracker.tags.fingers[0]}/{tracker.tags.fingers[1]}"
     )
     return tracker
@@ -184,8 +178,9 @@ def main(args: Args) -> None:
       with ThreadPoolExecutor(max_workers=concurrent) as prep_pool:
         trackers = list(prep_pool.map(_prep_one, names))
   finally:
-    # Release the per-stream GPU workers so the linear solver has device memory.
     gpu_flow.shutdown()
+    release_videos()
+    stage.cleanup()
   mark("trackers prepared")
 
   cross_obs = cross_sightings(trackers, args.gripper.tag_size)
@@ -203,6 +198,7 @@ def main(args: Args) -> None:
   adopt_ba_refined_estimates(trackers, solve.result, keys)
 
   estimate = build_run_estimate(trackers, solve, keys, args, cross_obs, joints)
+  mark("estimate built")
 
   worst_move_translation, worst_move_rotation = solve.worst_anchor_move
   summary = Summary(
@@ -240,6 +236,7 @@ def main(args: Args) -> None:
     anchor_tag_ids=sorted(estimate.anchor_poses_world),
     anchor_tag_size=args.anchor.tag_size,
   ).save(schema.APPLICATION_ID, str(rbl))
+  mark("layers written")
   print(f"Wrote {rrd_path}, {viz_path} and {rbl}")
 
 

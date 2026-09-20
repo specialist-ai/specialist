@@ -43,7 +43,14 @@ from specialist.vi_ba.build import (
 )
 from specialist.vi_ba.configs import Args
 from specialist.vi_ba.single_tracker import PreparedTracker
-from specialist.vi_ba.symbols import LANDMARK_CHAR
+from specialist.vi_ba.symbols import (
+  ANGLE_CHAR,
+  BIAS_CHAR,
+  LANDMARK_CHAR,
+  MAX_KEYFRAMES_PER_TRACKER,
+  POSE_CHAR,
+  VELOCITY_CHAR,
+)
 from specialist.vi_ba.urdf_joints import FINGER_JOINTS
 
 Float64Array = npt.NDArray[np.float64]
@@ -67,10 +74,6 @@ __all__ = [
 ]
 
 _BASE_TAG_CHAR = "G"
-_POSE_CHAR = "p"
-_VEL_CHAR = "v"
-_BIAS_CHAR = "b"
-_ANGLE_CHAR = "a"
 _SEAT_CHAR = "E"
 _ANCHOR_CHAR = "A"
 
@@ -95,13 +98,12 @@ _DATUM_FREE_SIGMA = 1e3
 # Rear-seat rotation prior (rad), loose enough for the measured ~9 deg seat errors.
 _SEAT_PRIOR_SIGMA_ROT = 0.2
 
-_MAX_KEYFRAMES_PER_TRACKER = 100_000
 _MAX_LANDMARKS_PER_TRACKER = 1_000_000
 
 
 class TrackerKeys:
   """Each tracker gets a unique slice of the integer-key space, indexed by
-  ``_MAX_KEYFRAMES_PER_TRACKER`` for poses/velocities/biases and
+  ``MAX_KEYFRAMES_PER_TRACKER`` for poses/velocities/biases and
   ``_MAX_LANDMARKS_PER_TRACKER`` for its landmarks. Anchors are shared by every
   tracker, so they key off the tag id alone."""
 
@@ -121,17 +123,17 @@ class TrackerKeys:
   def _kf_key(self, char: str, name: str, kf: int) -> int:
     """Collision-free key for a per-keyframe variable in one tracker's slice."""
     return int(
-      gtsam.symbol(char, self.tracker_index(name) * _MAX_KEYFRAMES_PER_TRACKER + kf)
+      gtsam.symbol(char, self.tracker_index(name) * MAX_KEYFRAMES_PER_TRACKER + kf)
     )
 
   def pose_key(self, name: str, kf: int) -> int:
-    return self._kf_key(_POSE_CHAR, name, kf)
+    return self._kf_key(POSE_CHAR, name, kf)
 
   def velocity_key(self, name: str, kf: int) -> int:
-    return self._kf_key(_VEL_CHAR, name, kf)
+    return self._kf_key(VELOCITY_CHAR, name, kf)
 
   def bias_key(self, name: str, kf: int) -> int:
-    return self._kf_key(_BIAS_CHAR, name, kf)
+    return self._kf_key(BIAS_CHAR, name, kf)
 
   def front_landmark_key(self, name: str, track_id: int) -> int:
     """Key for a landmark in one tracker's landmark slot. Track ids are handed
@@ -151,7 +153,7 @@ class TrackerKeys:
   def theta_key(self, name: str, finger_idx: int, kf: int) -> int:
     """Key for a finger's revolute joint angle (scalar) at one keyframe.
     ``finger_idx`` 0 = left, 1 = right; collision-free per tracker and finger."""
-    return self._slot_key(_ANGLE_CHAR, name, finger_idx, _MAX_KEYFRAMES_PER_TRACKER, kf)
+    return self._slot_key(ANGLE_CHAR, name, finger_idx, MAX_KEYFRAMES_PER_TRACKER, kf)
 
   def _slot_key(self, char: str, name: str, half: int, width: int, index: int) -> int:
     """One integer key in the tracker's ``half`` slice of a ``width``-wide slot."""

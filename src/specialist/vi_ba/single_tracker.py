@@ -1,22 +1,21 @@
-"""Per-tracker prep for VI-BA: read one tracker's lenses and IMU out of a base
-recording, detect its tags, recover the anchor poses by PnP, chain the front
-lens's tracks, seed a trajectory from visual odometry (the metric anchor poses
-are the starved fallback), align it to the IMU for scale and gravity, and
-re-triangulate the landmarks metrically. Returns a ``PreparedTracker`` ready
-for ``specialist.vi_ba.compose`` to assemble into a joint factor graph.
-"""
+"""One tracker's lenses and IMU prepared into a ``PreparedTracker`` for the joint
+graph: tags, anchor PnP, front-lens tracks, an anchor-seeded trajectory aligned
+to the IMU, and metric landmarks."""
 
 from __future__ import annotations
 
 import ctypes
+import threading
+import time
 from collections.abc import Callable, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TypeVar
 
 import gtsam
 import numpy as np
 import numpy.typing as npt
-from specialist_camera import mei_unproject
 from specialist_corpus import schema
 from specialist_corpus.frames import LensVideo, RecordingKeyframes
 
@@ -31,17 +30,16 @@ from specialist.vi_ba.anchor_detection import (
   anchor_pose_from_tags,
   configure_detector,
   detect_all_tags,
+  detect_tags_following_split,
 )
 from specialist.vi_ba.build import LensChannel, LensSetup
 from specialist.vi_ba.configs import (
-  FrontendCfg,
   TrackerArgs,
 )
 from specialist.vi_ba.features import (
   Frame,
   available_ram,
   detect_orb,
-  parallel_map,
 )
 from specialist.vi_ba.finger_kinematics import FingerReproj, recover_gripper_tags
 from specialist.vi_ba.geometry import average_pose, consensus_pose, translation
@@ -58,26 +56,21 @@ from specialist.vi_ba.init import (
   apply_alignment_to_poses,
   body_poses_from_camera_poses,
   fill_camera_poses,
-  incremental_sfm,
-  interpolate_camera_poses,
-  pick_init_pair,
-  reject_vo_pose_outliers,
-  two_view_essential,
   visual_inertial_align,
 )
 from specialist.vi_ba.tag_discovery import (
   GripperTags,
   TagDiscoveryError,
   discover_gripper_tags,
-  uniform_sample_rows,
+  discovery_rows,
 )
 from specialist.vi_ba.tracks import (
   add_loop_landmarks,
-  bearings_by_track,
   cap_landmarks,
   filter_tracks_by_parallax,
   loop_closure_tracks,
   run_lens_frontend,
+  split_tracks_to_window,
   subsample_obs,
   triangulate_lens,
 )
@@ -86,11 +79,18 @@ Float64Array = npt.NDArray[np.float64]
 
 _A = TypeVar("_A")
 
-# Keyframes read at once from a banded lens.
-PREP_BAND = 256
+# Keyframes decoded at once from the front and the rear lens.
+PREP_BAND = 128
+_REAR_BAND = 64
 
 # Share of the available memory the concurrent decodes may claim between them.
 _PREP_MEMORY_SHARE = 0.35
+
+# Frames that may wait on the per-frame job workers, and the workers.
+_FRAME_JOBS_PENDING = 32
+_FRAME_JOB_WORKERS = 8
+# Runs the rear lens walk splits into, each with its own decoder.
+_REAR_WALK_SEGMENTS = 2
 
 
 __all__ = [
@@ -98,7 +98,89 @@ __all__ = [
   "captures_that_fit",
   "discover_tracker_tags",
   "prepare_tracker",
+  "renumber_landmarks",
+  "bound_malloc_arenas",
+  "stage_timer",
 ]
+
+
+def _resident_gb() -> float | None:
+  """The process's anonymous resident memory in GB, where the platform reports it."""
+  try:
+    for line in Path("/proc/self/status").read_text().splitlines():
+      if line.startswith("RssAnon:"):
+        return int(line.split()[1]) / 2**20
+  except (OSError, ValueError, IndexError):
+    pass
+  return None
+
+
+def stage_timer(scope: str | None = None) -> Callable[[str], None]:
+  """A ``[scope/timing] <stage> +<seconds> rss=<GB>`` line per finished stage."""
+  tag = f"{scope}/timing" if scope else "timing"
+  last = time.perf_counter()
+
+  def mark(stage: str) -> None:
+    nonlocal last
+    now = time.perf_counter()
+    resident = _resident_gb()
+    memory = "" if resident is None else f" rss={resident:.1f}GB"
+    print(f"  [{tag}] {stage} +{now - last:.1f}s{memory}")
+    last = now
+
+  return mark
+
+
+class _FrameJobs:
+  """Tag detection and loop-closure ORB per frame, on workers beside the walk."""
+
+  def __init__(self, n_frames: int, orb_features: int) -> None:
+    self._orb_features = orb_features
+    self.tags: list[list[TagDetection]] = [[] for _ in range(n_frames)]
+    self._orb: list[Frame | None] = [None] * n_frames
+    self._pool = ThreadPoolExecutor(max_workers=_FRAME_JOB_WORKERS)
+    self._slots = threading.BoundedSemaphore(_FRAME_JOBS_PENDING)
+    self._futures: list[Future[None]] = []
+
+  @property
+  def orb(self) -> list[Frame]:
+    """Every frame's ORB keypoints and descriptors; empty with no budget."""
+    return [] if self._orb_features <= 0 else [f for f in self._orb if f is not None]
+
+  def submit(self, k: int, frame: np.ndarray) -> None:
+    # The previous band's freed frames go back to the OS as a band starts.
+    if k % PREP_BAND == 0:
+      release_freed_memory()
+    self._slots.acquire()
+    self._futures.append(self._pool.submit(self._run, k, frame))
+
+  def _run(self, k: int, frame: np.ndarray) -> None:
+    try:
+      self.tags[k] = detect_all_tags([frame])[0]
+      if self._orb_features > 0:
+        self._orb[k] = detect_orb(frame, self._orb_features, 20)
+    finally:
+      self._slots.release()
+
+  def __enter__(self) -> _FrameJobs:
+    return self
+
+  def __exit__(self, *exc: object) -> None:
+    self._pool.shutdown(wait=True)
+    for future in self._futures:
+      future.result()
+
+
+def renumber_landmarks(
+  points: dict[int, Float64Array], tracks: dict[int, dict[int, Float64Array]]
+) -> tuple[dict[int, Float64Array], dict[int, dict[int, Float64Array]]]:
+  """``points`` and ``tracks`` re-keyed ``0..n-1`` in ascending order of the
+  point ids; a track without a point is dropped."""
+  dense = {old: new for new, old in enumerate(sorted(points))}
+  return (
+    {dense[t]: p for t, p in points.items()},
+    {dense[t]: obs for t, obs in tracks.items() if t in dense},
+  )
 
 
 def resolve_keyframe_every(keyframe_every: int, fps: float) -> int:
@@ -114,10 +196,19 @@ def resolve_keyframe_every(keyframe_every: int, fps: float) -> int:
   return keyframe_every if keyframe_every > 0 else stride
 
 
+def bound_malloc_arenas(limit: int) -> bool:
+  """Cap glibc's malloc arenas at ``limit``; whether the allocator took it."""
+  try:
+    libc = ctypes.CDLL("libc.so.6")
+    m_arena_max = -8
+    return bool(libc.mallopt(m_arena_max, limit))
+  except (OSError, AttributeError):
+    return False
+
+
 def release_freed_memory() -> None:
-  """Hand freed heap back to the OS. glibc raises its mmap threshold once it has
-  seen large blocks freed, after which keyframe-sized allocations come from the
-  heap and are retained. A no-op where the C library has no ``malloc_trim``."""
+  """Hand freed heap back to the OS; a no-op where the C library has no
+  ``malloc_trim``."""
   try:
     ctypes.CDLL("libc.so.6").malloc_trim(0)
   except (OSError, AttributeError):
@@ -233,42 +324,14 @@ def _anchor_pose_seed(
   front_extrinsic: gtsam.Pose3,
   n_keyframes: int,
 ) -> list[gtsam.Pose3] | None:
-  """Metric body-pose seed from the front-lens anchor PnP: world (= the anchor
-  tag frame) ``T_body`` at every keyframe that sees the anchor, with gaps
-  geodesic-filled. Returns ``None`` when too few keyframes see the anchor to
-  seed a trajectory."""
+  """Body poses at every keyframe from the anchor sightings, gaps geodesic-filled,
+  or ``None`` when too few keyframes see the anchor."""
   cam_poses = {kf: pose.inverse() for kf, pose in anchor_obs_per_kf.items()}
   if not _enough_registered(len(cam_poses), n_keyframes):
     return None
   return body_poses_from_camera_poses(
     fill_camera_poses(cam_poses, n_keyframes), front_extrinsic
   )
-
-
-def _anchor_metric_scale(
-  body_poses_unscaled: list[gtsam.Pose3],
-  anchor_obs_per_kf: dict[int, gtsam.Pose3],
-  front_lens: LensSetup,
-) -> float | None:
-  """Metric scale from the anchor: the ratio of the anchor-implied body-position
-  spread (from each keyframe's ``cam_T_tag``) to the unscaled visual-odometry
-  spread, over the anchored keyframes. ``None`` if fewer than three anchored
-  keyframes or the visual spread is degenerate."""
-  vo: list[Float64Array] = []
-  anc: list[Float64Array] = []
-  for kf, cam_T_tag in anchor_obs_per_kf.items():
-    body_in_tag = front_lens.extrinsic.compose(cam_T_tag).inverse()
-    anc.append(translation(body_in_tag))
-    vo.append(translation(body_poses_unscaled[kf]))
-  if len(vo) < 3:
-    return None
-  vo_arr = np.asarray(vo, dtype=np.float64)
-  anc_arr = np.asarray(anc, dtype=np.float64)
-  vo_spread = float(np.sqrt(((vo_arr - vo_arr.mean(axis=0)) ** 2).sum()))
-  anc_spread = float(np.sqrt(((anc_arr - anc_arr.mean(axis=0)) ** 2).sum()))
-  if vo_spread < 1e-9:
-    return None
-  return anc_spread / vo_spread
 
 
 def _imu_and_initial_gravity(
@@ -278,15 +341,8 @@ def _imu_and_initial_gravity(
   keyframe_times: Float64Array,
   body_poses_prealign: list[gtsam.Pose3],
 ) -> tuple[ImuSamples, gtsam.imuBias.ConstantBias, Float64Array | None]:
-  """Rescaled IMU samples, the body-frame factory bias, and an initial world
-  gravity.
-
-  Rotates the factory bias into the body frame. Where a stationary window
-  exists, rescales the accelerometer so its magnitude there matches
-  |g| = 9.81 m/s², then reads gravity off the mean stationary acceleration and
-  rotates it into the world frame via the nearest keyframe pose. Returns
-  ``gravity_world_initial=None`` when the clip has no stationary window.
-  """
+  """IMU samples rescaled to |g| on the first stationary window, the body-frame
+  factory bias, and the gravity that window gives in the world (``None`` without one)."""
   bias0 = gtsam.imuBias.ConstantBias(
     imu_to_body @ np.asarray(raw_factory_bias.accelerometer(), dtype=np.float64),
     imu_to_body @ np.asarray(raw_factory_bias.gyroscope(), dtype=np.float64),
@@ -319,61 +375,19 @@ def _seed_body_poses(
   front: _LensPrep,
   n_keyframes: int,
   anchor_obs_per_kf: dict[int, gtsam.Pose3],
-  cfg: FrontendCfg,
-) -> tuple[list[gtsam.Pose3], bool]:
-  """The pre-alignment body-pose seed, and whether it came from the anchor.
-
-  The visual-odometry front-end recovers the trajectory shape from the front
-  lens. Where too few keyframes register, the anchor-PnP poses seed instead;
-  where the anchor is not visible either, a two-view essential solve on the
-  widest init pair gives a straight line through the keyframes."""
-  sfm_cams, _ = incremental_sfm(
-    bearings_by_track(front.kept, front.setup.params),
-    min_shared=cfg.init_min_shared_tracks,
-  )
-  sfm_cams, vo_outliers = reject_vo_pose_outliers(sfm_cams)
-  if vo_outliers:
-    print(f"  [{name}/vo] rejected {len(vo_outliers)} rotation-spike kfs")
-  if _enough_registered(len(sfm_cams), n_keyframes, cfg.vo_min_registered_ratio):
-    print(f"  [{name}/vo] registered {len(sfm_cams)}/{n_keyframes} keyframes")
-    filled = fill_camera_poses(sfm_cams, n_keyframes)
-    return body_poses_from_camera_poses(filled, front.setup.extrinsic), False
-
-  anchor_seed = _anchor_pose_seed(anchor_obs_per_kf, front.setup.extrinsic, n_keyframes)
-  if anchor_seed is not None:
-    n_anchor_kf = len(anchor_obs_per_kf)
-    print(
-      f"  [{name}/vo] starved ({len(sfm_cams)}/{n_keyframes}); "
-      f"anchor-pose init from {n_anchor_kf} anchor keyframes"
-    )
-    return anchor_seed, True
-  print(
-    f"  [{name}/vo] only {len(sfm_cams)}/{n_keyframes} "
-    f"keyframes registered; using straight-line init"
-  )
-  init_first, init_last, init_shared = pick_init_pair(
-    front.kept, n_keyframes, cfg.init_min_shared_tracks
-  )
-  if init_shared < 8:
+) -> list[gtsam.Pose3]:
+  """The pre-alignment body poses, seeded from the anchor sightings."""
+  seed = _anchor_pose_seed(anchor_obs_per_kf, front.setup.extrinsic, n_keyframes)
+  if seed is None:
     raise RuntimeError(
-      f"{name}: the front lens has no init pair with ≥8 shared tracks "
-      f"(best={init_shared})"
+      f"{name}: only {len(anchor_obs_per_kf)}/{n_keyframes} keyframes see the "
+      "anchor; the trajectory seed needs a quarter of them"
     )
-  if init_first:
-    print(f"  [{name}/vo] init pair based at keyframe {init_first}")
-  shared = [
-    obs for obs in front.kept.values() if init_first in obs and init_last in obs
-  ]
-  pix_a = np.asarray([obs[init_first] for obs in shared], dtype=np.float64)
-  pix_b = np.asarray([obs[init_last] for obs in shared], dtype=np.float64)
-  r_cw_last, t_cw_last, _ = two_view_essential(
-    mei_unproject(pix_a, front.setup.params),
-    mei_unproject(pix_b, front.setup.params),
+  print(
+    f"  [{name}/vo] anchor-pose init from {len(anchor_obs_per_kf)}/{n_keyframes} "
+    f"anchor keyframes"
   )
-  cam_poses = interpolate_camera_poses(
-    r_cw_last, t_cw_last, n_keyframes, init_first=init_first, init_last=init_last
-  )
-  return body_poses_from_camera_poses(cam_poses, front.setup.extrinsic), False
+  return seed
 
 
 def _align_visual_inertial(
@@ -383,19 +397,14 @@ def _align_visual_inertial(
   bias0: gtsam.imuBias.ConstantBias,
   body_poses_prealign: list[gtsam.Pose3],
   gravity_world_initial: Float64Array | None,
-  fixed_scale: float | None,
 ) -> tuple[
   list[gtsam.Pose3],
   list[Float64Array],
   list[gtsam.PreintegratedCombinedMeasurements],
   Float64Array,
 ]:
-  """Metric gravity-aligned body poses, their velocities, the keyframe
-  preintegration, and the 3x3 map (scale · rotation) that carries prep-frame
-  points into the same world.
-
-  A negative recovered scale means the two-view init reflected the trajectory,
-  so it is reflected back and re-aligned."""
+  """Gravity-aligned metric body poses, velocities, keyframe preintegration and the
+  3x3 map carrying prep-frame points into the same world."""
 
   def pim_params(
     gravity: tuple[float, float, float],
@@ -410,7 +419,7 @@ def _align_visual_inertial(
 
   def align(poses: list[gtsam.Pose3]) -> Alignment:
     return visual_inertial_align(
-      poses, pim, fixed_gravity=gravity_world_initial, fixed_scale=fixed_scale
+      poses, pim, fixed_gravity=gravity_world_initial, fixed_scale=1.0
     )
 
   alignment = align(body_poses_prealign)
@@ -436,15 +445,13 @@ def _align_visual_inertial(
 
 
 def captures_that_fit(session: SessionRecording, names: Sequence[str]) -> int:
-  """How many captures may prep at once before their decoded frames exceed the
-  memory on hand. A capture decodes one band of keyframes per lens at a time;
-  the encoded samples those bands decode from are shared by every capture."""
+  """How many captures may prep at once within the memory on hand."""
   if len(names) <= 1:
     return len(names)
   height, width = session.decoded_shape(names[0])
-  per_capture = PREP_BAND * width * height  # one lens's resident band at a time
-  shared = session.path.stat().st_size
-  budget = available_ram() * _PREP_MEMORY_SHARE - shared
+  bands = 2 * PREP_BAND + 2 * _REAR_WALK_SEGMENTS * _REAR_BAND
+  per_capture = bands * width * height
+  budget = available_ram() * _PREP_MEMORY_SHARE
   affordable = int(budget / per_capture)
   return max(1, min(len(names), affordable))
 
@@ -455,10 +462,8 @@ def keyframe_grid(
   fps: float,
   keyframe_every: int,
 ) -> tuple[npt.NDArray[np.int64], int]:
-  """Keyframe rows over the covered span and the phase they start on, snapped
-  to the session-clock stride lattice the review timeline buckets by. When no
-  covered row sits on the lattice the grid simply starts at the first covered
-  row."""
+  """Keyframe rows over the covered span, snapped to the session-clock stride
+  lattice, and the phase they start on."""
   stride = schema.keyframe_stride(fps)
   session_rows = np.round(times * fps).astype(np.int64)
   on_lattice = np.flatnonzero(session_rows[covered] % stride == 0)
@@ -484,9 +489,9 @@ def discover_tracker_tags(args: TrackerArgs) -> GripperTags:
   """Identify one tracker's gripper tags from a sparse rear-lens read, so a
   take whose tags are missing or unrecognisable fails before the prep decodes
   anything."""
-  session = SessionRecording(args.base_rrd)
+  session = SessionRecording(args.base_rrd, args.stage)
   rear = session.lens_video(args.tracker, "rear")
-  walk = RecordingKeyframes(rear, uniform_sample_rows(len(rear.times)), band=1)
+  walk = RecordingKeyframes(rear, discovery_rows(rear.iframe_rows), band=1)
   detections = _per_band(detect_all_tags, walk)
   _, rear_lens = session.lens_setups(args.tracker, int(walk[0].shape[1]))
   try:
@@ -502,13 +507,12 @@ def discover_tracker_tags(args: TrackerArgs) -> GripperTags:
 
 
 def prepare_tracker(args: TrackerArgs, tags: GripperTags) -> PreparedTracker:
-  """Run every per-tracker stage. Returns a ``PreparedTracker`` ready for
-  joint-graph composition. Body poses are in this tracker's own gravity-
-  aligned visual world; the caller aligns trackers to a shared frame via
-  ``anchor_locals_by_tag``."""
+  """Every per-tracker stage; the body poses are in this tracker's own
+  gravity-aligned world."""
   name = args.tracker
-  configure_detector(args.frontend.parallel_tag_detect and args.parallel_siblings)
-  session = SessionRecording(args.base_rrd)
+  lap = stage_timer(name)
+  configure_detector(args.frontend.parallel_tag_detect)
+  session = SessionRecording(args.base_rrd, args.stage)
   front_video = session.lens_video(args.tracker, "front")
   rear_video = session.lens_video(args.tracker, "rear")
   fps = fps_from_times(front_video.times)
@@ -521,45 +525,75 @@ def prepare_tracker(args: TrackerArgs, tags: GripperTags) -> PreparedTracker:
   )
   grid_times = front_video.times[front_rows]
 
-  def walk_front() -> tuple[int, list[list[TagDetection]], list[Frame]]:
-    """One banded walk detecting tags and loop-closure ORB together. With loop
-    closure off the ORB list comes back empty."""
-    walk = RecordingKeyframes(front_video, front_rows, band=PREP_BAND)
-    width = int(walk[0].shape[1])
-    if not args.frontend.loop_closure:
-      return width, _per_band(detect_all_tags, walk), []
-
-    def band_fn(
-      band: list[np.ndarray],
-    ) -> list[tuple[list[TagDetection], Frame]]:
-      tags = detect_all_tags(band)
-      orb = parallel_map(
-        lambda f: detect_orb(f, args.frontend.orb_n_features, 20), band
-      )
-      return list(zip(tags, orb, strict=True))
-
-    fused = _per_band(band_fn, walk)
-    return width, [tags for tags, _ in fused], [orb for _, orb in fused]
-
-  decoded_width, front_tags_per_kf, front_orb = walk_front()
-  front_lens, rear_lens = session.lens_setups(args.tracker, decoded_width)
-  release_freed_memory()
-  # Rear: one dense walk, of which the keyframe set is a stride.
+  # Rear: a dense walk beside the front walk; the keyframes are a stride of it.
   stride = finger_stride(keyframe_every, fps)
   dense_rows = nearest_rows(
     rear_video.times, front_video.times[covered][grid_phase::stride]
   )
-  rear_tags_per_frame = _per_band(
-    detect_all_tags, RecordingKeyframes(rear_video, dense_rows, band=PREP_BAND)
-  )
+  kf_stride = keyframe_every // stride
   rear_frame_times = rear_video.times[dense_rows]
-  rear_tags_per_kf = rear_tags_per_frame[:: keyframe_every // stride]
-  n_keyframes = min(len(front_tags_per_kf), len(rear_tags_per_kf))
+  rear_walk = ThreadPoolExecutor(max_workers=1)
+
+  def rear_frames(
+    begin: int, end: int, video: LensVideo = rear_video
+  ) -> RecordingKeyframes:
+    return RecordingKeyframes(video, dense_rows[begin:end], band=_REAR_BAND)
+
+  rear_tags_future = rear_walk.submit(
+    detect_tags_following_split,
+    rear_frames,
+    len(dense_rows),
+    kf_stride,
+    {tag_id for tag_id in tags.fingers if tag_id > 0},
+    _REAR_WALK_SEGMENTS,
+  )
+
+  # Front: one walk serves the flow tracks, the tag detections and the ORB.
+  lap("inputs loaded")
+  front_frames = RecordingKeyframes(front_video, front_rows, band=PREP_BAND)
+  decoded_width = int(front_frames[0].shape[1])
+  front_lens, rear_lens = session.lens_setups(args.tracker, decoded_width)
+  front = _LensPrep(side="front", setup=front_lens, tags=[])
+  jobs = _FrameJobs(
+    len(front_frames),
+    args.frontend.orb_n_features if args.frontend.loop_closure else 0,
+  )
+  try:
+    with jobs:
+      front.keypoints, tracks = run_lens_frontend(
+        front_frames,
+        front_lens.params,
+        args.frontend,
+        label=f"{name}/front",
+        on_frame=jobs.submit,
+      )
+  finally:
+    # A front walk that fails must not leave the rear walk decoding.
+    rear_walk.shutdown(wait=True, cancel_futures=True)
+  front.tags, front_orb = jobs.tags, jobs.orb
+  del front_frames, jobs
+  lap("front lens walk")
+  front.kept = {
+    t: o for t, o in tracks.items() if len(o) >= args.frontend.min_track_length
+  }
+  if args.frontend.min_parallax > 0.0:
+    front.kept, front.rejected = filter_tracks_by_parallax(
+      front.kept, front.setup.params, args.frontend.min_parallax
+    )
+  del tracks
+  lap("front tracks")
+
+  rear_tags_per_frame = rear_tags_future.result()
+  # The encoded samples are read; nothing past the walks touches them.
+  del front_video, rear_video
+  rear_tags_per_kf = rear_tags_per_frame[::kf_stride]
+  n_keyframes = min(len(front.tags), len(rear_tags_per_kf))
   release_freed_memory()
+  lap("rear lens walk, past the front")
   if n_keyframes < 3:
     raise RuntimeError(f"only {n_keyframes} keyframes decoded — window too short")
-  front_tags_per_kf = front_tags_per_kf[:n_keyframes]
-  rear_tags_per_kf = rear_tags_per_kf[:n_keyframes]
+  front.tags = front.tags[:n_keyframes]
+  rear = _LensPrep(side="rear", setup=rear_lens, tags=rear_tags_per_kf[:n_keyframes])
   keyframe_times = grid_times[:n_keyframes]
 
   imu_to_body = session.imu_to_body(args.tracker)
@@ -572,8 +606,6 @@ def prepare_tracker(args: TrackerArgs, tags: GripperTags) -> PreparedTracker:
   )
   del raw_imu
 
-  front = _LensPrep(side="front", setup=front_lens, tags=front_tags_per_kf)
-  rear = _LensPrep(side="rear", setup=rear_lens, tags=rear_tags_per_kf)
   # Front lens only: the rear seat is a solved variable, so prep never reads it.
   obs_by_tag = {
     tag_id: anchor_pose_from_tags(
@@ -591,28 +623,10 @@ def prepare_tracker(args: TrackerArgs, tags: GripperTags) -> PreparedTracker:
       f"({len(anchor_obs_per_kf)} sighted keyframes vs {n_ref} for "
       f"tag {reference_tag_id})"
     )
+  lap("anchor pnp")
 
-  def run_lens(ch: _LensPrep, video: LensVideo, rows: npt.NDArray[np.int64]) -> None:
-    """Decode this lens, take everything downstream needs from its pixels, and
-    drop them again before the other lens is touched."""
-    frames = RecordingKeyframes(video, rows, band=PREP_BAND)
-    ch.keypoints, tracks = run_lens_frontend(
-      frames, ch.setup.params, args.frontend, label=f"{name}/{ch.side}"
-    )
-    ch.kept = {
-      t: o for t, o in tracks.items() if len(o) >= args.frontend.min_track_length
-    }
-    if args.frontend.min_parallax > 0.0:
-      ch.kept, ch.rejected = filter_tracks_by_parallax(
-        ch.kept, ch.setup.params, args.frontend.min_parallax
-      )
-    release_freed_memory()
-
-  run_lens(front, front_video, front_rows)
-
-  body_poses_prealign, anchor_seed_used = _seed_body_poses(
-    name, front, n_keyframes, anchor_obs_per_kf, args.frontend
-  )
+  body_poses_prealign = _seed_body_poses(name, front, n_keyframes, anchor_obs_per_kf)
+  lap("trajectory seed")
 
   imu, bias0, gravity_world_initial = _imu_and_initial_gravity(
     imu,
@@ -631,12 +645,8 @@ def prepare_tracker(args: TrackerArgs, tags: GripperTags) -> PreparedTracker:
     min_landmark_depth=0.01,
     max_landmark_depth=1000.0,
   )
+  lap("prealign triangulation")
 
-  # An anchor seed is already metric, so its scale is 1.0; otherwise take the
-  # scale from a visible anchor, and float it on the IMU only with no anchor.
-  anchor_scale = _anchor_metric_scale(
-    body_poses_prealign, anchor_obs_per_kf, front_lens
-  )
   body_poses, velocities, pim, prealign_to_world = _align_visual_inertial(
     name,
     imu,
@@ -644,8 +654,8 @@ def prepare_tracker(args: TrackerArgs, tags: GripperTags) -> PreparedTracker:
     bias0,
     body_poses_prealign,
     gravity_world_initial,
-    fixed_scale=1.0 if anchor_seed_used else anchor_scale,
   )
+  lap("vi alignment")
 
   # Each sighted anchor's pose in this tracker's local world, for the
   # shared-world alignment.
@@ -672,11 +682,13 @@ def prepare_tracker(args: TrackerArgs, tags: GripperTags) -> PreparedTracker:
       body_poses,
       front_lens,
       max(front.kept, default=0),
+      window=args.frontend.loop_closure_window,
     )
   # The ORB frames are the last hold on the front lens's descriptors, ~385 kB a
   # keyframe, and nothing past loop closure reads them.
   front_orb.clear()
   release_freed_memory()
+  lap("loop closure")
 
   if anchor_obs_per_kf:
     front.points = triangulate_lens(
@@ -707,11 +719,19 @@ def prepare_tracker(args: TrackerArgs, tags: GripperTags) -> PreparedTracker:
       tid: prealign_to_world @ xyz for tid, xyz in front.landmarks_prealign.items()
     }
 
+  front.points, windowed = split_tracks_to_window(
+    front.points,
+    {t: front.kept[t] for t in front.points if t in front.kept},
+    args.frontend.loop_closure_window,
+  )
   front.tracks = {
-    t: subsample_obs(front.kept[t], args.frontend.max_obs_per_track)
-    for t in front.points
-    if t in front.kept
+    t: subsample_obs(obs, args.frontend.max_obs_per_track)
+    for t, obs in windowed.items()
   }
+  # The landmarks that reach the bundle take dense ids.
+  front.points, front.tracks = renumber_landmarks(front.points, front.tracks)
+
+  lap("landmarks")
 
   v_max = float(max(np.linalg.norm(v) for v in velocities))
   print(f"  [{name}/vi] LSQ |v|max={v_max:.2f} m/s")
@@ -729,6 +749,7 @@ def prepare_tracker(args: TrackerArgs, tags: GripperTags) -> PreparedTracker:
       rear_frame_times,
     )
   )
+  lap("gripper tags")
 
   return PreparedTracker(
     name=name,
