@@ -410,7 +410,7 @@ def _pinned_solve_fixture(
   args = Args(
     base=Path("session_base.rrd"),
     anchor=AnchorCfg(tag_ids=(1, 5) if with_secondary else (1,)),
-    solver=SolverCfg(velocity_prior_sigma=0.01, gpu="off"),
+    solver=SolverCfg(velocity_prior_sigma=0.01),
   )
   return [tracker], TrackerKeys(["a"]), args, world_T_ref, world_T_sec
 
@@ -666,7 +666,7 @@ def test_an_anchor_no_front_lens_resolved_is_reported(
   args = Args(
     base=Path("session_base.rrd"),
     anchor=AnchorCfg(tag_ids=(1, 5)),
-    solver=SolverCfg(gpu="off"),
+    solver=SolverCfg(),
   )
   graph = gtsam.NonlinearFactorGraph()
   values = gtsam.Values()

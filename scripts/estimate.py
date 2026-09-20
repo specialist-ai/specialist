@@ -88,8 +88,7 @@ def main(args: Args) -> None:
   session = SessionRecording(args.base, Path(stage.name))
   names = tuple(session.slots)
   validate(args)
-  if args.solver.gpu == "require":
-    assert_backend()
+  assert_backend()
   rrd_path = schema.layer_rrd(args.output_dir, schema.ESTIMATE, session.session_id)
   viz_path = schema.layer_rrd(args.output_dir, schema.VIZ, session.session_id)
   existing = [p for p in (rrd_path, viz_path) if p.exists()]

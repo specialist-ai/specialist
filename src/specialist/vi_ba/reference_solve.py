@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 import gtsam
 import numpy as np
 
+from specialist.vi_ba._mei_factor_cpp import prune_factors
 from specialist.vi_ba.compose import (
   CrossSighting,
   LandmarkKeep,
@@ -15,7 +16,7 @@ from specialist.vi_ba.compose import (
   assemble_joint_graph,
   points_from_values,
 )
-from specialist.vi_ba.configs import Args, GpuMode
+from specialist.vi_ba.configs import Args
 from specialist.vi_ba.landmark_cull import cull_outlier_landmarks
 from specialist.vi_ba.optimize import OptimizeResult, optimize_graph
 from specialist.vi_ba.single_tracker import PreparedTracker
@@ -35,11 +36,9 @@ def _prune_factor_graph(
   graph: gtsam.NonlinearFactorGraph, drop_keys: set[int]
 ) -> gtsam.NonlinearFactorGraph:
   """A copy of ``graph`` without the factors that touch a key in ``drop_keys``."""
-  pruned = gtsam.NonlinearFactorGraph()
-  for i in range(graph.size()):
-    factor = graph.at(i)
-    if not any(k in drop_keys for k in factor.keys()):
-      pruned.push_back(factor)
+  pruned: gtsam.NonlinearFactorGraph = prune_factors(
+    graph, np.fromiter(drop_keys, dtype=np.int64, count=len(drop_keys))
+  )
   return pruned
 
 
@@ -64,7 +63,6 @@ def _solve_with_cull_reoptimize(
   trackers: list[PreparedTracker],
   keys: TrackerKeys,
   max_iterations: int,
-  gpu: GpuMode,
 ) -> tuple[OptimizeResult, LandmarkKeep]:
   """Solve, drop the landmarks the first solve exposes as outliers and re-solve warm;
   return the result and each tracker's kept tracks."""
@@ -73,17 +71,15 @@ def _solve_with_cull_reoptimize(
     graph,
     values,
     max_iterations=min(max_iterations, _PRECULL_MAX_ITERATIONS),
-    gpu=gpu,
   )
   poses_by_tracker = _solved_body_poses(trackers, keys, result.values)
   landmark_keep: LandmarkKeep = {}
   for t in trackers:
-    poses_1 = poses_by_tracker[t.name]
     points = points_from_values(
       result.values, keys.front_landmark_key, t.name, t.front.points
     )
     landmark_keep[t.name] = cull_outlier_landmarks(
-      points, t.front.tracks, poses_1, t.front.setup
+      points, t.front.tracks, poses_by_tracker[t.name], t.front.setup
     )
   first = result
   outlier_keys = _outlier_landmark_keys(trackers, keys, landmark_keep)
@@ -92,11 +88,19 @@ def _solve_with_cull_reoptimize(
     kept_values = gtsam.Values(result.values)
     for key in outlier_keys:
       kept_values.erase(key)
-    result = optimize_graph(pruned, kept_values, max_iterations=max_iterations, gpu=gpu)
+    result = optimize_graph(
+      pruned,
+      kept_values,
+      max_iterations=max_iterations,
+      initial_lambda=first.final_lambda,
+    )
     print(f"  [solve] cull-reoptimize dropped {len(outlier_keys)} outlier landmarks")
   elif result.iterations >= _PRECULL_MAX_ITERATIONS:
     result = optimize_graph(
-      graph, result.values, max_iterations=max_iterations, gpu=gpu
+      graph,
+      result.values,
+      max_iterations=max_iterations,
+      initial_lambda=first.final_lambda,
     )
   else:
     return result, landmark_keep
@@ -162,7 +166,7 @@ def _solve_joint_graph(
   """Solve the joint graph and read every anchor's world pose back out of it."""
   graph, values = assemble_joint_graph(trackers, keys, args, cross_obs, anchor_seed)
   result, landmark_keep = _solve_with_cull_reoptimize(
-    graph, values, trackers, keys, args.solver.max_iterations, args.solver.gpu
+    graph, values, trackers, keys, args.solver.max_iterations
   )
 
   solved: dict[int, gtsam.Pose3] = {}
