@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 from PIL import Image
 from scipy.spatial.transform import Rotation
-from scripts.state import Args, main
+from scripts.state import Args, blob_runs, main
 from specialist_camera import disc_mask, to_image
 from specialist_dataset import schema
 from specialist_dataset.frames import LensVideo, decode_rows
@@ -245,3 +245,11 @@ def test_the_writer_refuses_what_it_cannot_honour(
   ):
     with pytest.raises(SystemExit, match=message):
       _state(dataset, tmp_path, **kwargs)
+
+
+def test_blob_runs_cover_the_blobs_in_order_under_the_limit() -> None:
+  blobs = [bytes(n) for n in (3, 3, 3, 10, 1, 1)]
+  runs = blob_runs(blobs, limit=6)
+  assert [(r.start, r.stop) for r in runs] == [(0, 2), (2, 3), (3, 4), (4, 6)]
+  assert all(sum(map(len, blobs[r])) <= 6 or r.stop - r.start == 1 for r in runs)
+  assert blob_runs([], limit=6) == [slice(0, 0)]
