@@ -39,8 +39,9 @@ from __future__ import annotations
 
 import sys
 import tempfile
-import time
+from collections import deque
 from collections.abc import Iterator
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -71,7 +72,9 @@ from specialist_corpus.state import (
 
 from specialist.record.layer import git_sha
 from specialist.record.session import SessionRecording, fps_from_times
+from specialist.vi_ba.features import cpu_budget
 from specialist.vi_ba.geometry import canonical
+from specialist.vi_ba.single_tracker import stage_timer
 
 Float64Array = npt.NDArray[np.float64]
 Int64Array = npt.NDArray[np.int64]
@@ -166,14 +169,35 @@ def hand_slots(
   return chosen, next(s for s in slots if s != chosen)
 
 
+# Decoders per lens, and the frames each may hold ahead of its encoders.
+_DECODE_SEGMENTS = 4
+_ENCODE_AHEAD = 32
+
+
 def image_blobs(video: LensVideo, frames: Int64Array, scale: int) -> list[bytes]:
-  """One PNG per frame of ``frames``, ascending."""
-  return [
-    cv2.imencode(".png", to_image(frame.to_ndarray(format="rgb24"), scale)[:, :, ::-1])[
-      1
-    ].tobytes()
-    for _, frame in decode_rows(video, frames)
-  ]
+  """One PNG per frame of ``frames``, ascending, decoded in segments on threads of
+  their own and encoded behind them on a shared pool."""
+
+  def encode(frame: Any) -> bytes:
+    image = to_image(frame.to_ndarray(format="rgb24"), scale)[:, :, ::-1]
+    return cv2.imencode(".png", image)[1].tobytes()
+
+  def segment(rows: Int64Array) -> list[bytes]:
+    blobs: list[bytes] = []
+    pending: deque[Future[bytes]] = deque()
+    for _, frame in decode_rows(video, rows):
+      pending.append(encoders.submit(encode, frame))
+      if len(pending) >= _ENCODE_AHEAD:
+        blobs.append(pending.popleft().result())
+    blobs.extend(future.result() for future in pending)
+    return blobs
+
+  runs = [run for run in np.array_split(frames, _DECODE_SEGMENTS) if run.size]
+  with (
+    ThreadPoolExecutor(max(4, cpu_budget() // 4)) as encoders,
+    ThreadPoolExecutor(len(runs)) as decoders,
+  ):
+    return [blob for part in decoders.map(segment, runs) for blob in part]
 
 
 def clock(times: Float64Array, rows: Int64Array) -> list[rr.TimeColumn]:
@@ -305,6 +329,19 @@ def frames_on_rows(
   return kept
 
 
+def blob_runs(blobs: list[bytes], limit: int = 1 << 30) -> list[slice]:
+  """Consecutive runs of ``blobs`` under ``limit`` bytes each, Arrow's offset bound."""
+  runs: list[slice] = []
+  start = total = 0
+  for i, blob in enumerate(blobs):
+    if total + len(blob) > limit and i > start:
+      runs.append(slice(start, i))
+      start, total = i, 0
+    total += len(blob)
+  runs.append(slice(start, len(blobs)))
+  return runs
+
+
 def hand_chunks(
   hand: str,
   slot: str,
@@ -330,14 +367,19 @@ def hand_chunks(
       indexes=[],
       columns=rr.Transform3D.columns(translation=[[column, 0.0, 0.0]]),
     ),
-    Chunk.from_columns(
-      schema.state_image(hand),
-      indexes=clock(frame_times, label),
-      columns=[
-        *rr.EncodedImage.columns(blob=blobs, media_type=["image/png"] * len(blobs)),
-        *rr.AnyValues.columns(capture_row=capture),
-      ],
-    ),
+    *[
+      Chunk.from_columns(
+        schema.state_image(hand),
+        indexes=clock(frame_times[run], label[run]),
+        columns=[
+          *rr.EncodedImage.columns(
+            blob=blobs[run], media_type=["image/png"] * len(blobs[run])
+          ),
+          *rr.AnyValues.columns(capture_row=capture[run]),
+        ],
+      )
+      for run in blob_runs(blobs)
+    ],
     Chunk.from_columns(
       schema.state_pose(hand),
       indexes=clock(t, rows),
@@ -427,6 +469,7 @@ def main(args: Args) -> None:
   sys.stdout.reconfigure(line_buffering=True)  # type: ignore[union-attr]
   args.output_dir.mkdir(parents=True, exist_ok=True)
   stage = tempfile.TemporaryDirectory(prefix="lenses-", dir=args.output_dir)
+  lap = stage_timer()
   session = SessionRecording(args.base, Path(stage.name))
   slots = session.slots
   if not 1 <= len(slots) <= 2:
@@ -438,10 +481,19 @@ def main(args: Args) -> None:
   if missing := [s for s in slots if s not in poses.kf_times_by_slot]:
     raise SystemExit(f"{estimate_path} holds no keyframe poses for {missing}")
   keyframes = {s: poses.kf_times_by_slot[s] for s in slots}
+  lap("keyframe poses read")
 
-  times = {slot: session.lens_times(slot, _SIDE) for slot in slots}
+  with ThreadPoolExecutor(len(slots)) as lenses:
+    times = dict(
+      zip(
+        slots,
+        lenses.map(lambda slot: session.lens_times(slot, _SIDE), slots),
+        strict=True,
+      )
+    )
   fps = fps_from_times(times[slots[0]])
   width = stored_width(session, slots, args.scale)
+  lap("lens times read")
   layer = schema.state_layer(args.scale, args.f_row)
   out_path = schema.layer_rrd(args.output_dir, layer, session.session_id)
   if out_path.exists() and not args.overwrite:
@@ -467,6 +519,7 @@ def main(args: Args) -> None:
       hold_ends.append(
         hold(gripper[0], distance, np.linalg.norm(gripper[3], axis=1), span)
       )
+  lap("gripper states")
   with refusing():
     strike = tap(
       {slot: imu.t for slot, imu in imus.items()},
@@ -474,6 +527,7 @@ def main(args: Args) -> None:
     )
 
   window = usable_window(hold_ends, strike, args.margin, times, keyframes, fingers)
+  lap("window")
   with refusing():
     frames = image_frames(times, fps, window)
   left, right = hand_slots(
@@ -503,15 +557,22 @@ def main(args: Args) -> None:
 
   chunks: list[Chunk] = []
   rode = [(h, c) for h, c in zip(schema.HANDS, (left, right), strict=True) if c]
-  for hand, slot in rode:
-    started = time.time()
+
+  def hand_blobs(slot: str) -> list[bytes]:
     video = session.lens_video(slot, _SIDE)
     if not np.array_equal(video.times, times[slot]):
       raise RuntimeError(
         f"{slot}: the rear lens's frame times changed between two reads"
       )
+    return image_blobs(video, frames[slot], args.scale)
+
+  with ThreadPoolExecutor(len(rode)) as hands:
+    slots = [slot for _, slot in rode]
+    blobs_by_slot = dict(zip(slots, hands.map(hand_blobs, slots), strict=True))
+  lap("images")
+  for hand, slot in rode:
     frame_times = times[slot][frames[slot]]
-    blobs = image_blobs(video, frames[slot], args.scale)
+    blobs = blobs_by_slot[slot]
     all_rows, (t, position, orientation, lin_vel, ang_vel) = states[slot]
     held = (all_rows >= lo) & (all_rows <= hi)
     state = (t[held], position[held], orientation[held], lin_vel[held], ang_vel[held])
@@ -529,11 +590,12 @@ def main(args: Args) -> None:
     )
     print(
       f"  {hand} ({slot}): {len(blobs)} images, {sum(map(len, blobs)) / 1e6:.1f} MB, "
-      f"rows [{lo}, {hi}], {time.time() - started:.0f} s"
+      f"rows [{lo}, {hi}]"
     )
   write_layer(out_path, session.session_id, account, chunks)
   session.close()
   stage.cleanup()
+  lap("layer written")
   print(f"Wrote {out_path} ({out_path.stat().st_size / 1e6:.1f} MB)")
 
 
