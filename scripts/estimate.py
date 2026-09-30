@@ -54,9 +54,9 @@ def _resolve_urdf_path(explicit: Path | None) -> Path:
   if explicit is not None:
     return explicit
   try:
-    from specialist_description import urdf_path
+    from specialist_description import get_urdf_path
 
-    return Path(urdf_path("specialist_handheld"))
+    return Path(get_urdf_path("specialist_handheld"))
   except (ImportError, ValueError, FileNotFoundError) as exc:
     raise SystemExit(
       f"the gripper URDF is unavailable ({exc}); pass --urdf-path"
