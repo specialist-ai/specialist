@@ -1,4 +1,4 @@
-"""Unit tests solve on the host: the cuDSS factorization is replaced by scipy."""
+"""Tests solve on the host: the cuDSS factorization is replaced by scipy."""
 
 from __future__ import annotations
 

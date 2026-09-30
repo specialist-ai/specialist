@@ -1,59 +1,44 @@
 """Synthetic end-to-end integration test for the dual-lens VI-BA pipeline.
 
 Known 3D landmarks projected through ``mei_project`` at known body poses, with
-deterministic matches, drive ``chain_tracks``, ``two_view_essential``,
-``interpolate_camera_poses``, ``body_poses_from_camera_poses``,
-``triangulate_track_multiview`` and ``optimize_graph``. LM converges to
-landmarks matching ground truth up to the scale the gauge priors set.
+deterministic matches, drive ``chain_tracks``, ``fill_camera_poses``,
+``body_poses_from_camera_poses``, ``triangulate_lens`` and ``optimize_graph``.
+LM converges to the true landmarks and to the true pose of the keyframe the
+anchor missed.
 """
 
 from __future__ import annotations
 
 import gtsam
 import numpy as np
-import numpy.typing as npt
 from gtsam.symbol_shorthand import X
-from specialist_camera import MeiParams, mei_project, mei_unproject
 
 from specialist.vi_ba.build import LensSetup
 from specialist.vi_ba.features import chain_tracks
-from specialist.vi_ba.init import (
-  body_poses_from_camera_poses,
-  interpolate_camera_poses,
-  triangulate_track_multiview,
-  two_view_essential,
-)
+from specialist.vi_ba.init import body_poses_from_camera_poses, fill_camera_poses
 from specialist.vi_ba.optimize import optimize_graph
+from specialist.vi_ba.tracks import triangulate_lens
 from tests.mei_fixtures import (
   WIDE_CALIBRATED_RADIUS,
   front_landmark_key,
   pinhole_params,
   pinned_visual_graph,
+  project_point,
 )
 
-Float64Array = npt.NDArray[np.float64]
 
-
-def _project(
-  body_pose: gtsam.Pose3, extrinsic: gtsam.Pose3, xyz: Float64Array, params: MeiParams
-) -> Float64Array:
-  p_lens = body_pose.compose(extrinsic).transformTo(
-    gtsam.Point3(float(xyz[0]), float(xyz[1]), float(xyz[2]))
-  )
-  return mei_project(np.asarray(p_lens)[None, :], params)[0]
-
-
-def test_pipeline_recovers_ground_truth_from_two_view_init() -> None:
-  """20 landmarks, 3 body poses, front lens only, pinhole MEI: the pipeline
-  converges to the true landmarks up to the init-pair baseline scale."""
+def test_pipeline_recovers_ground_truth_from_anchor_seed() -> None:
+  """20 landmarks, 3 body poses, front lens only, pinhole MEI: the anchor sights
+  the end keyframes, the geodesic fill seeds the middle one off its true pose,
+  and the pipeline converges to the true landmarks and middle pose."""
   rng = np.random.default_rng(11)
   params = pinhole_params()
-  extrinsic = gtsam.Pose3()
+  extrinsic = gtsam.Pose3(gtsam.Rot3.Ypr(0.1, 0.0, 0.0), gtsam.Point3(0.02, 0.0, 0.05))
 
-  # Ground-truth body poses: pure +x translation.
+  # Ground-truth body poses: +x translation, the middle one off the straight line.
   true_poses = [
     gtsam.Pose3(gtsam.Rot3(), gtsam.Point3(0.0, 0.0, 0.0)),
-    gtsam.Pose3(gtsam.Rot3(), gtsam.Point3(0.15, 0.0, 0.0)),
+    gtsam.Pose3(gtsam.Rot3(), gtsam.Point3(0.15, 0.03, 0.0)),
     gtsam.Pose3(gtsam.Rot3(), gtsam.Point3(0.30, 0.0, 0.0)),
   ]
   n_keyframes = len(true_poses)
@@ -66,7 +51,7 @@ def test_pipeline_recovers_ground_truth_from_two_view_init() -> None:
   # Keypoints stay in landmark-index order.
   keypoints = [
     np.array(
-      [_project(body_pose, extrinsic, xyzs[i], params) for i in range(n_lm)],
+      [project_point(body_pose, extrinsic, xyzs[i], params) for i in range(n_lm)],
       dtype=np.float64,
     )
     for body_pose in true_poses
@@ -80,41 +65,18 @@ def test_pipeline_recovers_ground_truth_from_two_view_init() -> None:
   tracks = chain_tracks(keypoints, matches_between)
   assert len(tracks) == n_lm
 
-  # Two-view init on the widest pair (0, n_keyframes-1).
-  first, last = 0, n_keyframes - 1
-  pix_a = np.array([tracks[tid][first] for tid in tracks])
-  pix_b = np.array([tracks[tid][last] for tid in tracks])
-  bears_a = mei_unproject(pix_a, params)
-  bears_b = mei_unproject(pix_b, params)
-  r_cw, t_cw, _ = two_view_essential(bears_a, bears_b, threshold=1e-3)
-
-  cam_poses = interpolate_camera_poses(r_cw, t_cw, n_keyframes)
-  body_poses_init = body_poses_from_camera_poses(cam_poses, extrinsic)
-
-  # Triangulate from earliest + latest observation per track.
-  lens_poses = [pose.compose(extrinsic) for pose in body_poses_init]
-  lens_rotations = np.stack([pose.rotation().matrix() for pose in lens_poses])
-  lens_centers = np.stack(
-    [np.asarray(pose.translation(), dtype=np.float64) for pose in lens_poses]
+  # The anchor fixes the camera at the end keyframes only.
+  anchor_cam_poses = {
+    kf: true_poses[kf].compose(extrinsic) for kf in (0, n_keyframes - 1)
+  }
+  body_poses_init = body_poses_from_camera_poses(
+    fill_camera_poses(anchor_cam_poses, n_keyframes), extrinsic
   )
-  points_init: dict[int, Float64Array] = {}
-  for tid, obs in tracks.items():
-    frames_sorted = sorted(obs.keys())
-    f0, f1 = frames_sorted[0], frames_sorted[-1]
-    b0 = mei_unproject(obs[f0][None, :], params)[0]
-    b1 = mei_unproject(obs[f1][None, :], params)[0]
-    # The two-view init fixes an arbitrary unit-baseline scale, so the depth
-    # gate widens to cheirality-only.
-    xyz = triangulate_track_multiview(
-      np.stack([b0, b1]),
-      lens_rotations[[f0, f1]],
-      lens_centers[[f0, f1]],
-      min_landmark_depth=1e-6,
-      max_landmark_depth=1e9,
-    )
-    if xyz is not None:
-      points_init[tid] = xyz
+  assert not body_poses_init[1].equals(true_poses[1], 1e-2)
 
+  points_init = triangulate_lens(
+    tracks, body_poses_init, extrinsic, params, min_track_length=2
+  )
   assert len(points_init) >= int(0.9 * n_lm)
 
   lens = LensSetup(
@@ -126,19 +88,10 @@ def test_pipeline_recovers_ground_truth_from_two_view_init() -> None:
   initial_err = graph.error(values)
   result = optimize_graph(graph, values, max_iterations=50)
 
-  assert result.final_error <= initial_err
+  assert result.final_error < initial_err
   recovered = np.array(
     [np.asarray(result.values.atPoint3(front_landmark_key(tid))) for tid in points_init]
   )
   truth = np.array([xyzs[tid] for tid in points_init])
-
-  # The centred, normalised clouds factor out the global rigid transform and
-  # the scale the two-view init set, leaving the distance ratios.
-  def _normalised(p: np.ndarray) -> np.ndarray:
-    c = p - p.mean(axis=0, keepdims=True)
-    return c / np.linalg.norm(c)
-
-  assert np.allclose(_normalised(recovered), _normalised(truth), atol=0.05)
-
-  for i in range(n_keyframes):
-    assert result.values.exists(X(i))
+  np.testing.assert_allclose(recovered, truth, atol=1e-3)
+  assert result.values.atPose3(X(1)).equals(true_poses[1], 1e-3)
