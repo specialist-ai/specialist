@@ -1306,8 +1306,8 @@ requires-dist = [
 
 [[package]]
 name = "specialist-description"
-version = "0.5.0"
-source = { git = "ssh://git@github.com/specialist-ai/specialist_description.git?branch=main#eedc96d4a11aa9d623570e64f4b297b992163362" }
+version = "0.6.0"
+source = { git = "ssh://git@github.com/specialist-ai/specialist_description.git?branch=main#933f89fffe641bda73c335cf8880c171e5751aaa" }
 
 [[package]]
 name = "sphinx"
