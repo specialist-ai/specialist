@@ -10,12 +10,14 @@ on:
       - '**.md'
       - 'LICENSE'
 
+# Jobs run on ubuntu-24.04 for its gcc 13: the native factor built by gcc 14
+# or newer aborts at runtime.
 env:
   UV_FROZEN: "1"
 
 jobs:
   lint-format:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -29,7 +31,7 @@ jobs:
         run: uvx ruff@0.15.0 format --diff src/ tests/ scripts/ packages/
 
   typecheck:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -46,7 +48,7 @@ jobs:
         run: uv run --no-sync mypy
 
   tests:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
