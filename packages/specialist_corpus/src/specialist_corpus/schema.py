@@ -58,6 +58,7 @@ ESTIMATE = "estimate"
 VIZ = "viz"
 MOCAP = "mocap"
 STATE = "state"
+ASSETS = "assets"
 
 
 def state_layer(scale: int, f_row: float) -> str:
@@ -74,6 +75,11 @@ def layer_dir(corpus: Path, layer: str) -> Path:
 def layer_rrd(corpus: Path, layer: str, session: str) -> Path:
   """Where one session's layer sits in a layer-first corpus."""
   return layer_dir(corpus, layer) / f"{session}.rrd"
+
+
+def asset_rrd(corpus: Path, asset: str) -> Path:
+  """Where one dataset asset, a recording every session shares, sits."""
+  return corpus / ASSETS / f"{asset}.rrd"
 
 
 def camera_slots(serials: Sequence[str]) -> list[str]:
@@ -173,6 +179,11 @@ def state_opening(hand: str) -> str:
   return f"{state_hand(hand)}/opening"
 
 
+def state_finger(hand: str, joint: str) -> str:
+  """One finger's joint edge, the opening put through the model."""
+  return f"{state_hand(hand)}/{joint}"
+
+
 TAGS_DETECTION = "tags"
 KEYPOINTS_DETECTION = "keypoints"
 REJECTED_KEYPOINTS_DETECTION = "keypoints_rejected"
@@ -235,11 +246,6 @@ def base_tag(slot: str) -> str:
   return f"{camera(slot)}/base_tag"
 
 
-def joint_model(slot: str, joint: str) -> str:
-  """What the model says about one revolute joint."""
-  return f"{gripper_part(slot, joint)}/model"
-
-
 def joint_tag(slot: str, joint: str) -> str:
   """The tag riding one revolute joint, on the link it turns with."""
   return f"{gripper_part(slot, joint)}/tag"
@@ -259,6 +265,11 @@ def state(slot: str, quantity: str) -> str:
 def gripper(slot: str) -> str:
   """The gripper this camera rode, in the world frame."""
   return f"{camera(slot)}/gripper"
+
+
+def link_frame(slot: str, link: str) -> str:
+  """The frame of one model link on the gripper this camera rode."""
+  return f"{slot}_{link}"
 
 
 def gripper_part(slot: str, part: str) -> str:

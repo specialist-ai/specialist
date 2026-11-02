@@ -26,9 +26,10 @@ dense row range.
 
 Which camera rode which hand is detected from the estimate and written into
 the paths, so a trainer's fields are the same for every session; the slot
-rides on each hand as a value. The recording property ``state`` carries the
-layer's whole per-session account, read without opening the segment; only
-per-hand facts ride entities.
+rides on each hand as a value. The pose and the finger edges name the gripper
+model's frames, so the dataset's gripper asset rides them. The recording
+property ``state`` carries the layer's whole per-session account, read without
+opening the segment; only per-hand facts ride entities.
 
 Usage:
     uv run python scripts/state.py --base corpus/base/<session-id>.rrd \
@@ -54,6 +55,7 @@ import numpy.typing as npt
 import rerun as rr
 import tyro
 from rerun.chunk import Chunk, LazyChunkStream, OptimizationProfile
+from rerun.urdf import UrdfTree
 from scipy.spatial.transform import Rotation, Slerp
 from specialist_camera import MASK_RADIUS, to_image
 from specialist_corpus import schema
@@ -70,11 +72,14 @@ from specialist_corpus.state import (
   tap,
 )
 
+from specialist.record.asset import resolve_urdf_path
 from specialist.record.layer import git_sha
 from specialist.record.session import SessionRecording, fps_from_times
 from specialist.vi_ba.features import cpu_budget
 from specialist.vi_ba.geometry import canonical
 from specialist.vi_ba.single_tracker import stage_timer
+from specialist.vi_ba.urdf_joints import FINGER_JOINTS
+from specialist.vi_ba.viz import world_chunk
 
 Float64Array = npt.NDArray[np.float64]
 Int64Array = npt.NDArray[np.int64]
@@ -108,6 +113,8 @@ class Args:
 
   # The slot on the operator's left; overrides the geometric detection.
   left: str | None = None
+  # The gripper URDF; unset, the packaged description.
+  urdf_path: Path | None = None
 
   # Replace an existing layer.
   overwrite: bool = False
@@ -342,9 +349,31 @@ def blob_runs(blobs: list[bytes], limit: int = 1 << 30) -> list[slice]:
   return runs
 
 
+def finger_chunks(
+  hand: str, tree: UrdfTree, indexes: list[rr.TimeColumn], opening_rows: Float64Array
+) -> list[Chunk]:
+  """Each finger's joint edge on every row: the opening drives the left finger
+  and the right one follows its ``<mimic>``."""
+  joints = {joint.name: joint for joint in tree.joints()}
+  chunks = []
+  for name in FINGER_JOINTS:
+    mimic = joints[name].mimic
+    angle = (
+      opening_rows if mimic is None else mimic.multiplier * opening_rows + mimic.offset
+    )
+    columns = joints[name].compute_transform_columns(angle.tolist(), clamp=False)
+    chunks.append(
+      Chunk.from_columns(
+        schema.state_finger(hand, name), indexes=indexes, columns=columns
+      )
+    )
+  return chunks
+
+
 def hand_chunks(
   hand: str,
   slot: str,
+  tree: UrdfTree,
   frames: tuple[Float64Array, Int64Array, Int64Array],
   blobs: list[bytes],
   rows: Int64Array,
@@ -359,6 +388,7 @@ def hand_chunks(
   # One image plane holds both hands, left then right.
   column = float(schema.HANDS.index(hand) * width)
   return [
+    *finger_chunks(hand, tree, clock(t, rows), opening_rows),
     Chunk.from_columns(
       schema.state_hand(hand), indexes=[], columns=rr.AnyValues.columns(slot=[slot])
     ),
@@ -383,7 +413,12 @@ def hand_chunks(
     Chunk.from_columns(
       schema.state_pose(hand),
       indexes=clock(t, rows),
-      columns=rr.Transform3D.columns(translation=position, quaternion=orientation),
+      columns=rr.Transform3D.columns(
+        translation=position,
+        quaternion=orientation,
+        parent_frame=[schema.WORLD_FRAME] * len(t),
+        child_frame=[schema.link_frame(slot, tree.root_link().name)] * len(t),
+      ),
     ),
     Chunk.from_columns(
       schema.state_lin_vel(hand),
@@ -450,7 +485,7 @@ def write_layer(
   complete write renames into place."""
   path.parent.mkdir(parents=True, exist_ok=True)
   partial = path.parent / (path.name + ".partial")
-  store = LazyChunkStream.from_iter(chunks).collect(
+  store = LazyChunkStream.from_iter([world_chunk(), *chunks]).collect(
     optimize=OptimizationProfile.OBJECT_STORE
   )
   try:
@@ -499,6 +534,7 @@ def main(args: Args) -> None:
   if out_path.exists() and not args.overwrite:
     raise SystemExit(f"{out_path} exists; pass --overwrite to replace it")
 
+  urdf = resolve_urdf_path(args.urdf_path)
   estimate = Recording(estimate_path)
   anchors = np.stack(
     [pose[:3, 3] for pose in read_anchors(estimate_path).poses.values()]
@@ -581,6 +617,7 @@ def main(args: Args) -> None:
     chunks += hand_chunks(
       hand,
       slot,
+      UrdfTree.from_file_path(str(urdf), frame_prefix=f"{slot}_"),
       (frame_times, *frame_rows(frame_times, fps, args.f_row)),
       blobs,
       all_rows[held],
