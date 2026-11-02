@@ -9,7 +9,7 @@ from pathlib import Path
 import gtsam
 import numpy as np
 import pytest
-from rerun.experimental import RrdReader
+from rerun.chunk import RrdReader
 from specialist_corpus import frames, schema
 from specialist_corpus.frames import RecordingKeyframes
 
