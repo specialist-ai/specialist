@@ -218,6 +218,9 @@ def build(force: bool = False) -> Path:
     abi_version = _detect_gxx_abi_version(gtsam_pkg)
     if abi_version is not None:
       cmd += [f"-fabi-version={abi_version}"]
+    if sysconfig.get_platform().endswith("x86_64"):
+      # The wheel frees Eigen buffers the factor allocates, so both build for its baseline.
+      cmd += ["-march=x86-64"]
   for inc in _includes(gtsam_src, generated, boost_root):
     cmd += ["-I", inc]
   cmd += [str(src), "-o", str(out), str(libgtsam)]
