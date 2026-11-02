@@ -4,9 +4,8 @@ The gtsam wheel ships ``libgtsam`` but no C++ headers, so this shallow-clones th
 matching gtsam source (pinned to the wheel's version) once into a gitignored
 build cache for its headers, then compiles ``cpp/mei_factor.cpp`` against them +
 the vendored generated headers in ``cpp/gtsam_generated/``. Boost headers are
-taken from the system (``libboost-dev`` / ``brew install boost``) when present
-and otherwise fetched pinned into the same build cache, so the only system
-prerequisites are a C++17 compiler and git.
+fetched into the same build cache at the release the gtsam wheel bundles, so the
+only system prerequisites are a C++17 compiler and git.
 
 Invoked at install time by ``hatch_build.py`` and re-runnable with ``uv run
 build-mei-factor``, which needs a source checkout: the header cache and the C++
@@ -26,7 +25,8 @@ import sysconfig
 from pathlib import Path
 
 GTSAM_TAG = "4.3a0"
-BOOST_TAG = "1.83.0"
+# The release the gtsam wheel bundles: other headers corrupt the heap at runtime.
+BOOST_TAG = "1.87.0"
 
 
 def _repo_root(start: Path) -> Path:
@@ -76,16 +76,6 @@ def _ensure_headers(gtsam_src: Path) -> None:
       str(gtsam_src),
     ]
   )
-
-
-def _system_boost() -> Path | None:
-  """The prefix whose ``boost/`` headers the compiler will see, if any."""
-  if sys.platform == "darwin":
-    brew = os.popen("brew --prefix 2>/dev/null").read().strip() or "/opt/homebrew"
-    root = Path(brew) / "include"
-  else:
-    root = Path("/usr/include")
-  return root if (root / "boost" / "concept_check.hpp").exists() else None
 
 
 def _ensure_boost(boost_src: Path) -> None:
@@ -197,17 +187,16 @@ def build(force: bool = False) -> Path:
   generated = viba_pkg / "cpp" / "gtsam_generated"
   gtsam_src = repo / ".build" / f"gtsam-{GTSAM_TAG}"
   out = viba_pkg / ("_mei_factor_cpp" + str(sysconfig.get_config_var("EXT_SUFFIX")))
-  newest_input = max(p.stat().st_mtime for p in (src, *generated.rglob("*.h")))
+  inputs = (src, Path(__file__), *generated.rglob("*.h"))
+  newest_input = max(p.stat().st_mtime for p in inputs)
   if out.exists() and not force and out.stat().st_mtime >= newest_input:
     print(f"{out.name} is up to date")
     return out
 
   gtsam_pkg, libgtsam = _gtsam_paths()
   _ensure_headers(gtsam_src)
-  boost_root = _system_boost()
-  if boost_root is None:
-    boost_root = repo / ".build" / f"boost-{BOOST_TAG}"
-    _ensure_boost(boost_root)
+  boost_root = repo / ".build" / f"boost-{BOOST_TAG}"
+  _ensure_boost(boost_root)
   cxx = os.environ.get("CXX", "c++")
   # No fused multiply-add: the arithmetic stays numpy's.
   cmd = [cxx, "-O3", "-ffp-contract=off", "-shared", "-std=c++17", "-fPIC"]

@@ -38,8 +38,6 @@ jobs:
         with:
           python-version: "3.12"
           enable-cache: true
-      - name: Install Boost headers (the native MEI factor build needs them)
-        run: sudo apt-get update && sudo apt-get install -y libboost-all-dev
       - name: Install dependencies
         run: uv sync --no-group gpu --no-install-package specialist-description
       - name: Run mypy
@@ -55,8 +53,6 @@ jobs:
         with:
           python-version: "3.12"
           enable-cache: true
-      - name: Install Boost headers (the native MEI factor build needs them)
-        run: sudo apt-get update && sudo apt-get install -y libboost-all-dev
       - name: Install FFmpeg (rerun's Mp4Reader shells out to it in the video tests)
         run: sudo apt-get install -y ffmpeg
       - name: Install dependencies
