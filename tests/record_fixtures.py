@@ -10,6 +10,7 @@ import gtsam
 import numpy as np
 import numpy.typing as npt
 from scipy.spatial.transform import Rotation
+from specialist_description import get_urdf_path
 
 from specialist.loader.audio_sync import resolve_ffmpeg
 from specialist.loader.parse_insv import InsvData
@@ -19,6 +20,7 @@ from specialist.vi_ba.viz import CameraEstimate, LensEstimate
 from specialist.vi_ba.viz_build import RunEstimate
 
 BASE_TAG = gtsam.Pose3(gtsam.Rot3.Rz(0.3), gtsam.Point3(0.01, -0.02, 0.05))
+URDF = Path(get_urdf_path("specialist_handheld"))
 
 
 def synthetic_insv() -> InsvData:
@@ -220,7 +222,6 @@ def write_run(
   *,
   per_camera: list[CameraSummary] | None = None,
   summary: Summary | None = None,
-  urdf_path: Path,
   frame_period: float,
 ) -> tuple[Path, Path]:
   """Write both layers of a solved run under ``root`` in the corpus layout, and
@@ -253,39 +254,8 @@ def write_run(
     summary=summary or make_summary(),
     anchor_tag_size=0.1,
     session_id=session_id,
-    urdf_path=urdf_path,
+    urdf_path=URDF,
     frame_period=frame_period,
     timeline_start=0.0,
   )
   return estimate_path, viz_path
-
-
-def urdf_file(tmp_path: Path) -> Path:
-  """A gripper whose links carry the joint names the solve reprojects finger
-  tags onto, with visual geometry that needs no mesh file on disk."""
-  path = tmp_path / "robot.urdf"
-  link = (
-    '<link name="{n}"><visual><geometry><box size="0.1 0.1 0.1"/></geometry>'
-    "</visual></link>"
-  )
-  joint = (
-    '<joint name="{n}" type="revolute"><parent link="base"/><child link="{n}"/>'
-    '<axis xyz="0 0 1"/><limit lower="-1" upper="1" effort="1" velocity="1"/>'
-    "</joint>"
-  )
-  # Every tag rides a link on a fixed joint, so the frame a tag names is one
-  # the model already placed.
-  tag = (
-    '<link name="{n}_tag"/>'
-    '<joint name="{n}_tag" type="fixed"><parent link="{n}"/><child link="{n}_tag"/>'
-    '<origin xyz="0 0.01 0.02" rpy="0 0 0"/></joint>'
-  )
-  fingers = ("left_finger", "right_finger")
-  path.write_text(
-    '<?xml version="1.0"?><robot name="gripper">'
-    + "".join(link.format(n=n) for n in ("base", *fingers))
-    + "".join(joint.format(n=n) for n in fingers)
-    + "".join(tag.format(n=n) for n in ("base", *fingers))
-    + "</robot>"
-  )
-  return path

@@ -6,24 +6,20 @@ from dataclasses import fields
 from pathlib import Path
 from typing import Any
 
-import gtsam
 import numpy as np
 import pytest
 from rerun.chunk import Chunk, ChunkStore, RrdReader
 from specialist_corpus import schema
 
+from specialist.record.asset import write_gripper_asset
 from specialist.vi_ba.blueprint import (
   _hidden_overlay_overrides,
   _triad_overrides,
   _without_pixels,
 )
 from specialist.vi_ba.summary import CameraSummary, Summary
-from specialist.vi_ba.viz import (
-  CameraEstimate,
-  Layers,
-  estimate_chunks,
-)
-from tests.record_fixtures import camera_estimate, urdf_file, write_run
+from specialist.vi_ba.viz import CameraEstimate
+from tests.record_fixtures import URDF, camera_estimate, write_run
 
 # Every entity a solve writes, and the layer that must carry it.
 _ESTIMATE = (
@@ -39,7 +35,6 @@ _ESTIMATE = (
   "/camera/cam00/imu/bias/accel",
   "/camera/cam00/gripper",
   "/camera/cam00/gripper/opening",
-  "/camera/cam00/gripper/tf_static",
   "/camera/cam00/front/detection/keypoints",
   "/camera/cam00/front/detection/keypoints_rejected",
   "/camera/cam00/front/detection/tags",
@@ -47,7 +42,6 @@ _ESTIMATE = (
   "/camera/cam01",
 )
 _VIZ = (
-  "/camera/cam00/gripper/visual_geometries/base/visual_0",
   "/world/anchor/0",
   "/camera/cam00/trajectory",
   "/camera/cam00/marker",
@@ -57,6 +51,14 @@ _VIZ = (
   "/camera/cam00/front/overlay/tag_axes",
   "/camera/cam00/front/overlay/landmark_reprojection",
   "/camera/cam01/trajectory",
+)
+# What the model says, shared by every session through the dataset asset.
+_ASSET = (
+  "/camera/cam00/gripper",
+  "/camera/cam00/gripper/tf_static",
+  "/camera/cam00/gripper/left_finger",
+  "/camera/cam00/gripper/visual_geometries/base/visual_0",
+  "/camera/cam01/gripper/visual_geometries/right_finger/visual_0",
 )
 
 
@@ -73,9 +75,15 @@ def estimated_run(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, Path]
     tmp,
     "sess_route",
     _two_cameras(),
-    urdf_path=urdf_file(tmp),
     frame_period=1.0 / 30.0,
   )
+
+
+@pytest.fixture(scope="module")
+def assets(tmp_path_factory: pytest.TempPathFactory) -> list[Path]:
+  """The gripper asset of each slot."""
+  corpus = tmp_path_factory.mktemp("c")
+  return [write_gripper_asset(URDF, slot, corpus) for slot in ("cam00", "cam01")]
 
 
 def _chunks(path: Path) -> list[Chunk]:
@@ -134,22 +142,34 @@ def test_the_fixture_carries_one_of_everything_a_camera_holds() -> None:
 
 
 def test_each_layer_carries_exactly_what_it_owns(
-  estimated_run: tuple[Path, Path],
+  estimated_run: tuple[Path, Path], assets: list[Path]
 ) -> None:
-  """An entity may appear in both layers, the quantity in one and the way of
-  drawing it in the other, but a ``(entity, component)`` name may not: two
-  writers of one name resolve silently by write time."""
+  """An entity may appear in several layers, the quantity in one, the way of
+  drawing it in another and the model's word on it in the asset, but a
+  ``(entity, component)`` name may not: two writers of one name resolve
+  silently by write time."""
   estimate_path, viz_path = estimated_run
-  estimate, viz = _names(estimate_path), _names(viz_path)
+  estimate, viz, model = (
+    _names(estimate_path),
+    _names(viz_path),
+    set().union(*map(_names, assets)),
+  )
   estimate_entities = {e for e, _ in estimate}
   viz_entities = {e for e, _ in viz}
+  model_entities = {e for e, _ in model}
 
   assert len(RrdReader(str(estimate_path)).recordings()) == 1
   assert not estimate & viz, f"{sorted(estimate & viz)} written by both layers"
+  assert not (estimate | viz) & model, (
+    f"{sorted((estimate | viz) & model)} written by a layer and the asset"
+  )
   assert not set(_ESTIMATE) - estimate_entities, (
     f"missing: {sorted(set(_ESTIMATE) - estimate_entities)}"
   )
   assert not set(_VIZ) - viz_entities, f"missing: {sorted(set(_VIZ) - viz_entities)}"
+  assert not set(_ASSET) - model_entities, (
+    f"missing: {sorted(set(_ASSET) - model_entities)}"
+  )
 
   known = re.compile(
     r"^/(world(/anchor/\d+)?|estimate|__properties(/\w+)?"
@@ -158,7 +178,7 @@ def test_each_layer_carries_exactly_what_it_owns(
     r"|/rear_seat"
     r"|/(marker|base_tag|lin_vel|trajectory))?)$"
   )
-  stray = sorted({e for e, _ in estimate | viz if not known.match(e)})
+  stray = sorted({e for e, _ in estimate | viz | model if not known.match(e)})
   assert not stray, f"entities routed by nobody: {stray}"
 
 
@@ -230,7 +250,7 @@ def test_an_anchor_keeps_both_its_triad_and_its_outline() -> None:
 
 
 def test_what_the_camera_pose_carries_is_only_what_is_mounted_on_it(
-  estimated_run: tuple[Path, Path],
+  estimated_run: tuple[Path, Path], assets: list[Path]
 ) -> None:
   """The camera entity carries the body pose, so a transform beneath it
   composes with that pose and drawable data beneath it is drawn through it.
@@ -240,7 +260,7 @@ def test_what_the_camera_pose_carries_is_only_what_is_mounted_on_it(
   detached: set[str] = set()
   drawable: set[str] = set()
   path_framed: set[str] = set()
-  for path in estimated_run:
+  for path in (*estimated_run, *assets):
     for chunk in _chunks(path):
       entity, names = chunk.entity_path, chunk.to_record_batch().schema.names
       if "CoordinateFrame:frame" in names:
@@ -270,7 +290,7 @@ def test_what_the_camera_pose_carries_is_only_what_is_mounted_on_it(
 
 
 def test_every_tag_the_solve_used_is_named_in_the_layer(
-  estimated_run: tuple[Path, Path],
+  estimated_run: tuple[Path, Path], assets: list[Path]
 ) -> None:
   """Every physical tag the solve used is an entity carrying its own pose and
   id: each world anchor, the base tag on the body, and the tag riding each
@@ -291,7 +311,7 @@ def test_every_tag_the_solve_used_is_named_in_the_layer(
 
   # Naming a frame nothing defines places the tag nowhere.
   defined, named_frames = set(), {}
-  for path in estimated_run:
+  for path in (*estimated_run, *assets):
     for chunk in _chunks(path):
       batch = chunk.to_record_batch()
       row = batch.to_pydict()
@@ -313,45 +333,66 @@ def test_every_tag_the_solve_used_is_named_in_the_layer(
   assert not dangling, f"entities naming a frame nothing defines: {dangling}"
 
 
-def test_the_model_the_angles_came_from_is_named(
-  estimated_run: tuple[Path, Path], tmp_path: Path
-) -> None:
-  """The layer records which model the joint angles came from, and each
-  joint's axis and limits."""
-  values: dict[tuple[str, str], Any] = {}
-  for chunk in _chunks(estimated_run[0]):
+def _child_frames(path: Path) -> set[str]:
+  """Every frame one file defines an edge onto."""
+  frames: set[str] = set()
+  for chunk in _chunks(path):
     batch = chunk.to_record_batch()
-    for name, column in zip(
-      batch.schema.names, batch.to_pydict().values(), strict=True
-    ):
-      if name in ("robot", "urdf_sha", "axis", "joint_type", "limit_lower"):
-        values[chunk.entity_path, name] = column[0]
+    if "Transform3D:child_frame" in batch.schema.names:
+      column = batch.column("Transform3D:child_frame").to_pylist()
+      frames |= {str(f) for row in column if row for f in row}
+  return frames
 
-  def one(entity: str, name: str) -> Any:
-    return np.asarray(values[entity, name]).reshape(-1)
 
+def test_the_model_the_angles_came_from_is_named(
+  estimated_run: tuple[Path, Path],
+) -> None:
+  """The estimate names the model its joint angles came from, by digest."""
   gripper = f"/{schema.gripper('cam00')}"
-  assert one(gripper, "robot")[0] == "gripper"
-  digest = str(one(gripper, "urdf_sha")[0])
-  # The fixture writes the same bytes every time, so a digest that tracks the
-  # model matches a fresh copy of it.
-  assert digest == hashlib.sha256(urdf_file(tmp_path).read_bytes()).hexdigest(), (
-    "the digest does not track the model it was read from"
-  )
-  for joint in ("left_finger", "right_finger"):
-    entity = f"/{schema.joint_model('cam00', joint)}"
-    assert one(entity, "joint_type")[0] == "revolute"
-    # The finger factors rotate about +z and do not read the URDF axis.
-    assert list(one(entity, "axis")) == [0.0, 0.0, 1.0]
-    assert one(entity, "limit_lower")[0] == pytest.approx(-1.0)
+  values = {
+    name: column[0]
+    for chunk in _chunks(estimated_run[0])
+    if chunk.entity_path == gripper
+    for name, column in chunk.to_record_batch().to_pydict().items()
+  }
+  assert values["robot"] == ["specialist_handheld"]
+  assert values["urdf_sha"] == [hashlib.sha256(URDF.read_bytes()).hexdigest()]
 
 
-def test_no_frame_is_defined_twice(estimated_run: tuple[Path, Path]) -> None:
+def test_the_asset_is_the_model_and_only_its_fixed_edges(
+  estimated_run: tuple[Path, Path], assets: list[Path]
+) -> None:
+  """The asset is static throughout, its id is the URDF's digest, and it
+  defines the edges the model fixes; the joints the solve turns are the
+  estimate's to define."""
+  for asset in assets:
+    assert asset.stem.startswith("gripper-")
+    assert [e.recording_id for e in RrdReader(str(asset)).recordings()] == [asset.stem]
+    assert all(chunk.is_static for chunk in _chunks(asset))
+  fixed = {
+    f"{slot}_{link}"
+    for slot in ("cam00", "cam01")
+    for link in (
+      "base_tag",
+      "camera",
+      "insta_360_x3",
+      "left_finger_tag",
+      "right_finger_tag",
+    )
+  }
+  assert set().union(*map(_child_frames, assets)) == fixed
+  turned = {"cam00_left_finger", "cam00_right_finger"}
+  assert turned <= _child_frames(estimated_run[0])
+
+
+def test_no_frame_is_defined_twice(
+  estimated_run: tuple[Path, Path], assets: list[Path]
+) -> None:
   """One frame, one definition: Rerun resolves a second definition of a child
   frame by log order across layers. A static definition and a temporal one are
   not a clash, since the temporal one wins; two of a kind is the ambiguity."""
   by_frame: dict[tuple[str, bool], set[str]] = {}
-  for path in estimated_run:
+  for path in (*estimated_run, *assets):
     for chunk in _chunks(path):
       batch = chunk.to_record_batch()
       if "Transform3D:child_frame" not in batch.schema.names:
@@ -438,30 +479,6 @@ def test_no_layer_embeds_a_blueprint(
   assert not RrdReader(str(estimate_path)).blueprints()
 
 
-def test_a_model_that_fails_to_write_is_not_mistaken_for_a_missing_model(
-  tmp_path: Path,
-) -> None:
-  """A sink that raises on a mesh chunk raises out of ``estimate_chunks``: the
-  optional-model guard covers building the model, not writing it."""
-  data = camera_estimate("cam00")
-
-  def die(chunk: Chunk) -> None:
-    if "geometries" in chunk.entity_path:
-      raise OSError(28, "No space left on device")
-
-  with pytest.raises(OSError):
-    estimate_chunks(
-      Layers(die, die),
-      [data],
-      {0: gtsam.Pose3()},
-      0,
-      0.1,
-      urdf_path=urdf_file(tmp_path),
-      timeline_start=0.0,
-      frame_period=1.0 / 30.0,
-    )
-
-
 def test_every_number_the_summary_carries_reaches_the_layer(
   estimated_run: tuple[Path, Path],
 ) -> None:
@@ -512,7 +529,6 @@ def test_every_overlay_answers_on_the_keyframe_clock_alone(tmp_path: Path) -> No
     tmp_path,
     "sess_kf",
     _two_cameras(),
-    urdf_path=urdf_file(tmp_path),
     frame_period=1.0 / 30.0,
   )
   geometry = ("strips", "positions", "centers")

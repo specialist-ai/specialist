@@ -15,6 +15,7 @@ import tyro
 from specialist_corpus import schema
 from specialist_corpus.frames import release_videos
 
+from specialist.record.asset import write_gripper_asset
 from specialist.record.layer import write_estimate_layers
 from specialist.record.session import SessionRecording
 from specialist.vi_ba.anchor_detection import configure_detector
@@ -106,6 +107,8 @@ def main(args: Args) -> None:
   print(f"session {session.session_id}: trackers {list(names)}")
 
   urdf_path = _resolve_urdf_path(args.urdf_path)
+  for name in names:
+    write_gripper_asset(urdf_path, name, args.output_dir)
 
   concurrent = captures_that_fit(session, names)
   set_precompute_concurrency(concurrent)

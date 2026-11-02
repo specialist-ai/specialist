@@ -30,7 +30,6 @@ from tests.record_fixtures import (
   camera_estimate,
   encode_clip,
   synthetic_insv,
-  urdf_file,
   write_run,
 )
 
@@ -78,7 +77,7 @@ def corpus(tmp_path_factory: pytest.TempPathFactory) -> Path:
     camera_estimate("cam00", hold=0.7, rate=_RATE["cam00"]),
     camera_estimate("cam01", offset=1.0, hold=0.7, rate=_RATE["cam01"]),
   ]
-  write_run(root, "sess", cameras, urdf_path=urdf_file(root), frame_period=1.0 / _FPS)
+  write_run(root, "sess", cameras, frame_period=1.0 / _FPS)
   return root
 
 
@@ -224,6 +223,29 @@ def test_the_state_is_the_base_tag_frame_on_a_dense_row_lattice(
       # finger angles.
       np.testing.assert_allclose(t_open, t, atol=1e-9)
       np.testing.assert_allclose(q[:, 0], 0.1)
+
+
+def test_each_hand_places_the_gripper_model(corpus: Path, tmp_path: Path) -> None:
+  """The pose is the world-to-root edge of the slot's model and each finger
+  edge is the opening put through the joint, so the model rides the state."""
+  out = _state(corpus, tmp_path, margin=0.0)
+  with Recording(out) as recording:
+    for hand, slot in (("left", "cam00"), ("right", "cam01")):
+      pose = recording.series(f"/{schema.state_pose(hand)}")
+      child = pose.column(
+        schema.selector(schema.state_pose(hand), "Transform3D:child_frame")
+      )
+      assert {f[0] for f in child.to_pylist()} == {f"{slot}_base"}
+      # An opening of 0.1 rad turns the left finger +0.1 about z and the right
+      # finger -0.1.
+      for joint, turn in (("left_finger", 0.05), ("right_finger", -0.05)):
+        entity = schema.state_finger(hand, joint)
+        edges = recording.series(f"/{entity}").column(
+          schema.selector(entity, "Transform3D:child_frame")
+        )
+        assert {f[0] for f in edges.to_pylist()} == {f"{slot}_{joint}"}
+        _, quaternion = recording.values(entity, schema.POSE_QUATERNION, 4)
+        np.testing.assert_allclose(quaternion[:, 2], np.sin(turn), atol=1e-6)
 
 
 def test_a_frame_whose_capture_row_leaves_the_state_rows_goes_for_both_hands(

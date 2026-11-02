@@ -11,7 +11,7 @@ from specialist_corpus import schema
 from specialist_corpus.read import read_keyframe_poses
 
 from specialist.vi_ba.summary import CameraSummary
-from tests.record_fixtures import camera_estimate, urdf_file, write_run
+from tests.record_fixtures import camera_estimate, write_run
 
 
 @pytest.fixture(scope="module")
@@ -35,7 +35,6 @@ def estimate_rrd(tmp_path_factory: pytest.TempPathFactory) -> Path:
       )
       for c in cameras
     ],
-    urdf_path=urdf_file(tmp_path_factory.mktemp("urdf")),
     frame_period=1.0 / 30.0,
   )
   return estimate
@@ -111,7 +110,6 @@ def test_worst_rmse_is_the_worst_camera_that_was_measured(tmp_path: Path) -> Non
         seat_cross_obs=7,
       ),
     ],
-    urdf_path=urdf_file(tmp_path),
     frame_period=1.0 / 30.0,
   )
   assert _worst_rmse(estimate) == pytest.approx(0.4)
@@ -136,7 +134,6 @@ def test_worst_rmse_is_nan_when_no_camera_was_measured(tmp_path: Path) -> None:
         seat_cross_obs=7,
       )
     ],
-    urdf_path=urdf_file(tmp_path),
     frame_period=1.0 / 30.0,
   )
   assert np.isnan(_worst_rmse(estimate))

@@ -3,11 +3,13 @@
 The catalog serves corpus inspection and training, and a training dataset
 holds the state layer alone: ``state_<cfg>/<session>.rrd`` registers as the
 segments themselves, with the state dashboard as the default and both hands'
-frames side by side as the segment-table card. Every other layer is opened
-per session, straight from its files:
+frames side by side as the segment-table card. The gripper models under
+``<root>/assets`` register as the dataset's assets, which every segment
+shows. Every other layer is opened per session, straight from its files:
 
     uv run rerun <root>/blueprints/specialist.rbl <root>/base/<id>.rrd \
-        <root>/estimate/<id>.rrd <root>/viz/<id>.rrd
+        <root>/estimate/<id>.rrd <root>/viz/<id>.rrd \
+        --asset <root>/assets/gripper-<urdf-sha>-<slot>.rrd
 
 Usage:
     uv run python scripts/catalog.py corpus/state_s12_r100 \
@@ -33,6 +35,7 @@ from specialist_corpus.schema import (
   state_image,
 )
 
+from specialist.record.asset import register_assets
 from specialist.vi_ba.blueprint import state_blueprint, state_card_blueprint
 
 
@@ -132,6 +135,7 @@ def main(args: Args) -> None:
     dataset = client.create_dataset(name)
   check_one_configuration(dataset, args.state.name)
   register_all(dataset, files, args.state.name)
+  register_assets(dataset, args.state.parent)
 
   dashboard = state_blueprint()
   blueprints_dir = args.state.parent / "blueprints"
