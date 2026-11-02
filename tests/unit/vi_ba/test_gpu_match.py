@@ -33,7 +33,7 @@ def test_gpu_matches_equal_cv2_brute_force() -> None:
   frames = [detect_orb(f, 2000, 20) for f in _block_frames(6)]
   assert min(len(f.keypoints) for f in frames) > 500
   pairs = [(i, j) for i in range(6) for j in range(6) if i != j]
-  out = gpu_match._match_pairs_cuda(frames, pairs, 0.8)
+  out = gpu_match.match_pairs(frames, pairs, 0.8)
   n_matches = 0
   for (i, j), got in zip(pairs, out, strict=True):
     expected = match_pair(frames[i], frames[j], 0.8)
@@ -57,6 +57,6 @@ def test_gpu_matches_equal_cv2_with_uneven_and_tied_trains() -> None:
   frames.append(type(frames[0])(keypoints=np.zeros((600, 2)), descriptors=tied))
   n = len(frames)
   pairs = [(i, j) for i in range(n) for j in range(n) if i != j]
-  out = gpu_match._match_pairs_cuda(frames, pairs, 0.8)
+  out = gpu_match.match_pairs(frames, pairs, 0.8)
   for (i, j), got in zip(pairs, out, strict=True):
     assert np.array_equal(got, match_pair(frames[i], frames[j], 0.8)), (i, j)
