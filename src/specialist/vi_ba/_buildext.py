@@ -38,7 +38,9 @@ def _repo_root(start: Path) -> Path:
 
 def _run(cmd: list[str]) -> None:
   print("  $", " ".join(str(c) for c in cmd))
-  subprocess.run(cmd, check=True)
+  # A git hook's GIT_INDEX_FILE would aim the gtsam clone at the calling repo's index.
+  env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+  subprocess.run(cmd, check=True, env=env)
 
 
 def _gtsam_paths() -> tuple[Path, Path]:
