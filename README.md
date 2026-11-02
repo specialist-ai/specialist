@@ -74,7 +74,8 @@ without touching the rest:
 ```
 base/<session-id>.rrd          # remuxed per-lens video, IMU, calibration, offsets
 estimate/<session-id>.rrd      # the run's answers: poses, joint angles, opening
-viz/<session-id>.rrd           # what is only drawn: ribbon, overlays, meshes
+viz/<session-id>.rrd           # what is only drawn: ribbon, overlays
+assets/gripper-<sha>-<slot>.rrd # one slot's gripper model, shared by every session
 state_s12_r100/<session-id>.rrd # what the policy sees: 240x240 images, 100 Hz state
 mocap/<session-id>.rrd         # ground-truth layer (eval branch)
 ```
@@ -114,13 +115,20 @@ The run writes two layers sharing the base recording's id:
 `logs/estimate/<session-id>.rrd` carries what a consumer reads — body poses,
 keyframe poses, finger joint angles, gripper opening, the solved anchor poses
 and the run summary — and `logs/viz/<session-id>.rrd` carries what is only
-drawn, the trajectory ribbon, the image overlays, the landmarks, the robot
-meshes and the diagnostic scalars. Re-running a session refuses to overwrite
-either unless `--overwrite` is passed, so point experimental runs at their own
+drawn, the trajectory ribbon, the image overlays, the landmarks and the
+diagnostic scalars. The gripper model, meshes and fixed joints, is one asset
+per camera slot, `logs/assets/gripper-<sha>-<slot>.rrd`, written once per URDF
+and shared by every session. Re-running a session refuses to overwrite either
+layer unless `--overwrite` is passed, so point experimental runs at their own
 `--output-dir`. To look at a session, load the layers beside their base — the
-shared id merges them — with
-`uv run rerun logs/blueprints/specialist.rbl logs/base/<id>.rrd
-logs/estimate/<id>.rrd logs/viz/<id>.rrd`.
+shared id merges them — with the assets:
+
+```
+uv run rerun logs/blueprints/specialist.rbl logs/base/<id>.rrd \
+  logs/estimate/<id>.rrd logs/viz/<id>.rrd \
+  --asset logs/assets/gripper-<sha>-cam00.rrd \
+  --asset logs/assets/gripper-<sha>-cam01.rrd
+```
 
 **3. State.** The layer holds the session's state, keyed by hand:
 *proprioceptive* — each hand's pose, twist and finger opening — and *object*,
