@@ -1,4 +1,4 @@
-"""Catalog a dataset's state layer as a Rerun catalog dataset, with its blueprints.
+"""Register a state layer as a Rerun catalog dataset, with its assets and blueprints.
 
 Usage:
     uv run python scripts/catalog.py dataset/state_s12_r100 \
@@ -24,6 +24,7 @@ from specialist_dataset.schema import (
   state_image,
 )
 
+from specialist.record.asset import register_assets
 from specialist.vi_ba.blueprint import state_blueprint, state_card_blueprint
 
 
@@ -117,6 +118,7 @@ def main(args: Args) -> None:
     entry = client.create_dataset(name)
   check_one_configuration(entry, args.state.name)
   register_all(entry, files, args.state.name)
+  register_assets(entry, args.state.parent)
 
   dashboard = state_blueprint()
   blueprints_dir = args.state.parent / "blueprints"

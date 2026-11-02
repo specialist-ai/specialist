@@ -12,7 +12,6 @@ import gtsam
 import numpy as np
 import numpy.typing as npt
 import pyarrow as pa
-import pyarrow.compute as pc
 import rerun as rr
 from rerun.chunk import Chunk
 from specialist_dataset import schema
@@ -77,6 +76,18 @@ def _static(emit: Sink, entity_path: str, *columns: Any) -> None:
     Chunk.from_columns(
       entity_path, indexes=[], columns=[c for group in columns for c in group]
     )
+  )
+
+
+def world_chunk() -> Chunk:
+  """The world frame, Z up, that every layer's poses hang from."""
+  return Chunk.from_columns(
+    schema.WORLD,
+    indexes=[],
+    columns=[
+      *rr.ViewCoordinates.columns(xyz=[rr.components.ViewCoordinates.RIGHT_HAND_Z_UP]),
+      *rr.Transform3D.columns(child_frame=[schema.WORLD_FRAME]),
+    ],
   )
 
 
@@ -545,75 +556,6 @@ def _camera_statics(layers: Layers, data: CameraEstimate) -> None:
   )
 
 
-def _urdf_model(
-  layers: Layers, data: CameraEstimate, urdf_path: Path
-) -> tuple[rr.urdf.UrdfTree, str]:
-  """The gripper model and its root frame; an unreadable mesh costs only pictures."""
-  gripper_root = "/" + schema.gripper(data.slot)
-  # The loader escapes prefix slashes, so chunks move under the gripper after loading.
-  tree = rr.urdf.UrdfTree.from_file_path(
-    str(urdf_path),
-    entity_path_prefix=data.slot,
-    frame_prefix=f"{data.slot}_",
-    static_transform_entity_path=schema.gripper_part(data.slot, "tf_static"),
-  )
-  root_frame = f"{data.slot}_{tree.root_link().name}"
-  model_root = f"/{data.slot}/{tree.name}"
-  try:
-    links = [tree.root_link(), *map(tree.get_joint_child, tree.joints())]
-    collision = [p for link in links for p in tree.get_collision_geometry_paths(link)]
-    drawn = {p for link in links for p in tree.get_visual_geometry_paths(link)}
-    model_chunks = tree.stream().drop(content=collision).to_chunks()
-  except Exception as exc:  # noqa: BLE001 - a mesh failure costs pictures alone
-    print(f"  [warn] [model] geometry skipped ({exc})")
-    drawn = set()
-    model_chunks = [
-      chunk
-      for chunk in tree.stream().to_chunks()
-      if "geometries" not in chunk.entity_path
-    ]
-  # Schema paths carry no leading slash; a chunk's entity path does.
-  static_path = f"/{schema.gripper_part(data.slot, 'tf_static')}"
-  for chunk in model_chunks:
-    # The static transforms are already at their final path.
-    tail = chunk.entity_path.removeprefix(model_root)
-    sink = layers.viz if chunk.entity_path in drawn else layers.estimate
-    if chunk.entity_path == static_path:
-      for fixed in _fixed_joint_transforms(chunk, tree, data.slot):
-        sink(fixed)
-      continue
-    sink(
-      chunk
-      if tail == chunk.entity_path
-      else chunk.with_entity_path(gripper_root + tail)
-    )
-  # CoordinateFrame places the entity; a two-frame transform only defines an edge.
-  _static(
-    layers.estimate,
-    gripper_root,
-    rr.CoordinateFrame.columns(frame=[root_frame]),
-    rr.AnyValues.columns(
-      robot=[tree.name],
-      urdf_sha=[hashlib.sha256(urdf_path.read_bytes()).hexdigest()],
-    ),
-  )
-  return tree, root_frame
-
-
-def _fixed_joint_transforms(chunk: Any, tree: Any, slot: str) -> list[Any]:
-  """The model's static transforms, less the joints the solve writes per keyframe."""
-  fixed = {
-    f"{slot}_{tree.get_joint_child(joint).name}"
-    for joint in tree.joints()
-    if joint.joint_type == "fixed"
-  }
-  batch = chunk.to_record_batch()
-  child = batch.column(batch.schema.get_field_index("Transform3D:child_frame"))
-  keep = pc.is_in(pc.list_flatten(child), value_set=pa.array(sorted(fixed)))
-  out = Chunk.from_record_batch(batch.filter(keep))
-  return out if isinstance(out, list) else [out]
-
-
 def _pose_streams(layers: Layers, data: CameraEstimate, indexes: _Indexes) -> None:
   """Body pose and velocity at the keyframes and, propagated, on the camera entity."""
   # Naming both frames keeps path composition from stacking this on the camera pose.
@@ -681,16 +623,6 @@ def _joint_streams(
     if joint is None:
       continue
     joint_path = schema.gripper_part(data.slot, joint_name)
-    _static(
-      layers.estimate,
-      schema.joint_model(data.slot, joint_name),
-      rr.AnyValues.columns(
-        joint_type=[joint.joint_type],
-        axis=[np.asarray(joint.axis, dtype=np.float64)],
-        limit_lower=[joint.limit_lower],
-        limit_upper=[joint.limit_upper],
-      ),
-    )
     tag_id = data.joint_tags.get(joint_name)
     if tag_id is not None:
       _send_tag(
@@ -712,13 +644,6 @@ def _joint_streams(
       joint,
       *frame_series,
       indexes,
-    )
-    _static(
-      layers.estimate,
-      joint_path,
-      rr.CoordinateFrame.columns(
-        frame=[f"{data.slot}_{tree.get_joint_child(joint).name}"]
-      ),
     )
     _send_angle(layers.estimate, joint_path, indexes.dense(times), angles)
 
@@ -871,7 +796,15 @@ def _send_camera(
 ) -> None:
   """Log every entity under one camera; the caller logs the shared world statics."""
   _camera_statics(layers, data)
-  tree, root_frame = _urdf_model(layers, data, urdf_path)
+  tree = rr.urdf.UrdfTree.from_file_path(str(urdf_path), frame_prefix=f"{data.slot}_")
+  root_frame = schema.link_frame(data.slot, tree.root_link().name)
+  _static(
+    layers.estimate,
+    "/" + schema.gripper(data.slot),
+    rr.AnyValues.columns(
+      robot=[tree.name], urdf_sha=[hashlib.sha256(urdf_path.read_bytes()).hexdigest()]
+    ),
+  )
   indexes = _camera_indexes(data, frame_period, timeline_start)
   _pose_streams(layers, data, indexes)
   gripper_hr = _gripper_streams(layers, data, indexes, root_frame)
@@ -932,12 +865,7 @@ def estimate_chunks(
   frame_period: float,
 ) -> None:
   """Every entity of a solved run as chunks, sorted into the estimate and viz layers."""
-  _static(
-    layers.estimate,
-    schema.WORLD,
-    rr.ViewCoordinates.columns(xyz=[rr.components.ViewCoordinates.RIGHT_HAND_Z_UP]),
-    rr.Transform3D.columns(child_frame=[schema.WORLD_FRAME]),
-  )
+  layers.estimate(world_chunk())
   for tag_id, pose in anchor_poses_world.items():
     _send_anchor(
       layers,
