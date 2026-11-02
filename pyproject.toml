@@ -9,8 +9,8 @@ dependencies = [
   "gtsam==4.3a0",
   "numpy>=1.26",
   "scipy>=1.11",
-  # The [datafusion] extra is the catalog client's query engine.
-  "rerun-sdk[datafusion]>=0.36.3,<0.37",
+  # The [catalog] extra is the catalog client and its query engine.
+  "rerun-sdk[catalog]>=0.41.0,<0.42",
   "av>=13",
   "tyro>=0.9",
   "telemetry-parser>=0.3",

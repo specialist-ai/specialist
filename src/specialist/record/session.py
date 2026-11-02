@@ -11,7 +11,7 @@ from typing import Any
 import gtsam
 import numpy as np
 import numpy.typing as npt
-from rerun.experimental import RrdReader
+from rerun.chunk import RrdReader
 from specialist_camera import Side
 from specialist_corpus import frames, schema
 from specialist_corpus.poses import quats_to_matrices

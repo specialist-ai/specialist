@@ -74,11 +74,11 @@ def _anchor_square(tag_size: float) -> np.ndarray:
 
 def _triad_overrides(
   slots: list[str], anchor_tag_ids: Iterable[int], tag_size: float
-) -> dict[rr.datatypes.EntityPath | str, Any]:
+) -> dict[rr.encodings.EntityPath | str, Any]:
   """A triad on every frame the solve exports. An override names every
   visualizer its entity keeps."""
   square = _anchor_square(tag_size)
-  axes: dict[rr.datatypes.EntityPath | str, Any] = {
+  axes: dict[rr.encodings.EntityPath | str, Any] = {
     f"/{record_schema.anchor(int(tag_id))}": [
       rr.TransformAxes3D(tag_size / 2.0),
       rr.LineStrips3D(strips=[square], colors=[_TAG_COLOR], radii=[0.003]),
@@ -102,7 +102,7 @@ def _triad_overrides(
 
 def _trail_overrides(
   slots: list[str],
-) -> dict[rr.datatypes.EntityPath | str, rrb.VisibleTimeRanges]:
+) -> dict[rr.encodings.EntityPath | str, rrb.VisibleTimeRanges]:
   """The window every view that draws a trajectory ribbon has to set."""
   return {f"/{record_schema.trajectory(s)}": _trail_window() for s in slots}
 
@@ -116,7 +116,7 @@ _HIDDEN = (
 
 def _hidden_overlay_overrides(
   slot: str, lens: str
-) -> dict[rr.datatypes.EntityPath | str, rrb.EntityBehavior]:
+) -> dict[rr.encodings.EntityPath | str, rrb.EntityBehavior]:
   """The dense pixel layers start hidden. Only the lens that builds landmarks
   has them."""
   if lens != "front":
@@ -143,7 +143,7 @@ def _scene(
   slots: list[str],
   anchor_tag_ids: Iterable[int] = (),
   anchor_tag_size: float = 0.1,
-  overrides: dict[rr.datatypes.EntityPath | str, Any] | None = None,
+  overrides: dict[rr.encodings.EntityPath | str, Any] | None = None,
 ) -> rrb.Spatial3DView:
   """The 3D view every dashboard shares: a triad on each solved frame, the
   anchors' outlines and the trajectory ribbons; the landmark clouds start
@@ -153,7 +153,7 @@ def _scene(
   optionally ending in ``/**``, and a wildcard in the middle matches nothing.
   """
   hidden = rrb.EntityBehavior(visible=False)
-  all_overrides: dict[rr.datatypes.EntityPath | str, Any] = {**_trail_overrides(slots)}
+  all_overrides: dict[rr.encodings.EntityPath | str, Any] = {**_trail_overrides(slots)}
   all_overrides.update(_triad_overrides(slots, anchor_tag_ids, anchor_tag_size))
   all_overrides.update(
     {
@@ -250,7 +250,7 @@ def state_blueprint() -> rrb.Blueprint:
   )
 
 
-def _state_triads() -> dict[rr.datatypes.EntityPath | str, Any]:
+def _state_triads() -> dict[rr.encodings.EntityPath | str, Any]:
   return {
     f"/{record_schema.state_pose(hand)}": rr.TransformAxes3D(BODY_AXIS)
     for hand in record_schema.HANDS

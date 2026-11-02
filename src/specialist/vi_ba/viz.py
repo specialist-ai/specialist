@@ -21,7 +21,7 @@ import numpy.typing as npt
 import pyarrow as pa
 import pyarrow.compute as pc
 import rerun as rr
-from rerun.experimental import Chunk
+from rerun.chunk import Chunk
 from specialist_corpus import schema as record_schema
 from specialist_corpus.poses import quats_to_matrices
 

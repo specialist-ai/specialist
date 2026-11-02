@@ -28,6 +28,8 @@ def clean_clip(tmp_path_factory: pytest.TempPathFactory, h264_clip: Path) -> Pat
 
 
 def _collect(clip: Path, shift: float) -> tuple[list[object], list[int], list[bool]]:
+  """The stream's static chunks, its sample times and its keyframe marks; the
+  marks come in a sparse chunk of their own."""
   stream = video_chunks(clip, "image/cam/front", time_shift=shift, window=_WHOLE_CLIP)
   static, times, keyframes = [], [], []
   for chunk in stream.to_chunks():
@@ -36,10 +38,13 @@ def _collect(clip: Path, shift: float) -> tuple[list[object], list[int], list[bo
       static.append(chunk)
       continue
     batch = chunk.to_record_batch()
-    index = batch.schema.get_field_index("video_time")
-    times += [v.value for v in batch.column(index)]
-    key_index = batch.schema.get_field_index("VideoStream:is_keyframe")
-    keyframes += [bool(v.as_py()) for v in batch.column(key_index)]
+    names = batch.schema.names
+    if "VideoStream:sample" in names:
+      times += [v.value for v in batch.column(names.index("video_time"))]
+    if "VideoStream:is_keyframe" in names:
+      keyframes += [
+        bool(v.as_py()) for v in batch.column(names.index("VideoStream:is_keyframe"))
+      ]
   return static, times, keyframes
 
 
@@ -49,7 +54,10 @@ def _keyframe_rows(clip: Path, shift: float) -> list[tuple[int, int]]:
   for chunk in video_chunks(
     clip, "image/t/front", time_shift=shift, window=(0.0, 10.0)
   ).to_chunks():
-    if chunk.is_static:
+    if (
+      chunk.is_static
+      or "VideoStream:sample" not in chunk.to_record_batch().schema.names
+    ):
       continue
     batch = chunk.to_record_batch()
     names = batch.schema.names
@@ -86,7 +94,11 @@ def test_time_shift(clean_clip: Path) -> None:
 def test_window_keeps_and_drops_chunks(clean_clip: Path) -> None:
   def rows(window: tuple[float, float]) -> int:
     stream = video_chunks(clean_clip, "image/cam/front", time_shift=0.0, window=window)
-    return sum(c.num_rows for c in stream.to_chunks() if not c.is_static)
+    return sum(
+      c.num_rows
+      for c in stream.to_chunks()
+      if "VideoStream:sample" in c.to_record_batch().schema.names
+    )
 
   # A chunk overlapping the window survives whole at GOP granularity; one
   # entirely outside is dropped.
