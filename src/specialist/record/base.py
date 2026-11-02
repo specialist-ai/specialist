@@ -10,7 +10,7 @@ import gtsam
 import numpy as np
 import numpy.typing as npt
 import rerun as rr
-from rerun.experimental import Chunk, LazyChunkStream, OptimizationProfile, send_chunks
+from rerun.chunk import Chunk, LazyChunkStream, OptimizationProfile
 from specialist_dataset import schema
 
 from specialist.loader.parse_insv import InsvData
@@ -184,7 +184,7 @@ def write_base_recording(
   merged = LazyChunkStream.merge(
     *video_streams, LazyChunkStream.from_iter(sidecar_chunks)
   )
-  # Dense `false` rows of `is_keyframe` block GoP rebatching; keep the marker sparse.
+  # fix_keyframe re-derives the markers, as the GOP trim keeps the marker chunk whole.
   optimize = dataclasses.replace(OptimizationProfile.OBJECT_STORE, fix_keyframe=True)
   store = merged.collect(optimize=optimize)
   partial = out_path.parent / (out_path.name + ".partial")
@@ -192,7 +192,7 @@ def write_base_recording(
   try:
     with rr.RecordingStream(schema.APPLICATION_ID, recording_id=session_id) as stream:
       stream.save(str(partial))
-      send_chunks(store, recording=stream)
+      rr.send_chunks(store, recording=stream)
       for name, values in properties.items():
         if values:
           stream.send_property(name, rr.AnyValues(**values))
