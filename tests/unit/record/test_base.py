@@ -5,7 +5,7 @@ from typing import Any
 
 import numpy as np
 import pytest
-from rerun.experimental import Chunk, LazyChunkStream, RrdReader
+from rerun.chunk import Chunk, LazyChunkStream, RrdReader
 from specialist_corpus import schema
 
 from specialist.record.base import (
@@ -116,7 +116,7 @@ def test_write_base_recording_failure_leaves_no_final_file(
   def explode(*args: Any, **kwargs: Any) -> None:
     raise RuntimeError("mid-write failure")
 
-  monkeypatch.setattr("specialist.record.base.send_chunks", explode)
+  monkeypatch.setattr("rerun.send_chunks", explode)
   chunks = imu_chunks("cam00", synthetic_insv(), 0.0, _WHOLE_SESSION)
   with pytest.raises(RuntimeError, match="mid-write failure"):
     write_base_recording(out, "s", [LazyChunkStream.from_iter(chunks)], [], {})

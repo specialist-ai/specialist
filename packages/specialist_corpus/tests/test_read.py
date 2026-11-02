@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 import rerun as rr
-from rerun.experimental import Chunk, send_chunks
+from rerun.chunk import Chunk
 from specialist_corpus import schema
 from specialist_corpus.read import (
   Recording,
@@ -35,7 +35,7 @@ def _lens_chunk() -> Chunk:
 def _write(rrd: Path, chunks: list[Chunk]) -> None:
   with rr.RecordingStream("test", recording_id="s") as stream:
     stream.save(str(rrd))
-    send_chunks(chunks, recording=stream)
+    rr.send_chunks(chunks, recording=stream)
 
 
 def test_a_static_written_twice_resolves_to_one_value(tmp_path: Path) -> None:
@@ -58,7 +58,7 @@ def test_a_lens_reads_back_at_the_decode_resolution(tmp_path: Path) -> None:
   rrd = tmp_path / "base.rrd"
   with rr.RecordingStream("test", recording_id="s") as stream:
     stream.save(str(rrd))
-    send_chunks([_lens_chunk()], recording=stream)
+    rr.send_chunks([_lens_chunk()], recording=stream)
   row = Recording(rrd).row(schema.lens("cam00", "front"))
   assert lens_from_row(row, 1440, "front").params.fx == pytest.approx(1000.0)
   lens = read_lens(rrd, "cam00", "front", 1440)
@@ -79,7 +79,7 @@ def _keyframes() -> Chunk:
 def _write_stamped(rrd: Path, chunks: list[Chunk]) -> None:
   with rr.RecordingStream("test", recording_id="s") as stream:
     stream.save(str(rrd))
-    send_chunks(chunks, recording=stream)
+    rr.send_chunks(chunks, recording=stream)
 
 
 def _tagged(entity: str, tag_id: int) -> Chunk:

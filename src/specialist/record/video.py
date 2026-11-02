@@ -14,7 +14,8 @@ from pathlib import Path
 import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
-from rerun.experimental import Chunk, LazyChunkStream, Mp4Reader
+from rerun.chunk import Chunk, LazyChunkStream
+from rerun.experimental import Mp4Reader
 from specialist_corpus import schema
 
 from specialist.loader.audio_sync import resolve_ffmpeg
@@ -75,7 +76,7 @@ def _shift_chunk(
 
 
 def _stream_metadata(mp4: Path, entity_path: str) -> tuple[float, int]:
-  """The stream's frame period from its own PTS, and its keyframe-marker
+  """The stream's frame period from its samples' PTS, and its keyframe-marker
   count."""
   pts: list[int] = []
   markers = 0
@@ -88,7 +89,8 @@ def _stream_metadata(mp4: Path, entity_path: str) -> tuple[float, int]:
       continue
     batch = chunk.to_record_batch()
     names = batch.schema.names
-    pts.extend(v.value for v in batch.column(names.index(schema.TIMELINE)))
+    if "VideoStream:sample" in names:
+      pts.extend(v.value for v in batch.column(names.index(schema.TIMELINE)))
     if "VideoStream:is_keyframe" in names:
       flags = batch.column(names.index("VideoStream:is_keyframe")).to_pylist()
       markers += sum(1 for f in flags if f is not None and len(f) and bool(f[0]))
@@ -124,7 +126,8 @@ def video_chunks(
   if markers != keyframes:
     raise RuntimeError(
       f"{entity_path}: the reader marked {markers} keyframes but the container "
-      f"holds {keyframes}; the recording would not be randomly accessible"
+      f"holds {keyframes} (the reader transcodes a source with B-frames); the "
+      "recording would not be randomly accessible"
     )
   stride = schema.keyframe_stride(schema.NS_PER_SECOND / period_ns)
   stream = Mp4Reader(
