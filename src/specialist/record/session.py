@@ -6,7 +6,6 @@ from __future__ import annotations
 import shutil
 import tempfile
 from pathlib import Path
-from typing import Any
 
 import gtsam
 import numpy as np
@@ -82,7 +81,6 @@ class SessionRecording:
     if not recordings:
       raise ValueError(f"{base_rrd} holds no recording")
     self.session_id: str = recordings[0].recording_id
-    self._rows: dict[str, dict[str, Any]] = {}
     self._recording = Recording(base_rrd)
     self._stage = stage
     self._owns_stage = stage is None
@@ -115,23 +113,9 @@ class SessionRecording:
       raise ValueError(f"{self.path} holds no /{schema.CAMERA_ROOT}/<slot> video")
     return slots
 
-  def _entity_row(self, entity: str) -> dict[str, Any]:
-    """Component name -> newest value across the entity's chunks."""
-    cached = self._rows.get(entity)
-    if cached is None:
-      cached = self._recording.row(entity)
-      self._rows[entity] = cached
-    return cached
-
   def lens_times(self, slot: str, side: str) -> Float64Array:
     """One lens's frame PTS (s), one row per encoded sample."""
     return frames.lens_times(self._recording, schema.video(slot, side))
-
-  @property
-  def frame_times(self) -> dict[str, Float64Array]:
-    """Per-camera front-lens frame times (s): the grid a solve's keyframe
-    timestamps must land on."""
-    return {slot: self.lens_times(slot, "front") for slot in self.slots}
 
   def lens_video(self, slot: str, side: str) -> frames.LensVideo:
     """One lens's encoded samples, ready for banded decoding."""
@@ -153,7 +137,9 @@ class SessionRecording:
     )
 
   def _lens_setup(self, slot: str, side: Side, decoded_width: int) -> LensSetup:
-    lens = lens_from_row(self._entity_row(schema.lens(slot, side)), decoded_width, side)
+    lens = lens_from_row(
+      self._recording.row(schema.lens(slot, side)), decoded_width, side
+    )
     return LensSetup(
       extrinsic=gtsam.Pose3(lens.body_from_lens),
       params=lens.params,
@@ -175,18 +161,13 @@ class SessionRecording:
 
   def imu_to_body(self, slot: str) -> Float64Array:
     """The IMU mounting rotation, raw IMU axes -> body."""
-    row = self._entity_row(schema.imu(slot))
+    row = self._recording.row(schema.imu(slot))
     matrix: Float64Array = quats_to_matrices(row[schema.POSE_QUATERNION])[0]
     return matrix
 
   def factory_bias(self, slot: str) -> gtsam.imuBias.ConstantBias:
     """The factory IMU bias in raw IMU axes (accel m/s^2, gyro rad/s)."""
-    row = self._entity_row(schema.imu(slot))
+    row = self._recording.row(schema.imu(slot))
     accel = np.asarray(row["accel_bias"], dtype=np.float64).reshape(3)
     gyro = np.asarray(row["gyro_bias"], dtype=np.float64).reshape(3)
     return gtsam.imuBias.ConstantBias(accel, gyro)
-
-  def rolling_shutter_readout(self, slot: str) -> float:
-    """The rolling-shutter readout time (s) stored with the IMU calibration."""
-    row = self._entity_row(schema.imu(slot))
-    return float(np.asarray(row["rolling_shutter_readout"]).reshape(-1)[0])

@@ -40,7 +40,6 @@ APPLICATION_ID = "specialist"
 # One property group per layer: a name has exactly one writer after a merge.
 BASE_PROPERTIES = "base"
 ESTIMATE_PROPERTIES = "estimate"
-VIZ_PROPERTIES = "viz"
 TIMELINE = "video_time"
 KEYFRAME_TIMELINE = "keyframe"
 ROW_TIMELINE = "row"
@@ -56,7 +55,6 @@ WORLD_FRAME = "world"
 BASE = "base"
 ESTIMATE = "estimate"
 VIZ = "viz"
-MOCAP = "mocap"
 STATE = "state"
 ASSETS = "assets"
 
@@ -67,14 +65,9 @@ def state_layer(scale: int, f_row: float) -> str:
   return f"{STATE}_s{scale}_r{round(f_row)}"
 
 
-def layer_dir(corpus: Path, layer: str) -> Path:
-  """Where one layer's recordings sit in a layer-first corpus."""
-  return corpus / layer
-
-
 def layer_rrd(corpus: Path, layer: str, session: str) -> Path:
   """Where one session's layer sits in a layer-first corpus."""
-  return layer_dir(corpus, layer) / f"{session}.rrd"
+  return corpus / layer / f"{session}.rrd"
 
 
 def asset_rrd(corpus: Path, asset: str) -> Path:
@@ -187,21 +180,14 @@ def state_finger(hand: str, joint: str) -> str:
 TAGS_DETECTION = "tags"
 KEYPOINTS_DETECTION = "keypoints"
 REJECTED_KEYPOINTS_DETECTION = "keypoints_rejected"
-DETECTION_KINDS = (TAGS_DETECTION, KEYPOINTS_DETECTION, REJECTED_KEYPOINTS_DETECTION)
 
 TAG_AXES_OVERLAY = "tag_axes"
 LANDMARK_REPROJECTION_OVERLAY = "landmark_reprojection"
-OVERLAY_KINDS = (TAG_AXES_OVERLAY, LANDMARK_REPROJECTION_OVERLAY)
 
 
 def detection(slot: str, side: str, kind: str) -> str:
   """What the lens measured, in its own pixels."""
   return f"{lens(slot, side)}/detection/{kind}"
-
-
-def tag_center(slot: str, side: str) -> str:
-  """A detected tag's centre pixel, the cheirality ray's origin."""
-  return f"{detection(slot, side, TAGS_DETECTION)}/center"
 
 
 def overlay(slot: str, side: str, kind: str) -> str:

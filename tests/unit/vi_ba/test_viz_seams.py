@@ -55,16 +55,14 @@ def test_the_propagated_gripper_frame_is_what_the_trajectory_rides() -> None:
   trail's keypoint offset is applied in, so the two agree by construction."""
   data = _data()
   indexes = _camera_indexes(data, 1.0 / 30.0, timeline_start=0.0)
-  gripper_hr = _gripper_streams(
-    Layers(lambda _: None, lambda _: None), data, indexes, "cam00_base"
-  )
+  gripper_hr = _gripper_streams(Layers([], []), data, indexes, "cam00_base")
   assert gripper_hr is not None
   translations, rotations = gripper_hr
   assert translations.shape == (5, 3)
   assert rotations.shape == (5, 3, 3)
 
   chunks: list[Chunk] = []
-  _trajectory_streams(Layers(chunks.append, chunks.append), data, gripper_hr, (1, 2, 3))
+  _trajectory_streams(Layers(chunks, chunks), data, gripper_hr, (1, 2, 3))
   offset = np.asarray(data.trajectory_offset_in_gripper)
   expected = translations + rotations @ offset
   strips = _strips(chunks)
