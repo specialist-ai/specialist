@@ -5,9 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
-import rerun as rr
 import rerun.blueprint as rrb
-from rerun.chunk import RrdReader
+from rerun.chunk import LazyStore, RrdReader
 
 from specialist.vi_ba.blueprint import (
   blueprint_for_slots,
@@ -39,22 +38,23 @@ def test_a_break_in_the_samples_is_a_break_in_the_path() -> None:
   assert np.array_equal(segments[3], np.stack([traj[2], traj[3]]))
 
 
-def _ranged(blueprint: rrb.Blueprint, rrd: Path) -> set[str]:
-  """The entity paths the blueprint gives a visible time range."""
-  with rr.RecordingStream("app", recording_id="bp", send_properties=False) as stream:
-    stream.save(str(rrd))
-    stream.send_blueprint(blueprint, make_active=True, make_default=True)
+def _store(blueprint: rrb.Blueprint | rrb.TableBlueprint, rrd: Path) -> LazyStore:
+  """The blueprint store of ``blueprint`` saved to ``rrd``."""
+  blueprint.save("app", str(rrd))
   reader = RrdReader(str(rrd))
-  columns = reader.store(store=reader.blueprints()[0]).schema().component_columns()
-  return {c.entity_path for c in columns if c.component == "VisibleTimeRanges:ranges"}
+  return reader.store(store=reader.blueprints()[0])
+
+
+def _carrying(blueprint: rrb.Blueprint, rrd: Path, component: str) -> set[str]:
+  """The blueprint entities that carry one component."""
+  columns = _store(blueprint, rrd).schema().component_columns()
+  return {c.entity_path for c in columns if c.component == component}
 
 
 def _views(blueprint: rrb.Blueprint | rrb.TableBlueprint, rrd: Path) -> dict[str, str]:
   """Each view's name and the entity path it takes as its origin."""
-  blueprint.save("app", str(rrd))
-  reader = RrdReader(str(rrd))
   views: dict[str, str] = {}
-  for chunk in reader.store(store=reader.blueprints()[0]).stream().to_chunks():
+  for chunk in _store(blueprint, rrd).stream().to_chunks():
     batch = chunk.to_record_batch()
     if "ViewBlueprint:space_origin" not in batch.schema.names:
       continue
@@ -68,11 +68,7 @@ def _views(blueprint: rrb.Blueprint | rrb.TableBlueprint, rrd: Path) -> dict[str
 
 def _overrides(blueprint: rrb.Blueprint, rrd: Path, view: str) -> set[tuple[str, str]]:
   """Each entity the named view overrides, with the component overridden."""
-  with rr.RecordingStream("app", recording_id="bp", send_properties=False) as stream:
-    stream.save(str(rrd))
-    stream.send_blueprint(blueprint, make_active=True, make_default=True)
-  reader = RrdReader(str(rrd))
-  store = reader.store(store=reader.blueprints()[0])
+  store = _store(blueprint, rrd)
   names: dict[str, str] = {}
   for chunk in store.stream().to_chunks():
     batch = chunk.to_record_batch()
@@ -102,8 +98,7 @@ def test_the_state_card_is_one_pane_over_both_hands(tmp_path: Path) -> None:
   """The viewer shows cards only from a table blueprint's card layout."""
   views = _views(state_card_blueprint(240), tmp_path / "c.rrd")
   assert views == {"state": "/state"}
-  reader = RrdReader(str(tmp_path / "c.rrd"))
-  paths = reader.store(store=reader.blueprints()[0]).schema().entity_paths()
+  paths = _store(state_card_blueprint(240), tmp_path / "c.rrd").schema().entity_paths()
   assert "/table/layouts/cards" in {str(p) for p in paths}
 
 
@@ -115,35 +110,33 @@ def test_the_state_dashboard_puts_a_triad_on_each_hand(tmp_path: Path) -> None:
     assert ("state/" + hand + "/pose", "TransformAxes3D:axis_length") in overridden
 
 
-def _visualized(blueprint: rrb.Blueprint, rrd: Path) -> set[str]:
-  """The entity paths the blueprint puts an explicit visualizer set on."""
-  with rr.RecordingStream("app", recording_id="bp", send_properties=False) as stream:
-    stream.save(str(rrd))
-    stream.send_blueprint(blueprint, make_active=True, make_default=True)
-  reader = RrdReader(str(rrd))
-  columns = reader.store(store=reader.blueprints()[0]).schema().component_columns()
-  return {
-    c.entity_path for c in columns if c.component == "ActiveVisualizers:instruction_ids"
-  }
-
-
 def test_the_written_blueprint_carries_an_override_for_every_anchor(
   tmp_path: Path,
 ) -> None:
   """An anchor's pose renders as nothing on its own, so the drawing lives in
   the blueprint."""
-  drawn = _visualized(
-    blueprint_for_slots(["cam00"], anchor_tag_ids=[7]), tmp_path / "with.rrd"
+  drawn = _carrying(
+    blueprint_for_slots(["cam00"], anchor_tag_ids=[7]),
+    tmp_path / "with.rrd",
+    "ActiveVisualizers:instruction_ids",
   )
   assert any(p.endswith("world/anchor/7/visualizers") for p in drawn), sorted(drawn)
-  bare = _visualized(blueprint_for_slots(["cam00"]), tmp_path / "without.rrd")
+  bare = _carrying(
+    blueprint_for_slots(["cam00"]),
+    tmp_path / "without.rrd",
+    "ActiveVisualizers:instruction_ids",
+  )
   assert not any("anchor" in p for p in bare)
 
 
 def test_every_view_that_draws_the_ribbon_sets_the_window(tmp_path: Path) -> None:
   """The samples carry one step each, so every view that draws the ribbon sets
   a visible time range."""
-  ranged = _ranged(blueprint_for_slots(["cam00"]), tmp_path / "dashboard.rrd")
+  ranged = _carrying(
+    blueprint_for_slots(["cam00"]),
+    tmp_path / "dashboard.rrd",
+    "VisibleTimeRanges:ranges",
+  )
   assert any(
     p.endswith("overrides/camera/cam00/trajectory/visualizers") for p in ranged
   ), ranged

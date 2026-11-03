@@ -1,8 +1,7 @@
 """Columnar Rerun chunks for dual-lens VI-BA. ``estimate_chunks`` takes one
 ``CameraEstimate`` per camera and builds every entity a solved run has (poses,
 biases, gripper, landmarks, tags, reprojections, joints, ...) under that camera's
-slot, handing each chunk to a sink as it is made; the layer writer in
-``specialist.record.layer`` decides which file each one belongs in.
+slot, sorted into the estimate layer's chunks and the viz layer's.
 
 Every path is minted by ``specialist_corpus.schema``, which is the only place
 that decides what an entity is called."""
@@ -51,16 +50,13 @@ __all__ = [
 ]
 
 
-Sink = Callable[[Chunk], None]
-
-
 @dataclass(frozen=True)
 class Layers:
   """Where a chunk goes, by what it is: a quantity someone computes with to
   ``estimate``, a way of drawing one to ``viz``."""
 
-  estimate: Sink
-  viz: Sink
+  estimate: list[Chunk]
+  viz: list[Chunk]
 
 
 def _clock(times: Float64Array) -> rr.TimeColumn:
@@ -68,22 +64,22 @@ def _clock(times: Float64Array) -> rr.TimeColumn:
   return rr.TimeColumn(_TIMELINE, duration=times)
 
 
-def _send(emit: Sink, entity_path: str, indexes: Any, columns: Any) -> None:
-  """One temporal chunk, shaped exactly as the columnar log call was."""
-  emit(Chunk.from_columns(entity_path, indexes=indexes, columns=columns))
+def _send(chunks: list[Chunk], entity_path: str, indexes: Any, columns: Any) -> None:
+  """One temporal chunk at one entity."""
+  chunks.append(Chunk.from_columns(entity_path, indexes=indexes, columns=columns))
 
 
-def _in_world(emit: Sink, entity_path: str) -> None:
+def _in_world(chunks: list[Chunk], entity_path: str) -> None:
   """Declare an entity's data to be in the world frame. Goes on the entity that
   holds the data, never on a parent -- see ``schema.WORLD_FRAME``."""
   _static(
-    emit, entity_path, rr.CoordinateFrame.columns(frame=[record_schema.WORLD_FRAME])
+    chunks, entity_path, rr.CoordinateFrame.columns(frame=[record_schema.WORLD_FRAME])
   )
 
 
-def _static(emit: Sink, entity_path: str, *columns: Any) -> None:
+def _static(chunks: list[Chunk], entity_path: str, *columns: Any) -> None:
   """One static chunk carrying every archetype logged at that entity."""
-  emit(
+  chunks.append(
     Chunk.from_columns(
       entity_path, indexes=[], columns=[c for group in columns for c in group]
     )
@@ -103,10 +99,10 @@ def world_chunk() -> Chunk:
 
 
 def _send_scalars(
-  emit: Sink, entity_path: str, indexes: list[rr.TimeColumn], values: Any
+  chunks: list[Chunk], entity_path: str, indexes: list[rr.TimeColumn], values: Any
 ) -> None:
   """One unnamed scalar series at the entity that reads it."""
-  _send(emit, entity_path, indexes, rr.Scalars.columns(scalars=values))
+  _send(chunks, entity_path, indexes, rr.Scalars.columns(scalars=values))
 
 
 def _send_series(
@@ -132,10 +128,12 @@ def _send_series(
   )
 
 
-def _send_angle(emit: Sink, entity_path: str, indexes: Any, angles: Any) -> None:
+def _send_angle(
+  chunks: list[Chunk], entity_path: str, indexes: Any, angles: Any
+) -> None:
   """A joint's angle series, beside the transform that angle drives."""
   values = np.asarray(angles, dtype=np.float64)
-  _send(emit, entity_path, indexes, rr.AnyValues.columns(angle=values))
+  _send(chunks, entity_path, indexes, rr.AnyValues.columns(angle=values))
 
 
 def _pose_columns(pose: gtsam.Pose3) -> Any:
@@ -363,7 +361,7 @@ def _send_tag_axes_columns(
 
 
 def _send_factor_line_columns(
-  emit: Sink,
+  chunks: list[Chunk],
   entity_path: str,
   lines_per_kf: list[Float64Array],
   indexes: list[rr.TimeColumn],
@@ -378,7 +376,7 @@ def _send_factor_line_columns(
     return
   strips = [line.astype(np.float32) for arr in lines_per_kf for line in arr]
   _send(
-    emit,
+    chunks,
     entity_path,
     indexes,
     rr.LineStrips3D.columns(
@@ -449,7 +447,7 @@ class CameraEstimate:
 
 
 def _send_joint_transform(
-  emit: Sink,
+  chunks: list[Chunk],
   entity_path: str,
   joint: Any,
   times: Float64Array,
@@ -463,7 +461,7 @@ def _send_joint_transform(
     times = np.concatenate(([indexes.timeline_start], times))
     angles = np.concatenate((angles[:1], angles))
   _send(
-    emit,
+    chunks,
     entity_path,
     indexes.dense(times),
     joint.compute_transform_columns([float(a) for a in angles]),
@@ -910,7 +908,6 @@ _TRAJECTORY_PALETTE = (
 
 
 def estimate_chunks(
-  layers: Layers,
   cameras: list[CameraEstimate],
   anchor_poses_world: dict[int, gtsam.Pose3],
   reference_tag_id: int,
@@ -918,15 +915,15 @@ def estimate_chunks(
   urdf_path: Path,
   timeline_start: float,
   frame_period: float,
-) -> None:
-  """Build every entity of a solved run as chunks, each handed to the sink for
-  the layer it belongs to.
+) -> Layers:
+  """Build every entity of a solved run as chunks, sorted by the layer each
+  belongs to.
 
   Every entity a camera owns hangs under ``/camera/<slot>/...``; each anchor
   sits at ``/world/anchor/<tag_id>``, carrying whether it is the reference the
   gauge was pinned to.
   """
-  layers.estimate(world_chunk())
+  layers = Layers([world_chunk()], [])
   for tag_id, pose in anchor_poses_world.items():
     _log_anchor(
       layers,
@@ -945,3 +942,4 @@ def estimate_chunks(
       timeline_start=timeline_start,
       frame_period=frame_period,
     )
+  return layers
