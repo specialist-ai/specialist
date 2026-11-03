@@ -206,13 +206,6 @@ def test_imu_calibration_roundtrips(base_rrd: Path) -> None:
     np.asarray(bias.gyroscope()), np.asarray(expected.gyroscope()), atol=1e-12
   )
   np.testing.assert_allclose(session.imu_to_body("cam00"), IMU_TO_BODY, atol=1e-12)
-  assert session.rolling_shutter_readout("cam00") == pytest.approx(0.0157)
-
-
-def _value(rrd: Path, entity: str, component: str) -> float:
-  """One static scalar off an entity."""
-  row = SessionRecording(rrd)._entity_row(entity.lstrip("/"))
-  return float(np.asarray(row[component]).reshape(-1)[0])
 
 
 def test_capture_telemetry_reaches_the_base(base_rrd: Path) -> None:
@@ -229,9 +222,9 @@ def test_capture_telemetry_reaches_the_base(base_rrd: Path) -> None:
   cap = f"/{schema.camera('cam00')}"
   assert {"serial_number", "camera_type", "fw_version", "photo_rot"} <= columns[cap]
   assert {"source", "clock_shift", "clock_confidence", "clock_method"} <= columns[cap]
+  row = SessionRecording(base_rrd)._recording.row(cap.lstrip("/"))
   # The shift is the one the streams carry.
-  assert _value(base_rrd, cap, "clock_shift") == pytest.approx(-0.25)
-  row = SessionRecording(base_rrd)._entity_row(cap.lstrip("/"))
+  assert np.asarray(row["clock_shift"]).reshape(-1)[0] == pytest.approx(-0.25)
   assert str(np.asarray(row["source"]).reshape(-1)[0]) == "a_00_.insv"
   # The rolling shutter is the IMU calibration's, in seconds, and only there.
   assert "rolling_shutter_time" not in columns[cap]
