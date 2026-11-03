@@ -81,23 +81,14 @@ def frame_width(rrd: Path) -> int:
 
 
 def check_one_configuration(dataset: DatasetEntry, state: str) -> None:
-  """Refuse a dataset that already holds another state configuration: every
-  configuration writes the same names, so two would resolve silently."""
-  table = dataset.segment_table().to_arrow_table()
-  column = f"property:{STATE}:config"
-  if column not in table.schema.names:
-    return
-  held = {
-    v
-    for row in table.column(column).to_pylist()
-    if row
-    for v in (row if isinstance(row, list) else [row])
-    if v
-  }
+  """Refuse a dataset holding any layer but ``state``: each configuration
+  registers as the layer of its name and writes the same names, so two would
+  resolve silently."""
+  held = {layer.name for layer in dataset.info().layers}
   if held - {state}:
     raise SystemExit(
-      f"{sorted(held)} is already on the dataset; one dataset takes one "
-      "state configuration"
+      f"{sorted(held)} is already on the dataset; a dataset holds one state "
+      "configuration and no other layer"
     )
 
 

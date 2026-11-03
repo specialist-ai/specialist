@@ -50,10 +50,18 @@ def _shift_chunk(
   window_ns: tuple[int, int],
   period_ns: float,
   stride: int,
+  keyframes: int,
 ) -> Iterable[Chunk]:
   if chunk.is_static or schema.TIMELINE not in chunk.timeline_names:
     return [chunk]
   batch = chunk.to_record_batch()
+  # The reader marks every keyframe in one chunk, a row each.
+  if "VideoStream:is_keyframe" in batch.schema.names and batch.num_rows != keyframes:
+    raise RuntimeError(
+      f"{chunk.entity_path}: the reader marked {batch.num_rows} keyframes but the "
+      f"container holds {keyframes} (the reader transcodes a source with B-frames); "
+      "the recording would not be randomly accessible"
+    )
   index = batch.schema.get_field_index(schema.TIMELINE)
   shifted = pc.add(batch.column(index), pa.scalar(shift_ns, type=pa.duration("ns")))
   # GOP granularity: the stream spills up to one group past the window to keep
@@ -75,37 +83,20 @@ def _shift_chunk(
   )
 
 
-def _stream_metadata(mp4: Path, entity_path: str) -> tuple[float, int]:
-  """The stream's frame period from its samples' PTS, and its keyframe-marker
-  count."""
-  pts: list[int] = []
-  markers = 0
-  for chunk in (
-    Mp4Reader(mp4, timeline_name=schema.TIMELINE, entity_path=entity_path)
-    .stream()
-    .to_chunks()
-  ):
-    if chunk.is_static or schema.TIMELINE not in chunk.timeline_names:
-      continue
-    batch = chunk.to_record_batch()
-    names = batch.schema.names
-    if "VideoStream:sample" in names:
-      pts.extend(v.value for v in batch.column(names.index(schema.TIMELINE)))
-    if "VideoStream:is_keyframe" in names:
-      flags = batch.column(names.index("VideoStream:is_keyframe")).to_pylist()
-      markers += sum(1 for f in flags if f is not None and len(f) and bool(f[0]))
-  if len(pts) < 2:
-    return float(schema.NS_PER_SECOND), markers
-  return float(np.median(np.diff(np.sort(np.asarray(pts))))), markers
-
-
-def _container_keyframes(mp4: Path) -> int:
-  """The keyframe count from the container's own sample table."""
+def _container_metadata(mp4: Path) -> tuple[float, int]:
+  """The frame period from the container's packet PTS, and its keyframe count."""
   import av
 
+  pts: list[int] = []
+  keyframes = 0
   with av.open(str(mp4)) as container:
-    stream = container.streams.video[0]
-    return sum(1 for p in container.demux(stream) if p.size and p.is_keyframe)
+    for p in container.demux(container.streams.video[0]):
+      if p.size and p.pts is not None:
+        pts.append(round(p.pts * p.time_base * schema.NS_PER_SECOND))
+        keyframes += p.is_keyframe
+  if len(pts) < 2:
+    return float(schema.NS_PER_SECOND), keyframes
+  return float(np.median(np.diff(np.sort(pts)))), keyframes
 
 
 def video_chunks(
@@ -121,18 +112,11 @@ def video_chunks(
     round(window[0] * schema.NS_PER_SECOND),
     round(window[1] * schema.NS_PER_SECOND),
   )
-  period_ns, markers = _stream_metadata(mp4, entity_path)
-  keyframes = _container_keyframes(mp4)
-  if markers != keyframes:
-    raise RuntimeError(
-      f"{entity_path}: the reader marked {markers} keyframes but the container "
-      f"holds {keyframes} (the reader transcodes a source with B-frames); the "
-      "recording would not be randomly accessible"
-    )
+  period_ns, keyframes = _container_metadata(mp4)
   stride = schema.keyframe_stride(schema.NS_PER_SECOND / period_ns)
   stream = Mp4Reader(
     mp4, timeline_name=schema.TIMELINE, entity_path=entity_path
   ).stream()
   return stream.flat_map(
-    lambda c: _shift_chunk(c, shift_ns, window_ns, period_ns, stride)
+    lambda c: _shift_chunk(c, shift_ns, window_ns, period_ns, stride, keyframes)
   )
