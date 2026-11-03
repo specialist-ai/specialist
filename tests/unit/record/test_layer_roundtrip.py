@@ -8,41 +8,13 @@ import numpy as np
 import pytest
 from rerun.chunk import RrdReader
 from specialist_corpus import schema
-from specialist_corpus.read import read_keyframe_poses
+from specialist_corpus.read import Recording, read_keyframe_poses
 
-from specialist.vi_ba.summary import CameraSummary
 from tests.record_fixtures import camera_estimate, urdf_file, write_run
 
 
-@pytest.fixture(scope="module")
-def estimate_rrd(tmp_path_factory: pytest.TempPathFactory) -> Path:
-  """The estimate layer of a solved two-camera run."""
-  cameras = [camera_estimate("cam00"), camera_estimate("cam01", offset=1.0)]
-  estimate, _viz = write_run(
-    tmp_path_factory.mktemp("roundtrip"),
-    "sess_x",
-    cameras,
-    per_camera=[
-      CameraSummary(
-        slot=c.slot,
-        n_keyframes=4,
-        anchor_obs=3,
-        front_rmse=0.4,
-        base_tag_id=c.base_tag_id,
-        seat_rotation=(0.0, 0.0, 0.05),
-        seat_anchor_obs=12,
-        seat_cross_obs=7,
-      )
-      for c in cameras
-    ],
-    urdf_path=urdf_file(tmp_path_factory.mktemp("urdf")),
-    frame_period=1.0 / 30.0,
-  )
-  return estimate
-
-
-def test_estimate_roundtrip(estimate_rrd: Path) -> None:
-  run = read_keyframe_poses(estimate_rrd)
+def test_estimate_roundtrip(estimated_run: tuple[Path, Path]) -> None:
+  run = read_keyframe_poses(estimated_run[0])
   assert run.slots == ["cam00", "cam01"]
   for slot, offset in (("cam00", 0.0), ("cam01", 1.0)):
     times = run.kf_times_by_slot[slot]
@@ -53,64 +25,33 @@ def test_estimate_roundtrip(estimate_rrd: Path) -> None:
     np.testing.assert_allclose(run.kf_rotations_by_slot[slot], expected_r, atol=1e-6)
 
 
-def test_the_run_account_is_a_property_not_an_entity(estimate_rrd: Path) -> None:
+def test_the_run_account_is_a_property_not_an_entity(
+  estimated_run: tuple[Path, Path],
+) -> None:
   """A catalog reads the run's account without opening the segment, so it is a
   property group and no entity carries a second copy."""
-  store = RrdReader(str(estimate_rrd)).store()
-  entities, fields = set(), set()
-  for chunk in store.stream().filter(is_static=True).to_chunks():
-    entities.add(chunk.entity_path)
-    if chunk.entity_path == "/__properties/estimate":
-      fields |= {
-        n for n in chunk.to_record_batch().schema.names if not n.startswith("rerun.")
-      }
-  assert f"/{schema.ESTIMATE}" not in entities
+  columns = RrdReader(str(estimated_run[0])).store().schema().component_columns()
+  fields = {c.component for c in columns if c.entity_path == "/__properties/estimate"}
+  assert f"/{schema.ESTIMATE}" not in {c.entity_path for c in columns}
   assert {"final_graph_error", "solver_iterations", "worst_rmse", "git_sha"} <= fields
 
 
 def _worst_rmse(estimate: Path) -> float:
   """The selector a catalog filters on, read back off the layer."""
-  for chunk in RrdReader(str(estimate)).store().stream().to_chunks():
-    if chunk.entity_path != "/__properties/estimate":
-      continue
-    batch = chunk.to_record_batch()
-    if "worst_rmse" in batch.schema.names:
-      column = batch.column(batch.schema.names.index("worst_rmse")).to_pylist()
-      return float(np.asarray(column[0]).reshape(-1)[0])
-  raise AssertionError("the estimate layer carries no worst_rmse")
+  with Recording(estimate) as recording:
+    value = recording.property(schema.ESTIMATE_PROPERTIES)["worst_rmse"]
+  return float(np.asarray(value).reshape(-1)[0])
 
 
 def test_worst_rmse_is_the_worst_camera_that_was_measured(tmp_path: Path) -> None:
   """An unmeasured camera's NaN RMSE neither becomes the worst RMSE nor
   poisons the comparison that picks one."""
-  cameras = [camera_estimate("cam00"), camera_estimate("cam01", offset=1.0)]
   estimate, _viz = write_run(
     tmp_path,
     "sess_rmse",
-    cameras,
-    per_camera=[
-      # The NaN camera comes first.
-      CameraSummary(
-        slot=cameras[0].slot,
-        n_keyframes=4,
-        anchor_obs=3,
-        front_rmse=float("nan"),
-        base_tag_id=2000,
-        seat_rotation=(0.0, 0.0, 0.05),
-        seat_anchor_obs=12,
-        seat_cross_obs=7,
-      ),
-      CameraSummary(
-        slot=cameras[1].slot,
-        n_keyframes=4,
-        anchor_obs=3,
-        front_rmse=0.4,
-        base_tag_id=2003,
-        seat_rotation=(0.0, 0.0, 0.05),
-        seat_anchor_obs=12,
-        seat_cross_obs=7,
-      ),
-    ],
+    [camera_estimate("cam00"), camera_estimate("cam01", offset=1.0)],
+    # The NaN camera comes first.
+    front_rmse=[float("nan"), 0.4],
     urdf_path=urdf_file(tmp_path),
     frame_period=1.0 / 30.0,
   )
@@ -119,35 +60,22 @@ def test_worst_rmse_is_the_worst_camera_that_was_measured(tmp_path: Path) -> Non
 
 def test_worst_rmse_is_nan_when_no_camera_was_measured(tmp_path: Path) -> None:
   """The worst RMSE over a run that measured no camera is NaN."""
-  cameras = [camera_estimate("cam00")]
   estimate, _viz = write_run(
     tmp_path,
     "sess_unmeasured",
-    cameras,
-    per_camera=[
-      CameraSummary(
-        slot=cameras[0].slot,
-        n_keyframes=4,
-        anchor_obs=3,
-        front_rmse=float("nan"),
-        base_tag_id=2000,
-        seat_rotation=(0.0, 0.0, 0.05),
-        seat_anchor_obs=12,
-        seat_cross_obs=7,
-      )
-    ],
+    [camera_estimate("cam00")],
+    front_rmse=[float("nan")],
     urdf_path=urdf_file(tmp_path),
     frame_period=1.0 / 30.0,
   )
   assert np.isnan(_worst_rmse(estimate))
 
 
-def test_layer_identity_and_no_recording_info(estimate_rrd: Path) -> None:
-  reader = RrdReader(str(estimate_rrd))
-  assert [e.recording_id for e in reader.recordings()] == ["sess_x"]
+def test_layer_identity_and_no_recording_info(estimated_run: tuple[Path, Path]) -> None:
+  reader = RrdReader(str(estimated_run[0]))
+  assert [e.recording_id for e in reader.recordings()] == ["sess_route"]
   chunk_paths = {c.entity_path for c in reader.store().stream().to_chunks()}
-  # send_properties=False writes no RecordingInfo chunk to collide with the
-  # base segment on catalog merge.
+  # No RecordingInfo chunk collides with the base segment on catalog merge.
   assert "/__properties" not in chunk_paths
   assert "/__properties/estimate" in chunk_paths
   # Path parity with the schema builders.
@@ -155,11 +83,13 @@ def test_layer_identity_and_no_recording_info(estimate_rrd: Path) -> None:
   assert f"/{schema.base_tag('cam00')}" in chunk_paths
 
 
-def test_linear_velocity_lands_on_its_own_entity(estimate_rrd: Path) -> None:
+def test_linear_velocity_lands_on_its_own_entity(
+  estimated_run: tuple[Path, Path],
+) -> None:
   """The velocity states are their own entity, indexed by their own timeline
   and carrying a value at every row."""
   rows = 0
-  for chunk in RrdReader(str(estimate_rrd)).store().stream().to_chunks():
+  for chunk in RrdReader(str(estimated_run[0])).store().stream().to_chunks():
     if chunk.entity_path != f"/{schema.state('cam00', 'lin_vel')}":
       continue
     batch = chunk.to_record_batch()

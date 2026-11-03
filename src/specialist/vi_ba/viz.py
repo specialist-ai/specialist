@@ -1,8 +1,7 @@
 """Columnar Rerun chunks for dual-lens VI-BA. ``estimate_chunks`` takes one
 ``CameraEstimate`` per camera and builds every entity a solved run has (poses,
 biases, gripper, landmarks, tags, reprojections, joints, ...) under that camera's
-slot, handing each chunk to a sink as it is made; the layer writer in
-``specialist.record.layer`` decides which file each one belongs in.
+slot, sorted into the estimate layer's chunks and the viz layer's.
 
 Every path is minted by ``specialist_corpus.schema``, which is the only place
 that decides what an entity is called."""
@@ -51,7 +50,7 @@ __all__ = [
 ]
 
 
-Sink = Callable[[Chunk], None]
+Sink = list[Chunk]
 
 
 @dataclass(frozen=True)
@@ -70,7 +69,7 @@ def _clock(times: Float64Array) -> rr.TimeColumn:
 
 def _send(emit: Sink, entity_path: str, indexes: Any, columns: Any) -> None:
   """One temporal chunk, shaped exactly as the columnar log call was."""
-  emit(Chunk.from_columns(entity_path, indexes=indexes, columns=columns))
+  emit.append(Chunk.from_columns(entity_path, indexes=indexes, columns=columns))
 
 
 def _in_world(emit: Sink, entity_path: str) -> None:
@@ -83,7 +82,7 @@ def _in_world(emit: Sink, entity_path: str) -> None:
 
 def _static(emit: Sink, entity_path: str, *columns: Any) -> None:
   """One static chunk carrying every archetype logged at that entity."""
-  emit(
+  emit.append(
     Chunk.from_columns(
       entity_path, indexes=[], columns=[c for group in columns for c in group]
     )
@@ -910,7 +909,6 @@ _TRAJECTORY_PALETTE = (
 
 
 def estimate_chunks(
-  layers: Layers,
   cameras: list[CameraEstimate],
   anchor_poses_world: dict[int, gtsam.Pose3],
   reference_tag_id: int,
@@ -918,15 +916,15 @@ def estimate_chunks(
   urdf_path: Path,
   timeline_start: float,
   frame_period: float,
-) -> None:
-  """Build every entity of a solved run as chunks, each handed to the sink for
-  the layer it belongs to.
+) -> Layers:
+  """Build every entity of a solved run as chunks, sorted by the layer each
+  belongs to.
 
   Every entity a camera owns hangs under ``/camera/<slot>/...``; each anchor
   sits at ``/world/anchor/<tag_id>``, carrying whether it is the reference the
   gauge was pinned to.
   """
-  layers.estimate(world_chunk())
+  layers = Layers([world_chunk()], [])
   for tag_id, pose in anchor_poses_world.items():
     _log_anchor(
       layers,
@@ -945,3 +943,4 @@ def estimate_chunks(
       timeline_start=timeline_start,
       frame_period=frame_period,
     )
+  return layers

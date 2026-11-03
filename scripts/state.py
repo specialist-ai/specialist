@@ -485,16 +485,14 @@ def write_layer(
   complete write renames into place."""
   path.parent.mkdir(parents=True, exist_ok=True)
   partial = path.parent / (path.name + ".partial")
-  store = LazyChunkStream.from_iter([world_chunk(), *chunks]).collect(
+  properties = Chunk.from_property(schema.STATE, rr.AnyValues(**account))
+  store = LazyChunkStream.from_iter([world_chunk(), properties, *chunks]).collect(
     optimize=OptimizationProfile.OBJECT_STORE
   )
   try:
-    with rr.RecordingStream(
-      schema.APPLICATION_ID, recording_id=session_id, send_properties=False
-    ) as stream:
-      stream.set_sinks(rr.FileSink(partial))
-      stream.send_property(schema.STATE, rr.AnyValues(**account))
-      rr.send_chunks(store, recording=stream)
+    store.write_rrd(
+      partial, application_id=schema.APPLICATION_ID, recording_id=session_id
+    )
     partial.replace(path)
   finally:
     partial.unlink(missing_ok=True)
