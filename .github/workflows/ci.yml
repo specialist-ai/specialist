@@ -36,7 +36,7 @@ jobs:
       - name: Setup uv
         uses: astral-sh/setup-uv@v6
         with:
-          python-version: "3.12"
+          python-version: "3.14"
           enable-cache: true
       - name: Install Boost headers (the native MEI factor build needs them)
         run: sudo apt-get update && sudo apt-get install -y libboost-all-dev
@@ -56,7 +56,7 @@ jobs:
       - name: Setup uv
         uses: astral-sh/setup-uv@v6
         with:
-          python-version: "3.12"
+          python-version: "3.14"
           enable-cache: true
       - name: Install Boost headers (the native MEI factor build needs them)
         run: sudo apt-get update && sudo apt-get install -y libboost-all-dev

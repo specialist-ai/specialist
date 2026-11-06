@@ -108,7 +108,7 @@ def _resident_gb() -> float | None:
     for line in Path("/proc/self/status").read_text().splitlines():
       if line.startswith("RssAnon:"):
         return int(line.split()[1]) / 2**20
-  except (OSError, ValueError, IndexError):
+  except OSError, ValueError, IndexError:
     pass
   return None
 
@@ -199,7 +199,7 @@ def bound_malloc_arenas(limit: int) -> bool:
     libc = ctypes.CDLL("libc.so.6")
     m_arena_max = -8
     return bool(libc.mallopt(m_arena_max, limit))
-  except (OSError, AttributeError):
+  except OSError, AttributeError:
     return False
 
 
@@ -207,7 +207,7 @@ def release_freed_memory() -> None:
   """Hand freed heap back to the OS; a no-op without glibc's ``malloc_trim``."""
   try:
     ctypes.CDLL("libc.so.6").malloc_trim(0)
-  except (OSError, AttributeError):
+  except OSError, AttributeError:
     pass
 
 

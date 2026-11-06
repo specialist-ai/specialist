@@ -27,10 +27,9 @@ notice. Reserve
 `uv run --no-sync` for timed benchmark legs, where a run must not spend its
 wall clock on dependency resolution.
 
-Pulls `gtsam>=4.3a0` (the alpha is the only release with cp312 wheels), `numpy`,
-`scipy`, `rerun-sdk`, `av`, `tyro`, `telemetry-parser`, `opencv-python`,
-`pupil-apriltags`, `allantools`, `pyyaml`, plus dev tools `pytest`, `ruff`,
-`mypy`, `pre-commit`.
+Pulls `gtsam==4.3.0`, `numpy`, `scipy`, `rerun-sdk`, `av`, `tyro`,
+`telemetry-parser`, `opencv-python`, `pupil-apriltags`, `allantools`, `pyyaml`,
+plus dev tools `pytest`, `ruff`, `mypy`, `pre-commit`.
 
 `uv sync` also compiles the native MEI bundle-adjustment factor
 (`_mei_factor_cpp`) — a C++ port of the reprojection factor that makes bundle
@@ -47,9 +46,9 @@ uv run build-mei-factor
 ```
 
 The extension shares pybind11 types with the gtsam wheel, so it must match that
-wheel's ABI: pybind11 is pinned to the 2.x series, and `-fabi-version` plus the
-libstdc++ string ABI are auto-detected from the installed wheel in `_buildext.py`
-(needed because manylinux wheels are built with an older GCC than a typical host).
+wheel's ABI: pybind11 is pinned to the 3.0 series (internals v11, as in the gtsam
+4.3.0 wheel), and `_buildext.py` reads the libstdc++ string ABI from the installed
+wheel.
 
 ## Test
 
